@@ -8,6 +8,10 @@ import {
   setBoxFromBounds,
   setVoxelBox,
 } from './collision'
+import {
+  type MeshGroundTargets,
+  sampleMeshGroundY,
+} from './terrainGroundRay'
 
 const DEFAULT_GRID_CELL = 5
 
@@ -35,6 +39,9 @@ type CellSlots = {
 export class CollisionWorld {
   readonly boxes: CollisionBox[] = []
   private readonly boxActive: boolean[] = []
+  // Coarse per-cell top-surface AABBs. The smooth surface mesh is authoritative
+  // for walking, so these are skipped by player/ground queries (excludeSurface).
+  private readonly boxIsSurface: boolean[] = []
   private readonly grid = new Map<string, number[]>()
   private readonly queryIndices: number[] = []
   private readonly cellSlots = new Map<string, CellSlots>()
@@ -47,7 +54,56 @@ export class CollisionWorld {
   private queryStamped: number[] = []
   private gridCell = DEFAULT_GRID_CELL
   private staticBoxIndices: number[] = []
+  private readonly buildSlots = new Map<string, number>()
   private maxLayers = 5
+  private meshGround: MeshGroundTargets | null = null
+  private readonly meshGroundHits: THREE.Intersection[] = []
+  // Frame-coherent cache: a straight-down ground ray only depends on XZ, so all
+  // the vertical collision substeps in one fall reuse a single raycast.
+  private groundFrameStamp = 0
+  private groundCacheStamp = -1
+  private groundCacheX = 0
+  private groundCacheZ = 0
+  private groundCacheY: number | null = null
+
+  setMeshGroundTargets(surface: THREE.Object3D, chunkRoot?: THREE.Object3D) {
+    this.meshGround = { surface, chunkRoot }
+  }
+
+  /** Bump once per frame to invalidate the mesh-ground sample cache. */
+  beginFrame() {
+    this.groundFrameStamp++
+  }
+
+  private sampleMeshGround(
+    feetX: number,
+    feetZ: number,
+    rayStartY: number,
+    maxDistance: number,
+  ): number | null {
+    if (!this.meshGround) return null
+    if (
+      this.groundCacheStamp === this.groundFrameStamp &&
+      Math.abs(feetX - this.groundCacheX) < 0.03 &&
+      Math.abs(feetZ - this.groundCacheZ) < 0.03
+    ) {
+      return this.groundCacheY
+    }
+    const y = sampleMeshGroundY(
+      feetX,
+      feetZ,
+      rayStartY,
+      this.meshGround,
+      this.meshGroundHits,
+      maxDistance,
+      { intersectInvisibleChunks: true },
+    )
+    this.groundCacheStamp = this.groundFrameStamp
+    this.groundCacheX = feetX
+    this.groundCacheZ = feetZ
+    this.groundCacheY = y
+    return y
+  }
 
   setGridCell(size: number) {
     this.gridCell = size
@@ -72,11 +128,42 @@ export class CollisionWorld {
     releaseCollisionBoxes(this.boxes)
     this.boxes.length = 0
     this.boxActive.length = 0
+    this.boxIsSurface.length = 0
     this.grid.clear()
     this.cellSlots.clear()
     this.heightGrid.clear()
     this.columnHints.clear()
     this.staticBoxIndices.length = 0
+    this.buildSlots.clear()
+  }
+
+  /**
+   * Add or re-activate a solid AABB for a player-placed build block. The block
+   * position is fixed per key, so the grid bucket from the first insert is reused.
+   */
+  setBuildBox(
+    key: string,
+    min: THREE.Vector3,
+    max: THREE.Vector3,
+    skin = 0.01,
+  ) {
+    const idx = this.buildSlots.get(key)
+    if (idx === undefined) {
+      const box = acquireCollisionBox()
+      box.min.set(min.x + skin, min.y + skin, min.z + skin)
+      box.max.set(max.x - skin, max.y - skin, max.z - skin)
+      this.buildSlots.set(key, this.addBox(box))
+    } else {
+      const box = this.boxes[idx]!
+      box.min.set(min.x + skin, min.y + skin, min.z + skin)
+      box.max.set(max.x - skin, max.y - skin, max.z - skin)
+      this.boxActive[idx] = true
+    }
+  }
+
+  removeBuildBox(key: string) {
+    const idx = this.buildSlots.get(key)
+    if (idx !== undefined) this.deactivateBox(idx)
   }
 
   private deactivateBox(index: number) {
@@ -85,10 +172,11 @@ export class CollisionWorld {
     }
   }
 
-  addBox(box: CollisionBox): number {
+  addBox(box: CollisionBox, isSurface = false): number {
     const index = this.boxes.length
     this.boxes.push(box)
     this.boxActive.push(true)
+    this.boxIsSurface.push(isSurface)
     this.insertIntoGrid(index, box.min.x, box.min.z, box.max.x, box.max.z)
     return index
   }
@@ -131,6 +219,8 @@ export class CollisionWorld {
     voxelSize: number,
   ): { min: number[]; max: number[] } | null {
     if (!cell.bounds) return null
+    // Fully excavated columns must not keep a solid surface shell you can't fall through.
+    if (cell.layerMask === 0) return null
     const min = [...cell.bounds.min]
     const max = cell.bounds.max
     const seam = cell.voxelBaseY ?? cell.capBottomY
@@ -147,6 +237,7 @@ export class CollisionWorld {
     cell: TerrainCellCollision,
     voxelSize: number,
   ): number | null {
+    if (cell.layerMask === 0) return null
     const seam = cell.voxelBaseY ?? cell.capBottomY
     let top = -Infinity
     for (let layer = 0; layer < this.maxLayers; layer++) {
@@ -224,7 +315,7 @@ export class CollisionWorld {
       if (slots.surface === null) {
         const box = acquireCollisionBox()
         setBoxFromBounds(box, surfaceBounds.min, surfaceBounds.max, 0.01)
-        slots.surface = this.addBox(box)
+        slots.surface = this.addBox(box, true)
       } else {
         setBoxFromBounds(
           this.boxes[slots.surface]!,
@@ -244,6 +335,9 @@ export class CollisionWorld {
     appendBoxesFromObject(root, this.boxes, skin)
     while (this.boxActive.length < this.boxes.length) {
       this.boxActive.push(true)
+    }
+    while (this.boxIsSurface.length < this.boxes.length) {
+      this.boxIsSurface.push(false)
     }
     for (let i = start; i < this.boxes.length; i++) {
       this.staticBoxIndices.push(i)
@@ -294,6 +388,7 @@ export class CollisionWorld {
     radius: number,
     yMin: number,
     yMax: number,
+    excludeSurface = false,
     out = this.queryIndices,
   ): number[] {
     out.length = 0
@@ -316,6 +411,7 @@ export class CollisionWorld {
           const idx = list[i]!
           if (this.queryStamped[idx] === stamp) continue
           if (!this.boxActive[idx]) continue
+          if (excludeSurface && this.boxIsSurface[idx]) continue
           this.queryStamped[idx] = stamp
           const box = this.boxes[idx]!
           if (box.max.y < yMin || box.min.y > yMax) continue
@@ -326,12 +422,12 @@ export class CollisionWorld {
     return out
   }
 
-  /** Walkable top from column hints only when feet overlap that column in XZ. */
+  /** Walkable top from column hints only when feet are over that column in XZ. */
   private columnHintAt(
     feetX: number,
     feetZ: number,
     feetY: number,
-    radius: number,
+    _radius: number,
     stepHeight: number,
     recoverBelow = 1.85,
   ) {
@@ -339,10 +435,10 @@ export class CollisionWorld {
     let best: number | null = null
     for (const hint of this.columnHints.values()) {
       if (
-        feetX + radius <= hint.x - half ||
-        feetX - radius >= hint.x + half ||
-        feetZ + radius <= hint.z - half ||
-        feetZ - radius >= hint.z + half
+        feetX <= hint.x - half ||
+        feetX >= hint.x + half ||
+        feetZ <= hint.z - half ||
+        feetZ >= hint.z + half
       ) {
         continue
       }
@@ -359,17 +455,40 @@ export class CollisionWorld {
     feetZ: number,
     radius: number,
     stepHeight: number,
+    excludeSurface = false,
   ): number | null {
+    const recoverBelow = 1.85
+    const maxAbove = stepHeight + 0.05
+    const minBelow = feetY - stepHeight - recoverBelow
+
+    let best: number | null = null
+    let meshHit = false
+    if (this.meshGround) {
+      const meshY = this.sampleMeshGround(feetX, feetZ, feetY + 1.5, stepHeight + 3)
+      if (
+        meshY !== null &&
+        meshY <= feetY + maxAbove &&
+        meshY >= minBelow
+      ) {
+        best = meshY
+        meshHit = true
+      }
+    }
+
     const below = Math.max(stepHeight + 2.5, 4)
     const above = stepHeight + 1.5
+    // When the smooth mesh resolved the surface, skip coarse surface boxes so the
+    // player follows the mesh instead of snapping to flat per-cell box tops. If the
+    // mesh missed, fall back to including surface boxes so we never lose the floor.
     const indices = this.queryNear(
       feetX,
       feetZ,
       radius + 1,
       feetY - below,
       feetY + above,
+      excludeSurface && meshHit,
     )
-    let best = findGroundTopInBoxes(
+    const boxBest = findGroundTopInBoxes(
       feetX,
       feetY,
       feetZ,
@@ -378,8 +497,103 @@ export class CollisionWorld {
       indices,
       stepHeight,
     )
+    if (boxBest !== null) {
+      if (best === null) {
+        best = boxBest
+      } else if (
+        boxBest > best &&
+        boxBest <= feetY + maxAbove &&
+        feetY - boxBest < 0.22
+      ) {
+        // Voxel / ledge tops above the mesh sample (e.g. standing on dug columns).
+        best = boxBest
+      }
+    }
+
     const hint = this.columnHintAt(feetX, feetZ, feetY, radius, stepHeight)
-    if (hint !== null && (best === null || hint > best)) best = hint
+    if (hint !== null) {
+      if (best === null) best = hint
+      else if (feetY - hint < 0.22 && hint > best && hint <= feetY + maxAbove) {
+        best = hint
+      }
+    }
+    return best
+  }
+
+  private isStaticBox(index: number): boolean {
+    const staticBoxes = this.staticBoxIndices
+    for (let i = 0; i < staticBoxes.length; i++) {
+      if (staticBoxes[i] === index) return true
+    }
+    return false
+  }
+
+  /**
+   * Highest walkable terrain top under (x, z), ignoring prop/base static boxes.
+   * Used so rocks/trees rest on voxels and surface, not on their own colliders.
+   */
+  findTerrainGroundTop(
+    feetX: number,
+    feetY: number,
+    feetZ: number,
+    radius: number,
+    maxDrop = 64,
+  ): number | null {
+    const stepHeight = maxDrop
+    const recoverBelow = maxDrop
+    const maxAbove = stepHeight + 0.05
+    const minBelow = feetY - stepHeight - recoverBelow
+
+    let best: number | null = null
+    let meshHit = false
+    if (this.meshGround) {
+      const meshY = this.sampleMeshGround(feetX, feetZ, feetY + 1.5, stepHeight + 3)
+      if (meshY !== null && meshY <= feetY + maxAbove && meshY >= minBelow) {
+        best = meshY
+        meshHit = true
+      }
+    }
+
+    const below = Math.max(stepHeight + 2.5, 4)
+    const above = stepHeight + 1.5
+    const indices = this.queryNear(
+      feetX,
+      feetZ,
+      radius + 1,
+      feetY - below,
+      feetY + above,
+      meshHit,
+    )
+    const boxBest = findGroundTopInBoxes(
+      feetX,
+      feetY,
+      feetZ,
+      radius,
+      this.boxes,
+      indices,
+      stepHeight,
+      recoverBelow,
+      (idx) => this.isStaticBox(idx),
+    )
+    if (boxBest !== null) {
+      if (best === null) {
+        best = boxBest
+      } else if (
+        boxBest > best &&
+        boxBest <= feetY + maxAbove &&
+        feetY - boxBest < 0.22
+      ) {
+        best = boxBest
+      }
+    }
+
+    const hint = this.columnHintAt(feetX, feetZ, feetY, radius, stepHeight, recoverBelow)
+    if (hint !== null) {
+      if (best === null) best = hint
+      else if (feetY - hint < 0.22 && hint > best && hint <= feetY + maxAbove) {
+        best = hint
+      }
+    }
     return best
   }
 

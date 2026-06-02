@@ -17,3 +17,11 @@ npm run dev
 | `npm run build` | Production build |
 | `npm run preview` | Preview production build |
 | `npm run slice-terrain` | Slice terrain mesh into surface pieces (requires Python venv) |
+
+### Terrain slicer (Python)
+
+```bash
+python -m venv .venv
+.venv/bin/python -m pip install -r scripts/requirements.txt
+npm run slice-terrain
+```

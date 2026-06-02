@@ -1,7 +1,7 @@
 import * as THREE from 'three'
 
-/** Slight XZ overlap so instanced voxel faces do not show hairline cracks. */
-export const VOXEL_FACE_OVERLAP = 0.04
+/** Extra XZ size on voxel boxes; keep at 0 — overlap reads as stacked blocks clipping. */
+export const VOXEL_FACE_OVERLAP = 0
 
 export type TerrainGrid = {
   minX: number

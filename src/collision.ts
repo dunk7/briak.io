@@ -64,23 +64,43 @@ export function xzOverlaps(
   )
 }
 
+/** True when the feet point is over this box's XZ footprint (not a nearby column). */
+export function feetOverBoxXz(
+  feetX: number,
+  feetZ: number,
+  box: CollisionBox,
+  inset = 0.02,
+): boolean {
+  return (
+    feetX > box.min.x + inset &&
+    feetX < box.max.x - inset &&
+    feetZ > box.min.z + inset &&
+    feetZ < box.max.z - inset
+  )
+}
+
 export function findGroundTopInBoxes(
   feetX: number,
   feetY: number,
   feetZ: number,
-  radius: number,
+  _radius: number,
   boxes: readonly CollisionBox[],
   indices: readonly number[],
   stepHeight: number,
   recoverBelow = 1.85,
+  excludeIndex?: (index: number) => boolean,
 ): number | null {
   let best: number | null = null
   for (let i = 0; i < indices.length; i++) {
-    const box = boxes[indices[i]!]
+    const idx = indices[i]!
+    if (excludeIndex?.(idx)) continue
+    const box = boxes[idx]
     const top = box.max.y
     if (top > feetY + stepHeight + 0.05) continue
     if (top < feetY - stepHeight - recoverBelow) continue
-    if (!xzOverlaps(feetX, feetZ, radius, box)) continue
+    if (!feetOverBoxXz(feetX, feetZ, box)) continue
+    // Feet below the solid — standing under it, not on its walkable top.
+    if (feetY < box.min.y - 0.02) continue
     if (best === null || top > best) best = top
   }
   return best
@@ -91,7 +111,7 @@ export function findGroundTop(
   feetX: number,
   feetY: number,
   feetZ: number,
-  radius: number,
+  _radius: number,
   boxes: readonly CollisionBox[],
   stepHeight: number,
   recoverBelow = 1.85,
@@ -101,7 +121,8 @@ export function findGroundTop(
     const top = box.max.y
     if (top > feetY + stepHeight + 0.05) continue
     if (top < feetY - stepHeight - recoverBelow) continue
-    if (!xzOverlaps(feetX, feetZ, radius, box)) continue
+    if (!feetOverBoxXz(feetX, feetZ, box)) continue
+    if (feetY < box.min.y - 0.02) continue
     if (best === null || top > best) best = top
   }
   return best
@@ -158,10 +179,12 @@ export function floorMtvInto(
   const overlapY = Math.min(playerMax.y - box.min.y, box.max.y - playerMin.y)
   const overlapZ = Math.min(playerMax.z - box.min.z, box.max.z - playerMin.z)
   if (overlapX <= 0 || overlapY <= 0 || overlapZ <= 0) return false
+  const feetY = playerMin.y - feetSkin
+  // Under an overhang — hit the bottom, don't get pushed onto the top.
+  if (feetY < box.min.y - 0.02) return false
   // Head must be above the deck we're landing on (not standing under a slab).
   if (playerMax.y <= box.max.y + 1e-4) return false
   if (playerMax.y < box.min.y + 0.05) return false
-  const feetY = playerMin.y - feetSkin
   // Clearly above this surface — not standing on it.
   if (feetY > box.max.y + 0.12) return false
   out.set(0, overlapY, 0)

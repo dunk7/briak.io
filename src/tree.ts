@@ -1,21 +1,28 @@
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import { sampleMeshGroundY, type MeshGroundTargets } from './terrainGroundRay'
 
-const TRUNK_COLOR = 0x5c3a22
-const TRUNK_EMISSIVE = 0x1a0f08
-const FOLIAGE_COLOR = 0x58a042
-const FOLIAGE_EMISSIVE = 0x0a1808
+const TRUNK_EMISSIVE = 0x140b06
+const FOLIAGE_EMISSIVE = 0x081406
 
-const FOLIAGE_NAMES = new Set(['Icosphere'])
+/** Bark tones — the lower trunk blob reads darker/rooty, the upper one warmer. */
+const TRUNK_PALETTE = [0x4a2f1c, 0x66421f]
+/** Distinct canopy greens so the morphed icospheres layer with depth. */
+const FOLIAGE_PALETTE = [0x4d9234, 0x5da642, 0x6cb84e]
+
+/** World scale applied when placing trees (authored GLB is 1 unit = 1 world unit). */
+const TREE_SCALE = 0.55
 
 const _box = new THREE.Box3()
-const _rayOrigin = new THREE.Vector3()
-const _down = new THREE.Vector3(0, -1, 0)
-const _raycaster = new THREE.Raycaster()
+const _rayHits: THREE.Intersection[] = []
+const RAY_ORIGIN_Y = 500
+const RAYCAST_FAR = 1200
 
-export const DEFAULT_TREE_MAX_HEIGHT_DELTA = 1.25
-export const DEFAULT_TREE_SAMPLE_RADIUS = 4
-export const DEFAULT_TREE_COUNT = 4
+export {
+  DEFAULT_TREE_COUNT,
+  DEFAULT_TREE_MAX_HEIGHT_DELTA,
+  DEFAULT_TREE_SAMPLE_RADIUS,
+} from './tuneDefaults'
 
 export type TreeCellMeta = {
   ix: number
@@ -23,6 +30,12 @@ export type TreeCellMeta = {
   center_x: number
   center_y: number
   cap_top_y: number
+  bounds?: { min: number[]; max: number[] }
+}
+
+/** Walkable surface height; `cap_top_y` is the voxel lip and sits above the mesh top. */
+export function cellSurfaceY(cell: TreeCellMeta): number {
+  return cell.bounds?.max[1] ?? cell.cap_top_y
 }
 
 export type TreeSpawnOptions = {
@@ -36,27 +49,104 @@ export type TreeSpawnOptions = {
   minCellSpacing?: number
 }
 
-function createTreeMaterial(color: number, emissive: number) {
+function createTreeMaterial(emissive: number) {
   return new THREE.MeshStandardMaterial({
-    color,
+    color: 0xffffff,
+    vertexColors: true,
     flatShading: true,
-    roughness: 0.95,
+    roughness: 0.92,
     metalness: 0,
     emissive,
-    emissiveIntensity: 0.18,
+    emissiveIntensity: 0.16,
   })
 }
 
-export function applyTreeMaterials(root: THREE.Object3D) {
-  const trunkMaterial = createTreeMaterial(TRUNK_COLOR, TRUNK_EMISSIVE)
-  const foliageMaterial = createTreeMaterial(FOLIAGE_COLOR, FOLIAGE_EMISSIVE)
+function hashUnit(i: number): number {
+  let n = (i * 374761393) & 0xffffffff
+  n = (n ^ (n >> 13)) * 1274126177
+  return ((n ^ (n >> 16)) >>> 0) / 4294967295
+}
 
+/**
+ * Bake per-vertex shading into a mesh: darker toward the blob's base (ambient
+ * occlusion fake) plus light grain, multiplied onto a linear base color. Keeps
+ * the faceted flat-shaded look while adding organic variation.
+ */
+function bakeBlobColors(
+  geometry: THREE.BufferGeometry,
+  baseHex: number,
+  bottomDarken: number,
+  grain: number,
+) {
+  const pos = geometry.getAttribute('position') as THREE.BufferAttribute
+  geometry.computeBoundingBox()
+  const bb = geometry.boundingBox!
+  const minY = bb.min.y
+  const range = bb.max.y - bb.min.y || 1
+
+  const base = new THREE.Color(baseHex)
+  const colors = new Float32Array(pos.count * 3)
+  for (let i = 0; i < pos.count; i++) {
+    const fy = (pos.getY(i) - minY) / range
+    const shade = 1 - bottomDarken * (1 - fy)
+    const jitter = (hashUnit(i + 1) - 0.5) * 2 * grain
+    const m = THREE.MathUtils.clamp(shade + jitter, 0.2, 1.25)
+    colors[i * 3] = base.r * m
+    colors[i * 3 + 1] = base.g * m
+    colors[i * 3 + 2] = base.b * m
+  }
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+}
+
+type TreeMeshClass = { mesh: THREE.Mesh; foliage: boolean }
+
+/** Number of lowest meshes treated as the (brown) trunk; the rest are leaves. */
+const TRUNK_MESH_COUNT = 2
+
+/**
+ * Sort meshes into trunk vs foliage by height: the lowest `TRUNK_MESH_COUNT`
+ * meshes are the trunk pieces, the rest are the leaf icospheres above them.
+ * (Robust to however the GLB names its meshes.)
+ */
+function classifyTreeMeshes(root: THREE.Object3D): TreeMeshClass[] {
+  const withBottom: { mesh: THREE.Mesh; bottom: number }[] = []
   root.traverse((child) => {
     if (!(child instanceof THREE.Mesh)) return
-    child.material = FOLIAGE_NAMES.has(child.name) ? foliageMaterial : trunkMaterial
-    child.castShadow = true
-    child.receiveShadow = true
+    _box.setFromObject(child)
+    withBottom.push({ mesh: child, bottom: _box.min.y })
   })
+
+  withBottom.sort((a, b) => a.bottom - b.bottom)
+  // With ≤2 meshes everything is trunk; otherwise leaves are everything above.
+  const trunkCount = Math.min(TRUNK_MESH_COUNT, Math.max(0, withBottom.length - 1))
+  return withBottom.map((m, idx) => ({ mesh: m.mesh, foliage: idx >= trunkCount }))
+}
+
+export function applyTreeMaterials(root: THREE.Object3D) {
+  root.updateWorldMatrix(true, true)
+  const classified = classifyTreeMeshes(root)
+
+  const trunkMaterial = createTreeMaterial(TRUNK_EMISSIVE)
+  const foliageMaterial = createTreeMaterial(FOLIAGE_EMISSIVE)
+
+  let trunkIdx = 0
+  let foliageIdx = 0
+  for (const { mesh, foliage } of classified) {
+    if (foliage) {
+      const hex = FOLIAGE_PALETTE[foliageIdx % FOLIAGE_PALETTE.length]!
+      bakeBlobColors(mesh.geometry, hex, 0.42, 0.06)
+      mesh.material = foliageMaterial
+      foliageIdx++
+    } else {
+      const hex = TRUNK_PALETTE[trunkIdx % TRUNK_PALETTE.length]!
+      bakeBlobColors(mesh.geometry, hex, 0.3, 0.05)
+      mesh.material = trunkMaterial
+      trunkIdx++
+    }
+    mesh.castShadow = true
+    mesh.receiveShadow = true
+    mesh.userData.treeFoliage = foliage
+  }
 }
 
 function trunkBottomY(root: THREE.Object3D): number | null {
@@ -65,7 +155,7 @@ function trunkBottomY(root: THREE.Object3D): number | null {
 
   root.traverse((child) => {
     if (!(child instanceof THREE.Mesh)) return
-    if (FOLIAGE_NAMES.has(child.name)) return
+    if (child.userData.treeFoliage) return
     _box.setFromObject(child)
     bottom = Math.min(bottom, _box.min.y)
   })
@@ -93,14 +183,10 @@ export async function loadTreeModel(url: string): Promise<THREE.Group> {
   return wrapper
 }
 
-function raycastGroundY(x: number, z: number, surface: THREE.Object3D): number | null {
-  _rayOrigin.set(x, 500, z)
-  _raycaster.near = 0
-  _raycaster.set(_rayOrigin, _down)
-  _raycaster.far = 500
-
-  const hits = _raycaster.intersectObject(surface, true)
-  return hits.length > 0 ? hits[0].point.y : null
+function raycastGroundY(x: number, z: number, targets: MeshGroundTargets): number | null {
+  return sampleMeshGroundY(x, z, RAY_ORIGIN_Y, targets, _rayHits, RAYCAST_FAR, {
+    intersectInvisibleChunks: true,
+  })
 }
 
 /**
@@ -109,10 +195,10 @@ function raycastGroundY(x: number, z: number, surface: THREE.Object3D): number |
 export function measureTerrainFlatness(
   x: number,
   z: number,
-  surface: THREE.Object3D,
+  targets: MeshGroundTargets,
   sampleRadius: number,
 ): number | null {
-  const centerY = raycastGroundY(x, z, surface)
+  const centerY = raycastGroundY(x, z, targets)
   if (centerY === null) return null
 
   let minY = centerY
@@ -123,7 +209,7 @@ export function measureTerrainFlatness(
     const angle = (i / sampleCount) * Math.PI * 2
     const sx = x + Math.cos(angle) * sampleRadius
     const sz = z + Math.sin(angle) * sampleRadius
-    const y = raycastGroundY(sx, sz, surface)
+    const y = raycastGroundY(sx, sz, targets)
     if (y === null) return null
     minY = Math.min(minY, y)
     maxY = Math.max(maxY, y)
@@ -142,8 +228,8 @@ export function measureFlatnessFromMeta(
   sampleRadius: number,
   cellSize: number,
 ): number | null {
-  let minY = cell.cap_top_y
-  let maxY = cell.cap_top_y
+  let minY = cellSurfaceY(cell)
+  let maxY = cellSurfaceY(cell)
   const sampleCount = 8
 
   for (let i = 0; i < sampleCount; i++) {
@@ -152,20 +238,23 @@ export function measureFlatnessFromMeta(
     const dIy = Math.round((Math.sin(angle) * sampleRadius) / cellSize)
     const neighbor = cells[`${cell.ix + dIx}_${cell.iy + dIy}`]
     if (!neighbor) return null
-    minY = Math.min(minY, neighbor.cap_top_y)
-    maxY = Math.max(maxY, neighbor.cap_top_y)
+    const ny = cellSurfaceY(neighbor)
+    minY = Math.min(minY, ny)
+    maxY = Math.max(maxY, ny)
   }
 
   return maxY - minY
 }
 
-/** Raycast the terrain surface so trees sit on actual mesh height, not cell metadata max. */
+/** Raycast merged chunk meshes so trees sit on the visible surface, not hidden cell roots. */
 export function resolveTreeGroundY(
   placements: TreePlacement[],
   surface: THREE.Object3D,
+  chunkRoot?: THREE.Object3D,
 ): void {
+  const targets: MeshGroundTargets = { surface, chunkRoot }
   for (const spot of placements) {
-    const y = raycastGroundY(spot.x, spot.z, surface)
+    const y = raycastGroundY(spot.x, spot.z, targets)
     if (y !== null) spot.y = y
   }
 }
@@ -193,7 +282,15 @@ function rotationForCell(ix: number, iy: number): number {
   return ((ix * 17 + iy * 31) % 628) / 100
 }
 
-/** Pick the flattest well-spaced cells; skips spawn and its neighbors. */
+/** Stable horizontal offset within a cell so respawns don't jump around. */
+function offsetXZForCell(ix: number, iy: number, cellSize: number) {
+  const spread = cellSize * 0.42
+  const ox = (hashUnit(ix * 7919 + iy * 104729) * 2 - 1) * spread
+  const oz = (hashUnit(ix * 109 + iy * 1009) * 2 - 1) * spread
+  return { ox, oz }
+}
+
+/** Pick flat, well-spaced cells spread across the map; skips spawn and its neighbors. */
 export function findTreePlacements(
   cells: Record<string, TreeCellMeta>,
   spawnIx: number,
@@ -201,8 +298,8 @@ export function findTreePlacements(
   options: TreeSpawnOptions,
   cellSize: number,
 ): TreePlacement[] {
-  const minSpacing = options.minCellSpacing ?? 2
-  const candidates: { cell: TreeCellMeta; flatness: number }[] = []
+  const minSpacing = options.minCellSpacing ?? 4
+  const pool: { cell: TreeCellMeta; flatness: number }[] = []
 
   for (const cell of Object.values(cells)) {
     if (Math.abs(cell.ix - spawnIx) <= 1 && Math.abs(cell.iy - spawnIy) <= 1) continue
@@ -215,23 +312,41 @@ export function findTreePlacements(
     )
     if (flatness === null || flatness > options.maxHeightDelta) continue
 
-    candidates.push({ cell, flatness })
+    pool.push({ cell, flatness })
   }
-
-  candidates.sort((a, b) => a.flatness - b.flatness)
 
   const picked: { ix: number; iy: number }[] = [{ ix: spawnIx, iy: spawnIy }]
   const placements: TreePlacement[] = []
 
-  for (const { cell } of candidates) {
-    if (placements.length >= options.treeCount) break
-    if (!cellSpacingOk(cell.ix, cell.iy, picked, minSpacing)) continue
+  // Farthest-from-existing placement so trees spread across the whole map.
+  while (placements.length < options.treeCount && pool.length > 0) {
+    let bestIdx = -1
+    let bestSep = -1
 
+    for (let i = 0; i < pool.length; i++) {
+      const { cell } = pool[i]!
+      if (!cellSpacingOk(cell.ix, cell.iy, picked, minSpacing)) continue
+
+      let minSep = Infinity
+      for (const p of picked) {
+        const sep = Math.max(Math.abs(cell.ix - p.ix), Math.abs(cell.iy - p.iy))
+        if (sep < minSep) minSep = sep
+      }
+      if (minSep > bestSep) {
+        bestSep = minSep
+        bestIdx = i
+      }
+    }
+
+    if (bestIdx < 0) break
+
+    const { cell } = pool.splice(bestIdx, 1)[0]!
     picked.push({ ix: cell.ix, iy: cell.iy })
+    const { ox, oz } = offsetXZForCell(cell.ix, cell.iy, cellSize)
     placements.push({
-      x: cell.center_x,
-      y: cell.cap_top_y,
-      z: cell.center_y,
+      x: cell.center_x + ox,
+      y: cellSurfaceY(cell),
+      z: cell.center_y + oz,
       rotationY: rotationForCell(cell.ix, cell.iy),
     })
   }
@@ -250,6 +365,7 @@ export function placeTrees(
     const tree = template.clone(true)
     tree.position.set(spot.x, spot.y, spot.z)
     if (spot.rotationY !== undefined) tree.rotation.y = spot.rotationY
+    tree.scale.setScalar(TREE_SCALE)
     parent.add(tree)
     trees.push(tree)
   }

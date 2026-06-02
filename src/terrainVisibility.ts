@@ -2,9 +2,9 @@ import * as THREE from 'three'
 import type { SurfaceChunkManager, SurfaceChunkCell } from './surfaceChunks'
 import type { VoxelInstancer, VoxelCellRef } from './voxelInstancing'
 
-const VOXEL_RADIUS = 58
-const VOXEL_RADIUS_SQ = VOXEL_RADIUS * VOXEL_RADIUS
-const CHUNK_RADIUS = 95
+/** Fallback radii (overridden per quality tier by the graphics slider). */
+export const DEFAULT_VOXEL_RADIUS = 58
+export const DEFAULT_CHUNK_RADIUS = 95
 
 export type VisibilityContext = {
   cells: Map<string, SurfaceChunkCell & VoxelCellRef>
@@ -12,6 +12,10 @@ export type VisibilityContext = {
   voxelInstancer: VoxelInstancer
   voxelSize: number
   layerCount: number
+  /** Quality-driven cull distance (m) for surface chunk meshes. */
+  chunkRadius: number
+  /** Quality-driven cull distance (m) for underground voxel columns. */
+  voxelRadius: number
 }
 
 /** Distance culling for chunk meshes, source roots (raycast), and voxel instances. */
@@ -21,6 +25,8 @@ export function updateTerrainVisibility(
   ctx: VisibilityContext,
 ) {
   const { cells, surfaceChunks, voxelInstancer, voxelSize, layerCount } = ctx
+  const chunkRadius = ctx.chunkRadius
+  const voxelRadiusSq = ctx.voxelRadius * ctx.voxelRadius
 
   for (const mesh of surfaceChunks.group.children) {
     if (!(mesh instanceof THREE.Mesh)) continue
@@ -31,7 +37,7 @@ export function updateTerrainVisibility(
     }
     const dx = bs.center.x - px
     const dz = bs.center.z - pz
-    const r = bs.radius + CHUNK_RADIUS
+    const r = bs.radius + chunkRadius
     mesh.visible = dx * dx + dz * dz < r * r
   }
 
@@ -40,7 +46,7 @@ export function updateTerrainVisibility(
     const dz = cell.centerZ - pz
     const distSq = dx * dx + dz * dz
 
-    const wantVoxel = distSq < VOXEL_RADIUS_SQ
+    const wantVoxel = distSq < voxelRadiusSq
     if (cell._voxelVisible === wantVoxel) continue
     cell._voxelVisible = wantVoxel
 

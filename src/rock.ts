@@ -1,6 +1,12 @@
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import type { CollisionWorld } from './collisionWorld'
 import { cellWorldOrigin, type TerrainGrid } from './voxelPlacement'
+import { assignBoxProjectedUVs, getRockMaterial } from './rockTexture'
+import { sampleMeshGroundY } from './terrainGroundRay'
+
+/** World units covered by one stone-texture tile across a rock surface. */
+const ROCK_TEXTURE_UNITS_PER_TILE = 0.7
 
 const ROCK_MODEL_URLS = [
   '/assets/rock1.glb',
@@ -9,24 +15,32 @@ const ROCK_MODEL_URLS = [
 ] as const
 
 const _box = new THREE.Box3()
-const _rayOrigin = new THREE.Vector3()
-const _down = new THREE.Vector3(0, -1, 0)
-const _raycaster = new THREE.Raycaster()
 const _rayHits: THREE.Intersection[] = []
 
 /** Rays start at y = RAY_ORIGIN_Y; far must reach lowest terrain from that height. */
 const RAY_ORIGIN_Y = 500
 const RAYCAST_FAR = 1200
 
+/** Fraction of rock height buried below the terrain surface (0 = on top, 0.5 = halfway). */
+const ROCK_BURY_FRACTION = 0.5
+const ROCK_SUPPORT_RADIUS = 0.4
+/** Cell AABB / cap lip can sit this far above the sloped mesh; prefer mesh beyond that. */
+const ROCK_MESH_OVER_COLLISION_EPS = 0.25
+const ROCK_FALL_GRAVITY = 32
+const ROCK_MAX_DROP = 64
+const ROCK_FALL_VY_KEY = 'fallVy'
+
 export type RockGroundTargets = {
   surface: THREE.Object3D
   chunkRoot?: THREE.Object3D
 }
 
-export const DEFAULT_ROCK_CLUMP_COUNT = 14
-export const DEFAULT_ROCKS_PER_CLUMP = 4
-export const DEFAULT_ROCK_CLUMP_RADIUS = 2.5
-export const DEFAULT_ROCK_CLUMP_SPACING = 3
+export {
+  DEFAULT_ROCK_CLUMP_COUNT,
+  DEFAULT_ROCK_CLUMP_RADIUS,
+  DEFAULT_ROCK_CLUMP_SPACING,
+  DEFAULT_ROCKS_PER_CLUMP,
+} from './tuneDefaults'
 
 export type RockCellMeta = {
   ix: number
@@ -39,7 +53,7 @@ export type RockCellMeta = {
 export type RockSpawnOptions = {
   /** How many clumps to scatter. */
   clumpCount: number
-  /** Rocks placed in each clump. */
+  /** Max rocks placed in each clump (actual count is random from 1 to this). */
   rocksPerClump: number
   /** Max horizontal spread from clump center (world units). */
   clumpRadius: number
@@ -84,10 +98,13 @@ function alignModelToGround(model: THREE.Object3D) {
 }
 
 function prepareRockMesh(root: THREE.Object3D) {
+  const rockMaterial = getRockMaterial()
   root.traverse((child) => {
     if (!(child instanceof THREE.Mesh)) return
     child.castShadow = true
     child.receiveShadow = true
+    assignBoxProjectedUVs(child.geometry, ROCK_TEXTURE_UNITS_PER_TILE)
+    child.material = rockMaterial
   })
 }
 
@@ -125,31 +142,127 @@ function raycastGroundY(
   surface: THREE.Object3D,
   chunkRoot?: THREE.Object3D,
 ): number | null {
-  _rayOrigin.set(x, RAY_ORIGIN_Y, z)
-  _raycaster.near = 0
-  _raycaster.set(_rayOrigin, _down)
-  _raycaster.far = RAYCAST_FAR
-
-  _rayHits.length = 0
-  if (chunkRoot && chunkRoot.children.length > 0) {
-    _raycaster.intersectObjects(chunkRoot.children, false, _rayHits)
-  }
-  _raycaster.intersectObject(surface, true, _rayHits)
-  if (_rayHits.length === 0) return null
-
-  _rayHits.sort((a, b) => a.distance - b.distance)
-  return _rayHits[0].point.y
+  return sampleMeshGroundY(
+    x,
+    z,
+    RAY_ORIGIN_Y,
+    { surface, chunkRoot },
+    _rayHits,
+    RAYCAST_FAR,
+    { intersectInvisibleChunks: true },
+  )
 }
 
-/** Drop rock so its world-space bounding-box bottom sits on the terrain surface. */
-function snapRockToGround(rock: THREE.Object3D, ground: RockGroundTargets): boolean {
-  const groundY = raycastGroundY(rock.position.x, rock.position.z, ground.surface, ground.chunkRoot)
-  if (groundY === null) return false
-
+function rockHeight(rock: THREE.Object3D): number {
   rock.updateWorldMatrix(true, true)
   _box.setFromObject(rock)
-  rock.position.y += groundY - _box.min.y
+  return _box.max.y - _box.min.y
+}
+
+function rockBottomY(rock: THREE.Object3D): number {
+  rock.updateWorldMatrix(true, true)
+  _box.setFromObject(rock)
+  return _box.min.y
+}
+
+function buriedBottomY(groundY: number, height: number): number {
+  return groundY - height * ROCK_BURY_FRACTION
+}
+
+function resolveRockSupportY(
+  x: number,
+  z: number,
+  probeY: number,
+  ground: RockGroundTargets,
+  collisionWorld?: CollisionWorld,
+): number | null {
+  const meshY = raycastGroundY(x, z, ground.surface, ground.chunkRoot)
+  if (!collisionWorld) return meshY
+
+  const collY = collisionWorld.findTerrainGroundTop(
+    x,
+    probeY,
+    z,
+    ROCK_SUPPORT_RADIUS,
+    ROCK_MAX_DROP,
+  )
+  if (meshY === null) return collY
+  if (collY === null) return meshY
+  // Sloped cells expose a flat AABB/cap lip above the local surface mesh.
+  if (collY > meshY + ROCK_MESH_OVER_COLLISION_EPS) return meshY
+  return Math.max(meshY, collY)
+}
+
+/** Drop rock so it sits half-buried in the terrain surface. */
+function snapRockToGround(
+  rock: THREE.Object3D,
+  ground: RockGroundTargets,
+  collisionWorld?: CollisionWorld,
+): boolean {
+  const bottom = rockBottomY(rock)
+  const groundY = resolveRockSupportY(
+    rock.position.x,
+    rock.position.z,
+    bottom,
+    ground,
+    collisionWorld,
+  )
+  if (groundY === null) return false
+
+  const height = rockHeight(rock)
+  const targetBottom = buriedBottomY(groundY, height)
+  rock.position.y += targetBottom - bottom
+  delete rock.userData[ROCK_FALL_VY_KEY]
   return true
+}
+
+/** Gravity + terrain snap when the block under a rock is mined away. */
+export function updateRocksPhysics(
+  rocks: readonly THREE.Group[],
+  ground: RockGroundTargets,
+  collisionWorld: CollisionWorld,
+  dt: number,
+): boolean {
+  let moved = false
+
+  for (const rock of rocks) {
+    const bottom = rockBottomY(rock)
+    const groundY = resolveRockSupportY(
+      rock.position.x,
+      rock.position.z,
+      bottom,
+      ground,
+      collisionWorld,
+    )
+    if (groundY === null) continue
+
+    const height = rockHeight(rock)
+    const targetBottom = buriedBottomY(groundY, height)
+    const gap = bottom - targetBottom
+
+    if (gap <= 0.02) {
+      if (gap > 0.001) {
+        rock.position.y -= gap
+        moved = true
+      }
+      delete rock.userData[ROCK_FALL_VY_KEY]
+      continue
+    }
+
+    let vy = (rock.userData[ROCK_FALL_VY_KEY] as number | undefined) ?? 0
+    vy -= ROCK_FALL_GRAVITY * dt
+    rock.position.y += vy * dt
+    rock.userData[ROCK_FALL_VY_KEY] = vy
+    moved = true
+
+    const newBottom = rockBottomY(rock)
+    if (newBottom <= targetBottom) {
+      rock.position.y += targetBottom - newBottom
+      delete rock.userData[ROCK_FALL_VY_KEY]
+    }
+  }
+
+  return moved
 }
 
 export function resolveRockGroundY(
@@ -189,7 +302,8 @@ export function findRockPlacements(
     reserved.push({ ix: center.ix, iy: center.iy })
     const { x: cx, z: cz } = cellCenterXZ(grid, center.ix, center.iy)
 
-    for (let r = 0; r < options.rocksPerClump; r++) {
+    const rocksInClump = 1 + Math.floor(Math.random() * options.rocksPerClump)
+    for (let r = 0; r < rocksInClump; r++) {
       const angle = Math.random() * Math.PI * 2
       const dist =
         options.clumpRadius > 0
@@ -201,7 +315,7 @@ export function findRockPlacements(
         z: cz + Math.sin(angle) * dist,
         modelIndex: Math.floor(Math.random() * ROCK_MODEL_URLS.length),
         rotationY: Math.random() * Math.PI * 2,
-        scale: 0.75 + Math.random() * 0.55,
+        scale: 0.5 + Math.random() * 0.5,
       })
     }
   }
@@ -214,6 +328,7 @@ export function placeRocks(
   placements: RockPlacement[],
   parent: THREE.Object3D,
   ground?: RockGroundTargets,
+  collisionWorld?: CollisionWorld,
 ): THREE.Group[] {
   const rocks: THREE.Group[] = []
 
@@ -227,7 +342,7 @@ export function placeRocks(
     rock.scale.setScalar(spot.scale)
     parent.add(rock)
 
-    if (ground && !snapRockToGround(rock, ground)) {
+    if (ground && !snapRockToGround(rock, ground, collisionWorld)) {
       parent.remove(rock)
       continue
     }

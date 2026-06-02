@@ -1,0 +1,180 @@
+export type TuneState = {
+  gravity: number
+  jumpVelocity: number
+  jetpackHold: number
+  moveSpeed: number
+  cameraHeight: number
+  lookSpeed: number
+  digSpeed: number
+  debrisDivisions: number
+  brightness: number
+  graphics: number
+  fog: number
+  grassGreenSlope: number
+  grassTuftCluster: number
+  treeFlatness: number
+  treeRadius: number
+  treeCount: number
+  rockClumpCount: number
+  rocksPerClump: number
+  rockClumpRadius: number
+  rockClumpSpacing: number
+}
+
+/** Canonical tuning defaults — keep `index.html` slider `value`s in sync. */
+export const TUNE_DEFAULTS: TuneState = {
+  gravity: 7,
+  jumpVelocity: 4,
+  jetpackHold: 0.85,
+  moveSpeed: 7.5,
+  cameraHeight: 0.75,
+  lookSpeed: 1,
+  digSpeed: 0.5,
+  debrisDivisions: 4,
+  brightness: 1.75,
+  graphics: 50,
+  fog: 50,
+  grassGreenSlope: 20,
+  grassTuftCluster: 72,
+  treeFlatness: 1.25,
+  treeRadius: 4,
+  treeCount: 14,
+  rockClumpCount: 14,
+  rocksPerClump: 4,
+  rockClumpRadius: 2.5,
+  rockClumpSpacing: 3,
+}
+
+export const DEFAULT_GRAVITY = TUNE_DEFAULTS.gravity
+export const DEFAULT_JUMP_SPEED = TUNE_DEFAULTS.jumpVelocity
+export const DEFAULT_JETPACK_HOLD = TUNE_DEFAULTS.jetpackHold
+export const DEFAULT_WALK_SPEED = TUNE_DEFAULTS.moveSpeed
+const SPRINT_SPEED_RATIO = 13.5 / 7.5
+export const DEFAULT_RUN_SPEED = DEFAULT_WALK_SPEED * SPRINT_SPEED_RATIO
+export const DEFAULT_EYE_HEIGHT = TUNE_DEFAULTS.cameraHeight
+export const DEFAULT_LOOK_SPEED = TUNE_DEFAULTS.lookSpeed
+export const DEFAULT_BRIGHTNESS = TUNE_DEFAULTS.brightness
+export const DEFAULT_GRAPHICS = TUNE_DEFAULTS.graphics
+export const DEFAULT_DIG_SPEED = TUNE_DEFAULTS.digSpeed
+export const DEFAULT_GRASS_GREEN_SLOPE_SLIDER = TUNE_DEFAULTS.grassGreenSlope
+export const DEFAULT_TOP_SLOPE_THRESHOLD = TUNE_DEFAULTS.grassGreenSlope / 100
+
+/** 0–100 slider → 0–1 tuft patch tightness. */
+export function grassTuftClusterFromSlider(sliderValue: number) {
+  const t = Math.max(0, Math.min(100, sliderValue)) / 100
+  return 1 - (1 - t) ** 1.35
+}
+
+export const DEFAULT_TREE_MAX_HEIGHT_DELTA = TUNE_DEFAULTS.treeFlatness
+export const DEFAULT_TREE_SAMPLE_RADIUS = TUNE_DEFAULTS.treeRadius
+export const DEFAULT_TREE_COUNT = TUNE_DEFAULTS.treeCount
+
+export const DEFAULT_ROCK_CLUMP_COUNT = TUNE_DEFAULTS.rockClumpCount
+export const DEFAULT_ROCKS_PER_CLUMP = TUNE_DEFAULTS.rocksPerClump
+export const DEFAULT_ROCK_CLUMP_RADIUS = TUNE_DEFAULTS.rockClumpRadius
+export const DEFAULT_ROCK_CLUMP_SPACING = TUNE_DEFAULTS.rockClumpSpacing
+
+export type TuneSliderElements = {
+  [K in keyof TuneState]: HTMLInputElement
+}
+
+const STORAGE_KEY = 'briak-tune-v1'
+
+export function readTuneFromSliders(sliders: TuneSliderElements): TuneState {
+  return {
+    gravity: Number(sliders.gravity.value),
+    jumpVelocity: Number(sliders.jumpVelocity.value),
+    jetpackHold: Number(sliders.jetpackHold.value),
+    moveSpeed: Number(sliders.moveSpeed.value),
+    cameraHeight: Number(sliders.cameraHeight.value),
+    lookSpeed: Number(sliders.lookSpeed.value),
+    digSpeed: Number(sliders.digSpeed.value),
+    debrisDivisions: Number(sliders.debrisDivisions.value),
+    brightness: Number(sliders.brightness.value),
+    graphics: Number(sliders.graphics.value),
+    fog: Number(sliders.fog.value),
+    grassGreenSlope: Number(sliders.grassGreenSlope.value),
+    grassTuftCluster: Number(sliders.grassTuftCluster.value),
+    treeFlatness: Number(sliders.treeFlatness.value),
+    treeRadius: Number(sliders.treeRadius.value),
+    treeCount: Number(sliders.treeCount.value),
+    rockClumpCount: Number(sliders.rockClumpCount.value),
+    rocksPerClump: Number(sliders.rocksPerClump.value),
+    rockClumpRadius: Number(sliders.rockClumpRadius.value),
+    rockClumpSpacing: Number(sliders.rockClumpSpacing.value),
+  }
+}
+
+export function applyTuneToSliders(sliders: TuneSliderElements, state: TuneState) {
+  for (const key of Object.keys(TUNE_DEFAULTS) as (keyof TuneState)[]) {
+    sliders[key].value = String(state[key])
+  }
+}
+
+function migrateSavedTune(raw: Record<string, unknown>): Partial<TuneState> {
+  const out = { ...raw } as Partial<TuneState> & {
+    grassSlope?: number
+    grassClump?: number
+  }
+  if (out.grassGreenSlope === undefined && raw.grassSlope !== undefined) {
+    out.grassGreenSlope = raw.grassSlope as number
+  }
+  if (out.grassTuftCluster === undefined && raw.grassClump !== undefined) {
+    out.grassTuftCluster = raw.grassClump as number
+  }
+  return out
+}
+
+function loadSavedTune(): Partial<TuneState> | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    if (!parsed || typeof parsed !== 'object') return null
+    return migrateSavedTune(parsed)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Read the persisted graphics-slider value (0–100) before any sliders are wired up,
+ * so one-time renderer decisions (e.g. MSAA) can match the user's saved quality tier.
+ */
+export function peekSavedGraphics(): number {
+  const saved = loadSavedTune()
+  const value = saved?.graphics
+  return typeof value === 'number' && Number.isFinite(value) ? value : DEFAULT_GRAPHICS
+}
+
+export function saveTuneState(state: TuneState) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+/** Apply saved tune if present; otherwise keep DOM values and persist them. */
+export function applyTuneFromStorage(sliders: TuneSliderElements) {
+  const saved = loadSavedTune()
+  if (saved) {
+    applyTuneToSliders(sliders, { ...TUNE_DEFAULTS, ...saved })
+    return
+  }
+  const domValues = readTuneFromSliders(sliders)
+  applyTuneToSliders(sliders, domValues)
+  saveTuneState(domValues)
+}
+
+export function bindTunePersistence(sliders: TuneSliderElements) {
+  const persist = () => saveTuneState(readTuneFromSliders(sliders))
+  for (const key of Object.keys(TUNE_DEFAULTS) as (keyof TuneState)[]) {
+    sliders[key].addEventListener('input', persist)
+  }
+}
+
+/** Dev helper: `exportTuneDefaults()` in the browser console → paste into `TUNE_DEFAULTS`. */
+export function exportTuneDefaults(sliders: TuneSliderElements) {
+  return JSON.stringify(readTuneFromSliders(sliders), null, 2)
+}

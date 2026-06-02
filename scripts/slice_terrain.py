@@ -9,9 +9,11 @@ Each cell is a perfect axis-aligned box on the integer grid:
 Pipeline (game space: Y-up):
   1. STL → game coordinates once.
   2. Per cell: boolean ∩ vertical column → accurate peak Y.
-  3. Boolean ∩ cap slab (column ∩ slab, not full mesh).
-  4. Hard-clip vertices to the cell box; snap boundary verts to exact planes.
-  5. Export in world space (no shift to cell corner — partial caps keep true position).
+  3. Ray-cast the cell footprint → lowest surface point (valley Y).
+  4. Boolean ∩ cap slab spanning [floor(valley), ceil(peak)] so the cap tiles
+     the whole 5×5 footprint (steep cells no longer collapse to a sliver).
+  5. Hard-clip vertices to the cell box; snap boundary verts to exact planes.
+  6. Export in world space (no shift to cell corner — partial caps keep true position).
 
 Usage (from project root):
   .venv/bin/python scripts/slice_terrain.py
@@ -36,6 +38,26 @@ VOXEL_LAYERS = 5
 # Tall column used to find terrain inside each XZ cell.
 COLUMN_Y_MIN = -500.0
 COLUMN_Y_MAX = 500.0
+
+# Downward ray grid (per axis) used to find each cell's lowest surface point so the
+# cap can be extended to cover the full footprint instead of just the top slab.
+SURFACE_SAMPLES = 11
+# Safety margin (meters) subtracted from the sampled valley before grid-flooring, to
+# absorb surface dips that fall between ray samples on steep cells.
+SURFACE_SAFETY = 0.5
+# Caves / overhangs: when a column's downward ray passes through interior air (the ray
+# exits the solid and re-enters it lower down), that hollow is a real cave. We extend the
+# exported cap DOWN through such gaps to the cave floor so the hollow geometry is kept
+# (the boolean already leaves the tunnel hollow). Below the cap, solid voxels remain, so
+# the dig contract is preserved. The depth is bounded so a few very deep shafts don't
+# explode the triangle / memory budget — anything past the bound falls back to voxels.
+MAX_CAP_LAYERS = 8
+# An interior air gap shorter than this (meters) is treated as surface noise, not a cave.
+MIN_CAVE_GAP = 1.0
+# Minimum fraction of the cell footprint that must contain terrain for the cell to be
+# emitted. Boundary cells below this are skipped so blocky voxel columns never poke out
+# past the map edge (majority-rule voxelization). Raise for a tighter map silhouette.
+MIN_CELL_COVERAGE = 0.5
 
 # Vert within this distance of a cell face is snapped to that face (meters).
 BOUNDARY_SNAP = 1e-3
@@ -62,6 +84,11 @@ def layer_ceil(y: float) -> int:
     if y <= 0:
         return int(math.ceil(y / CELL_SIZE - 1e-12)) * CELL_SIZE
     return int(math.ceil((y - 1e-12) / CELL_SIZE)) * CELL_SIZE
+
+
+def layer_floor(y: float) -> int:
+    """Largest grid layer coordinate <= y (CELL_SIZE steps)."""
+    return int(math.floor(y / CELL_SIZE + 1e-12)) * CELL_SIZE
 
 
 def cell_origin(min_corner: int, index: int) -> int:
@@ -147,9 +174,84 @@ def snap_and_clip_to_box(
     return clean_piece(out)
 
 
-def cap_layers_for_peak(peak_y: float) -> tuple[int, int]:
+def surface_profile(
+    mesh: trimesh.Trimesh,
+    x0: float,
+    x1: float,
+    z0: float,
+    z1: float,
+) -> tuple[float | None, float, float | None]:
+    """
+    Sample the cell footprint with downward rays.
+
+    Returns (valley, coverage, cave_floor):
+      valley     – lowest point of the *top* terrain surface (None if no hit).
+      coverage   – fraction of sample rays that hit the mesh (footprint fill).
+      cave_floor – lowest "topmost-cave floor" across rays, i.e. the floor of the first
+                   interior air gap a ray falls into below the surface (None if the cell
+                   has no caves/overhangs). The cap is extended down to here so the cave
+                   hollow survives the slab clip.
+    """
+    xs = np.linspace(x0, x1, SURFACE_SAMPLES)
+    zs = np.linspace(z0, z1, SURFACE_SAMPLES)
+    gx, gz = np.meshgrid(xs, zs)
+    sample_count = gx.size
+    origins = np.column_stack(
+        [gx.ravel(), np.full(sample_count, COLUMN_Y_MAX), gz.ravel()]
+    )
+    directions = np.tile([0.0, -1.0, 0.0], (sample_count, 1))
+
+    locations, ray_idx, _ = mesh.ray.intersects_location(
+        origins, directions, multiple_hits=True
+    )
+    if len(locations) == 0:
+        return None, 0.0, None
+
+    per_ray: dict[int, list[float]] = {}
+    for y, ri in zip(locations[:, 1], ray_idx):
+        per_ray.setdefault(int(ri), []).append(float(y))
+
+    tops: dict[int, float] = {ri: max(ys) for ri, ys in per_ray.items()}
+    coverage = len(tops) / sample_count
+
+    cave_floor: float | None = None
+    for ys in per_ray.values():
+        ys = sorted(ys, reverse=True)
+        # Crossings (top → down): solid spans [ys[1], ys[0]], gap [ys[2], ys[1]], etc.
+        # The first interior air gap is (ys[2], ys[1]); ys[2] is its floor.
+        if len(ys) >= 3 and (ys[1] - ys[2]) >= MIN_CAVE_GAP:
+            floor = ys[2]
+            if cave_floor is None or floor < cave_floor:
+                cave_floor = floor
+
+    return min(tops.values()), coverage, cave_floor
+
+
+def cap_layers_for_peak(
+    peak_y: float,
+    valley_y: float | None,
+    cave_floor_y: float | None = None,
+) -> tuple[int, int]:
+    """
+    Cap slab covering the whole footprint: top at the grid layer above the peak,
+    bottom at the grid layer at/below the lowest surface point. Falls back to a
+    single top layer when no valley sample is available.
+
+    When the cell contains a cave/overhang, the bottom is pushed down past the cave
+    floor (bounded by MAX_CAP_LAYERS) so the hollow interior survives the slab clip and
+    becomes walkable geometry instead of being replaced by solid voxels.
+    """
     cap_top = layer_ceil(peak_y)
-    cap_bottom = cap_top - CAP_HEIGHT
+    if valley_y is None:
+        cap_bottom = cap_top - CAP_HEIGHT
+    else:
+        cap_bottom = layer_floor(valley_y - SURFACE_SAFETY)
+        cap_bottom = min(cap_bottom, cap_top - CAP_HEIGHT)
+    if cave_floor_y is not None:
+        # Keep solid below the cave floor too, so there is something to stand on.
+        cap_bottom = min(cap_bottom, layer_floor(cave_floor_y - SURFACE_SAFETY))
+    # Bound the total cap depth so rare deep shafts don't blow up the geometry budget.
+    cap_bottom = max(cap_bottom, cap_top - MAX_CAP_LAYERS * CAP_HEIGHT)
     return cap_bottom, cap_top
 
 
@@ -234,8 +336,14 @@ def slice_cell(
     if column is None:
         return None
 
+    valley, coverage, cave_floor = surface_profile(
+        mesh, float(x0), float(x1), float(z0), float(z1)
+    )
+    if coverage < MIN_CELL_COVERAGE:
+        return None
+
     peak = float(np.max(column.vertices[:, 1]))
-    cap_bottom, cap_top = cap_layers_for_peak(peak)
+    cap_bottom, cap_top = cap_layers_for_peak(peak, valley, cave_floor)
     piece = extract_cap_from_column(column, x0, x1, z0, z1, cap_bottom, cap_top)
     if piece is None:
         return None

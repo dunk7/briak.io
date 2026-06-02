@@ -1,0 +1,7 @@
+# Python dependencies for scripts/slice_terrain.py
+# Install into the project venv:
+#   python -m venv .venv && .venv/bin/python -m pip install -r scripts/requirements.txt
+numpy==2.4.6
+trimesh==4.12.2
+manifold3d==3.5.0
+rtree==1.4.1

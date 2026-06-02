@@ -4,7 +4,12 @@ import {
   mergeVertices,
 } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import { assignWorldTerrainUVs } from './surfaceCapMaterials'
+import { buildTerrainBVH, disposeTerrainBVH } from './meshCollider'
+import { buildGrassBladeField } from './grassBlades'
 import type { TerrainGrid } from './voxelPlacement'
+
+/** Per-chunk instance cap for grass-blade tufts (perf guard). */
+const GRASS_BLADE_MAX_PER_CHUNK = 3200
 
 const _matrix = new THREE.Matrix4()
 
@@ -67,9 +72,17 @@ export type SurfaceChunkCell = {
 /** Merges nearby surface GLTF meshes into draw-call batches aligned to the terrain grid. */
 export class SurfaceChunkManager {
   readonly group = new THREE.Group()
+  /** Grass-blade tufts live in a separate group (kept out of collision/dig picks). */
+  readonly bladeGroup = new THREE.Group()
   private readonly grid: TerrainGrid
   private readonly chunks = new Map<string, SurfaceChunkCell[]>()
   private readonly chunkMeshes = new Map<string, THREE.Mesh[]>()
+  /** Merged grass geometry per chunk, kept so blades can be (re)built on demand. */
+  private readonly chunkGrassGeometry = new Map<string, THREE.BufferGeometry>()
+  private readonly chunkBlades = new Map<string, THREE.InstancedMesh>()
+  private grassBladesEnabled = false
+  private grassBladeDensity = 0
+  private grassTuftCluster = 0
   private dirtMaterial: THREE.Material
   private grassMaterial: THREE.Material
   private readonly worldUnitsPerTile: number
@@ -86,6 +99,76 @@ export class SurfaceChunkManager {
     this.worldUnitsPerTile = worldUnitsPerTile
     this.group.matrixAutoUpdate = false
     this.group.updateMatrixWorld(true)
+    this.bladeGroup.matrixAutoUpdate = false
+    this.bladeGroup.updateMatrixWorld(true)
+  }
+
+  /** Enable/disable scattered grass blades, density (tufts/m²), and clump amount (0–1). */
+  setGrassBlades(enabled: boolean, density: number, clump = 0) {
+    if (
+      this.grassBladesEnabled === enabled &&
+      this.grassBladeDensity === density &&
+      this.grassTuftCluster === clump
+    ) {
+      return
+    }
+    this.grassBladesEnabled = enabled
+    this.grassBladeDensity = density
+    this.grassTuftCluster = clump
+    for (const id of this.chunkGrassGeometry.keys()) {
+      this.buildBladesForChunk(id)
+    }
+  }
+
+  private disposeBladesForChunk(id: string) {
+    const mesh = this.chunkBlades.get(id)
+    if (!mesh) return
+    this.bladeGroup.remove(mesh)
+    mesh.dispose()
+    this.chunkBlades.delete(id)
+  }
+
+  private buildBladesForChunk(id: string) {
+    this.disposeBladesForChunk(id)
+    if (!this.grassBladesEnabled) return
+    const geo = this.chunkGrassGeometry.get(id)
+    if (!geo) return
+    const mesh = buildGrassBladeField(geo, {
+      density: this.grassBladeDensity,
+      maxInstances: GRASS_BLADE_MAX_PER_CHUNK,
+      clump: this.grassTuftCluster,
+    })
+    if (!mesh) return
+    mesh.castShadow = false
+    mesh.receiveShadow = false
+    mesh.frustumCulled = true
+    mesh.matrixAutoUpdate = false
+    mesh.updateMatrixWorld(true)
+    this.bladeGroup.add(mesh)
+    this.chunkBlades.set(id, mesh)
+  }
+
+  /** Hide blade tufts beyond `bladeRadius` (much shorter than terrain draw distance). */
+  cullBlades(px: number, pz: number, bladeRadius: number) {
+    if (bladeRadius <= 0) {
+      for (const mesh of this.chunkBlades.values()) mesh.visible = false
+      return
+    }
+    for (const mesh of this.chunkBlades.values()) {
+      const bs = mesh.boundingSphere
+      if (!bs) {
+        mesh.visible = false
+        continue
+      }
+      const dx = bs.center.x - px
+      const dz = bs.center.z - pz
+      // Chunk center must be within blade radius (small margin for chunk footprint).
+      const margin = Math.min(bs.radius * 0.25, 6)
+      mesh.visible = dx * dx + dz * dz <= (bladeRadius + margin) ** 2
+      if (!mesh.visible) continue
+      // Near the fade edge, drop to a cheaper material path if we add LOD later.
+      mesh.frustumCulled = true
+    }
   }
 
   private chunkId(cell: SurfaceChunkCell) {
@@ -170,10 +253,13 @@ export class SurfaceChunkManager {
     if (prev) {
       for (const mesh of prev) {
         this.group.remove(mesh)
+        disposeTerrainBVH(mesh.geometry)
         mesh.geometry.dispose()
       }
       this.chunkMeshes.delete(id)
     }
+    this.disposeBladesForChunk(id)
+    this.chunkGrassGeometry.delete(id)
 
     const cells = this.chunks.get(id)
     if (!cells) return
@@ -200,6 +286,7 @@ export class SurfaceChunkManager {
         this.worldUnitsPerTile,
         this.grid,
       )
+      buildTerrainBVH(mergedDirt)
       const mesh = new THREE.Mesh(mergedDirt, this.dirtMaterial)
       mesh.castShadow = false
       mesh.receiveShadow = false
@@ -218,6 +305,7 @@ export class SurfaceChunkManager {
         this.worldUnitsPerTile,
         this.grid,
       )
+      buildTerrainBVH(mergedGrass)
       const mesh = new THREE.Mesh(mergedGrass, this.grassMaterial)
       mesh.castShadow = false
       mesh.receiveShadow = false
@@ -226,6 +314,7 @@ export class SurfaceChunkManager {
       mesh.updateMatrixWorld(true)
       meshes.push(mesh)
       this.group.add(mesh)
+      this.chunkGrassGeometry.set(id, mergedGrass)
     }
     for (const g of grassGeos) g.dispose()
 
@@ -236,6 +325,8 @@ export class SurfaceChunkManager {
     if (meshes.length > 0) {
       this.chunkMeshes.set(id, meshes)
     }
+
+    this.buildBladesForChunk(id)
   }
 
   setMaterials(dirt: THREE.Material, grass: THREE.Material) {
@@ -250,11 +341,16 @@ export class SurfaceChunkManager {
   dispose() {
     for (const meshes of this.chunkMeshes.values()) {
       for (const mesh of meshes) {
+        disposeTerrainBVH(mesh.geometry)
         mesh.geometry.dispose()
         this.group.remove(mesh)
       }
     }
     this.chunkMeshes.clear()
+    for (const id of [...this.chunkBlades.keys()]) {
+      this.disposeBladesForChunk(id)
+    }
+    this.chunkGrassGeometry.clear()
   }
 }
 

@@ -53,8 +53,10 @@ export function assignWorldTerrainUVs(
   }
 }
 
+import { DEFAULT_TOP_SLOPE_THRESHOLD } from './tuneDefaults'
+
 /** Face normal Y above this in the top band → grass; below → dirt. */
-export const DEFAULT_TOP_SLOPE_THRESHOLD = 0.2
+export { DEFAULT_TOP_SLOPE_THRESHOLD }
 export const DEFAULT_UP_THRESHOLD = 0.88
 
 export function createVoxelBoxGeometry(
