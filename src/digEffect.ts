@@ -11,6 +11,8 @@ const _crumbPos = new THREE.Vector3()
 const _dir = new THREE.Vector3()
 const _pMin = new THREE.Vector3()
 const _pMax = new THREE.Vector3()
+const _wobbleEuler = new THREE.Euler()
+const _wobbleQuat = new THREE.Quaternion()
 
 const GRAVITY = 32
 const RESTITUTION = 0.22
@@ -18,20 +20,36 @@ const WALL_FRICTION = 0.55
 const GROUND_FRICTION = 0.42
 const DEBRIS_LIFETIME_MIN = 1.0
 const DEBRIS_LIFETIME_MAX = 1.85
-const FADE_OUT_SEC = 0.2
+const FADE_OUT_SEC = 0.28
 const SETTLE_SPEED = 0.35
-/** Dig progress 0–1 at which all grid crumbs have appeared. */
-const SPAWN_END = 0.62
-const MAX_SPAWN_PER_UPDATE = 4
-const POP_IN_SEC = 0.14
+/** Delay between piece releases on break (seconds). */
+const SPLIT_STAGGER = 0.012
+
+export type DigBreakStyle = 'dirt' | 'stone' | 'wood'
+
+export type DigBreakOptions = {
+  excludeBottomFace?: boolean
+  style?: DigBreakStyle
+}
+
+type StyleTuning = {
+  targetShake: number
+  hitSquash: number
+  burstMul: number
+  spinMul: number
+}
+
+const STYLE_TUNING: Record<DigBreakStyle, StyleTuning> = {
+  dirt: { targetShake: 0.038, hitSquash: 0.13, burstMul: 1, spinMul: 1 },
+  stone: { targetShake: 0.028, hitSquash: 0.09, burstMul: 0.92, spinMul: 0.75 },
+  wood: { targetShake: 0.048, hitSquash: 0.15, burstMul: 1.12, spinMul: 1.4 },
+}
 
 type CrumbSlot = {
   base: THREE.Vector3
   half: number
   mesh: THREE.Mesh | null
-  spawned: boolean
   released: boolean
-  pop: number
 }
 
 type DebrisPiece = {
@@ -40,21 +58,41 @@ type DebrisPiece = {
   angVel: THREE.Vector3
   half: number
   life: number
+  settle: number
+}
+
+type HiddenOriginal = {
+  obj: THREE.Object3D
+  position: THREE.Vector3
+  quaternion: THREE.Quaternion
+  scale: THREE.Vector3
+  /** Restored when dig preview ends (surface caps use manual matrices). */
+  matrixAutoUpdate: boolean
+  /** Scale about mesh center — needed when matrixAutoUpdate is off. */
+  worldPivot: THREE.Vector3 | null
+}
+
+function smoothstep(t: number): number {
+  return t * t * (3 - 2 * t)
 }
 
 export class DigBreakEffect {
   readonly group = new THREE.Group()
   private slots: CrumbSlot[] = []
   private spawnOrder: number[] = []
-  private nextSpawn = 0
   private flying: DebrisPiece[] = []
   private hidden: THREE.Object3D[] = []
+  private hiddenState: HiddenOriginal[] = []
   private originalsHidden = false
   private collisionWorld: CollisionWorld | null = null
   private sharedGeo: THREE.BufferGeometry | null = null
   private material: THREE.Material | null = null
   private finished = false
   private breakFloorY = 0
+  private style: DigBreakStyle = 'dirt'
+  private tuning = STYLE_TUNING.dirt
+  private splitQueue: number[] = []
+  private splitTimer = 0
 
   constructor(parent: THREE.Object3D) {
     parent.add(this.group)
@@ -65,14 +103,14 @@ export class DigBreakEffect {
   }
 
   hasActiveDebris(): boolean {
-    return this.flying.length > 0
+    return this.flying.length > 0 || this.splitQueue.length > 0
   }
 
   startFromObject(
     root: THREE.Object3D,
     material: THREE.Material,
     divisions = 4,
-    options?: { excludeBottomFace?: boolean },
+    options?: DigBreakOptions,
   ) {
     this.finished = false
     this.cancelDig()
@@ -86,10 +124,13 @@ export class DigBreakEffect {
     material: THREE.Material,
     divisions: number,
     hide: THREE.Object3D[],
-    options?: { excludeBottomFace?: boolean },
+    options?: DigBreakOptions,
   ) {
     this.finished = false
     this.cancelDig()
+    this.style = options?.style ?? 'dirt'
+    this.tuning = STYLE_TUNING[this.style]
+
     box.getCenter(_center)
     box.getSize(_size)
 
@@ -126,9 +167,7 @@ export class DigBreakEffect {
             base: _crumbPos.clone(),
             half: Math.max(halfX, (sy * crumbScale) * 0.5, (sz * crumbScale) * 0.5),
             mesh: null,
-            spawned: false,
             released: false,
-            pop: 0,
           })
           distances.push({
             i: idx,
@@ -140,46 +179,36 @@ export class DigBreakEffect {
 
     distances.sort((a, b) => b.d - a.d)
     this.spawnOrder = distances.map((d) => d.i)
-    this.nextSpawn = 0
 
-    for (const obj of hide) this.hidden.push(obj)
+    for (const obj of hide) {
+      this.hidden.push(obj)
+      const matrixAutoUpdate = obj.matrixAutoUpdate
+      let worldPivot: THREE.Vector3 | null = null
+      if (!matrixAutoUpdate) {
+        obj.updateMatrixWorld(true)
+        _box.setFromObject(obj)
+        if (!_box.isEmpty()) worldPivot = _box.getCenter(new THREE.Vector3())
+        obj.matrixAutoUpdate = true
+      }
+      this.hiddenState.push({
+        obj,
+        position: obj.position.clone(),
+        quaternion: obj.quaternion.clone(),
+        scale: obj.scale.clone(),
+        matrixAutoUpdate,
+        worldPivot,
+      })
+    }
   }
 
-  update(progress: number) {
+  /** Wobble the intact model while digging; no debris until finish(). */
+  update(progress: number, swingImpact = 0) {
     if (this.finished) return
-
-    const spawnT = Math.min(1, progress / SPAWN_END)
-    const targetSpawned = Math.floor(spawnT * this.spawnOrder.length)
-    let spawnedNow = 0
-    while (
-      this.nextSpawn < targetSpawned &&
-      spawnedNow < MAX_SPAWN_PER_UPDATE
-    ) {
-      const idx = this.spawnOrder[this.nextSpawn++]
-      if (this.spawnSlot(this.slots[idx])) spawnedNow++
-    }
-
-    const shake = (1 - progress) * 0.014
-    const t = performance.now() * 0.001
-    for (const slot of this.slots) {
-      if (!slot.spawned || slot.released || !slot.mesh) continue
-      const { mesh, base } = slot
-      mesh.position.set(
-        base.x + Math.sin(t * 38 + base.x * 7) * shake,
-        base.y + Math.sin(t * 44 + base.y * 9) * shake * 0.5,
-        base.z + Math.sin(t * 31 + base.z * 5) * shake * 0.6,
-      )
-    }
+    this.animateHiddenTargets(progress, swingImpact)
   }
 
   tick(dt: number) {
-    for (const slot of this.slots) {
-      if (!slot.spawned || slot.released || !slot.mesh) continue
-      if (slot.pop >= 1) continue
-      slot.pop = Math.min(1, slot.pop + dt / POP_IN_SEC)
-      const s = slot.pop * slot.pop * (3 - 2 * slot.pop)
-      slot.mesh.scale.setScalar(s)
-    }
+    this.tickSplit(dt)
 
     if (this.flying.length === 0) return
 
@@ -197,7 +226,12 @@ export class DigBreakEffect {
       }
     }
 
-    if (this.flying.length === 0 && this.finished) {
+    if (
+      this.flying.length === 0 &&
+      this.splitQueue.length === 0 &&
+      this.finished
+    ) {
+      this.cleanupBreakSlots()
       this.finished = false
     }
   }
@@ -206,22 +240,13 @@ export class DigBreakEffect {
     if (this.finished) return
     this.finished = true
     this.hideOriginals()
-
-    for (let i = this.nextSpawn; i < this.spawnOrder.length; i++) {
-      this.spawnSlot(this.slots[this.spawnOrder[i]])
-    }
-    this.nextSpawn = this.spawnOrder.length
-
-    for (const slot of this.slots) {
-      if (slot.spawned && !slot.released) this.releaseSlot(slot, true)
-    }
-    this.slots.length = 0
-
+    this.beginSplit()
     onRemoved?.()
   }
 
   releaseHidden() {
     this.hidden.length = 0
+    this.hiddenState.length = 0
   }
 
   /** Stop the in-progress dig preview; leaves falling debris alone. */
@@ -242,21 +267,95 @@ export class DigBreakEffect {
     this.finished = false
   }
 
-  private spawnSlot(slot: CrumbSlot | undefined): boolean {
-    if (!slot || slot.spawned || !this.sharedGeo || !this.material) return false
+  private beginSplit() {
+    this.splitQueue = [...this.spawnOrder]
+    this.splitTimer = 0
+    if (this.splitQueue.length > 0) this.flushSplitPiece()
+  }
 
-    slot.spawned = true
-    if (!this.originalsHidden) this.hideOriginals()
+  private tickSplit(dt: number) {
+    if (this.splitQueue.length === 0) return
+    this.splitTimer -= dt
+    while (this.splitTimer <= 0 && this.splitQueue.length > 0) {
+      this.flushSplitPiece()
+      this.splitTimer += SPLIT_STAGGER
+    }
+  }
+
+  private flushSplitPiece() {
+    const idx = this.splitQueue.shift()
+    if (idx === undefined) return
+    const slot = this.slots[idx]
+    if (!slot || slot.released) return
+    if (!slot.mesh) this.spawnSlot(slot)
+    this.releaseSlot(slot, true)
+  }
+
+  private animateHiddenTargets(progress: number, swingImpact: number) {
+    if (this.originalsHidden || this.hiddenState.length === 0) return
+
+    const stress = smoothstep(progress)
+    const intensity = stress * stress * this.tuning.targetShake
+    const progressSquash = 1 - stress * 0.08
+    const hitSquash =
+      1 - Math.min(1, swingImpact) * this.tuning.hitSquash * (0.65 + stress * 0.35)
+    const scaleMul = progressSquash * hitSquash
+    const t = performance.now() * 0.001
+
+    for (const state of this.hiddenState) {
+      const { obj, position, quaternion, scale, worldPivot } = state
+      const hitKick = swingImpact * this.tuning.hitSquash * 0.04
+      const wobbleX = Math.sin(t * 54 + position.x * 11) * intensity
+      const wobbleY =
+        Math.sin(t * 63 + position.y * 8) * intensity * 0.45 - hitKick
+      const wobbleZ = Math.sin(t * 49 + position.z * 12) * intensity * 0.9
+
+      obj.scale.set(
+        scale.x * scaleMul,
+        scale.y * scaleMul,
+        scale.z * scaleMul,
+      )
+
+      if (worldPivot) {
+        obj.position.set(
+          worldPivot.x + (position.x - worldPivot.x) * scaleMul + wobbleX,
+          worldPivot.y + (position.y - worldPivot.y) * scaleMul + wobbleY,
+          worldPivot.z + (position.z - worldPivot.z) * scaleMul + wobbleZ,
+        )
+      } else {
+        obj.position.set(
+          position.x + wobbleX,
+          position.y + wobbleY,
+          position.z + wobbleZ,
+        )
+      }
+
+      const twist = intensity * 0.14
+      _wobbleEuler.set(
+        Math.sin(t * 42 + position.x) * twist,
+        Math.sin(t * 37 + position.y) * twist * 1.15,
+        Math.sin(t * 45 + position.z) * twist * 0.8,
+      )
+      _wobbleQuat.setFromEuler(_wobbleEuler).premultiply(quaternion)
+      obj.quaternion.copy(_wobbleQuat)
+
+      if (!obj.matrixAutoUpdate) {
+        obj.updateMatrix()
+        obj.updateMatrixWorld(true)
+      }
+    }
+  }
+
+  private spawnSlot(slot: CrumbSlot) {
+    if (!this.sharedGeo || !this.material) return
 
     const mesh = new THREE.Mesh(this.sharedGeo, this.material)
     mesh.position.copy(slot.base)
-    mesh.scale.setScalar(0.001)
+    mesh.scale.setScalar(1)
     mesh.castShadow = true
     mesh.receiveShadow = true
-    slot.pop = 0
     slot.mesh = mesh
     this.group.add(mesh)
-    return true
   }
 
   private releaseSlot(slot: CrumbSlot, burst: boolean) {
@@ -269,15 +368,38 @@ export class DigBreakEffect {
     if (_dir.lengthSq() < 1e-6) _dir.set(0, 1, 0)
     else _dir.normalize()
 
-    mesh.scale.setScalar(1)
+    mesh.scale.setScalar(1.06)
+    mesh.rotation.set(
+      (Math.random() - 0.5) * 0.35,
+      (Math.random() - 0.5) * 0.35,
+      (Math.random() - 0.5) * 0.35,
+    )
+
+    const burstScale = this.tuning.burstMul * (burst ? 1.4 : 1)
+    const lateral = burst ? 1.75 : 1.05
+    const lift = burst ? 0.6 : 0.38
 
     const vel = new THREE.Vector3(
-      (Math.random() - 0.5) * (burst ? 1.4 : 0.9),
-      burst ? 0.15 + Math.random() * 0.45 : 0.2 + Math.random() * 0.35,
-      (Math.random() - 0.5) * (burst ? 1.4 : 0.9),
+      (Math.random() - 0.5) * lateral,
+      lift * (0.4 + Math.random() * 0.6),
+      (Math.random() - 0.5) * lateral,
     )
-    vel.addScaledVector(_dir, burst ? 0.35 + Math.random() * 0.55 : 0.25 + Math.random() * 0.35)
+    vel.addScaledVector(
+      _dir,
+      (burst ? 0.6 : 0.32) + Math.random() * (burst ? 0.7 : 0.4),
+    )
+    vel.multiplyScalar(burstScale)
 
+    if (this.style === 'wood') {
+      vel.y += 0.14
+      vel.x += (Math.random() - 0.5) * 0.3
+      vel.z += (Math.random() - 0.5) * 0.3
+    } else if (this.style === 'stone') {
+      vel.y *= 0.8
+      vel.multiplyScalar(1.06)
+    }
+
+    const spin = (burst ? 15 : 8) * this.tuning.spinMul
     const life =
       DEBRIS_LIFETIME_MIN +
       Math.random() * (DEBRIS_LIFETIME_MAX - DEBRIS_LIFETIME_MIN)
@@ -286,12 +408,13 @@ export class DigBreakEffect {
       mesh,
       vel,
       angVel: new THREE.Vector3(
-        (Math.random() - 0.5) * (burst ? 12 : 6),
-        (Math.random() - 0.5) * (burst ? 12 : 6),
-        (Math.random() - 0.5) * (burst ? 12 : 6),
+        (Math.random() - 0.5) * spin,
+        (Math.random() - 0.5) * spin,
+        (Math.random() - 0.5) * spin,
       ),
       half: slot.half,
       life,
+      settle: 0,
     })
     slot.mesh = null
   }
@@ -303,6 +426,13 @@ export class DigBreakEffect {
     mesh.rotation.x += angVel.x * dt
     mesh.rotation.y += angVel.y * dt
     mesh.rotation.z += angVel.z * dt
+
+    if (piece.settle < 0.12) {
+      piece.settle += dt
+      const settleT = piece.settle / 0.12
+      const scale = THREE.MathUtils.lerp(1.06, 1, smoothstep(settleT))
+      mesh.scale.setScalar(scale)
+    }
 
     _pMin.set(
       mesh.position.x - half,
@@ -388,30 +518,51 @@ export class DigBreakEffect {
     }
   }
 
+  private restoreHiddenTransform(state: HiddenOriginal) {
+    state.obj.position.copy(state.position)
+    state.obj.quaternion.copy(state.quaternion)
+    state.obj.scale.copy(state.scale)
+    state.obj.matrixAutoUpdate = state.matrixAutoUpdate
+    state.obj.updateMatrix()
+    state.obj.updateMatrixWorld(true)
+  }
+
   private hideOriginals() {
     if (this.originalsHidden) return
-    for (const obj of this.hidden) obj.visible = false
+    for (const state of this.hiddenState) {
+      this.restoreHiddenTransform(state)
+      state.obj.visible = false
+    }
     this.originalsHidden = true
   }
 
   private showHidden() {
-    for (const obj of this.hidden) obj.visible = true
+    for (const state of this.hiddenState) {
+      this.restoreHiddenTransform(state)
+      state.obj.visible = true
+    }
     this.hidden.length = 0
+    this.hiddenState.length = 0
     this.originalsHidden = false
   }
 
-  private clearDigSlots() {
+  private cleanupBreakSlots() {
+    this.splitQueue.length = 0
+    this.splitTimer = 0
     for (const slot of this.slots) {
       if (slot.mesh?.parent) this.group.remove(slot.mesh)
     }
     this.slots.length = 0
     this.spawnOrder.length = 0
-    this.nextSpawn = 0
     if (this.sharedGeo) {
       this.tryDisposeGeometry(this.sharedGeo)
       this.sharedGeo = null
     }
     this.material = null
+  }
+
+  private clearDigSlots() {
+    this.cleanupBreakSlots()
     this.finished = false
   }
 

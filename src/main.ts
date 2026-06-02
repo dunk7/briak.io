@@ -12,7 +12,8 @@ import {
   DIRT_MID,
   DIRT_TEXTURE_REPEAT,
 } from './dirtTexture'
-import { DigBreakEffect } from './digEffect'
+import { DigBreakEffect, type DigBreakOptions } from './digEffect'
+import { Inventory } from './inventory'
 import {
   applySurfaceCapMaterials,
   DEFAULT_TOP_SLOPE_THRESHOLD,
@@ -45,6 +46,7 @@ import {
   qualityTFromSlider,
 } from './graphicsQuality'
 import { PlayerController, type PlayerInput } from './player'
+import { ViewmodelHand } from './viewmodelHand'
 import {
   flushPendingSurfaceSources,
   loadSurfaceCell,
@@ -169,6 +171,11 @@ function createTerrainMaterial(
 const VISIBILITY_INTERVAL = 0.2
 /** Max distance from the camera to start or continue digging. */
 const DIG_REACH = 7
+
+const ROCK_DIG_TIME_BASE = 1.35
+const TREE_DIG_TIME_BASE = 2.1
+const STONE_PER_ROCK = 3
+const WOOD_PER_TREE = 5
 
 function cellToCollision(cell: Cell, layerMask = cell.layerMask): TerrainCellCollision {
   return {
@@ -353,6 +360,7 @@ async function main() {
   syncMoveTune()
   syncBrightness()
   scene.add(camera)
+  const viewmodelHand = new ViewmodelHand(camera)
 
   const terrainRoot = new THREE.Group()
   scene.add(terrainRoot)
@@ -367,6 +375,8 @@ async function main() {
   grassMaterial.polygonOffset = true
   grassMaterial.polygonOffsetFactor = -1
   grassMaterial.polygonOffsetUnits = -1
+  const stoneBreakMaterial = createTerrainMaterial(0x8a8580, undefined, 0x1a1816)
+  const woodBreakMaterial = createTerrainMaterial(0x5c3a22, undefined, 0x1a0f08)
   const cells = new Map<string, Cell>()
   const surfaceGroup = new THREE.Group()
   const voxelGroup = new THREE.Group()
@@ -784,16 +794,31 @@ async function main() {
     placedRocks = []
   }
 
-  const respawnRocks = (finalize = false) => {
+  const loadedRockCells = (): Record<string, CellMeta> => {
+    const out: Record<string, CellMeta> = {}
+    for (const cell of cells.values()) {
+      if (!cell.surfaceRoot) continue
+      const meta = surfaceCells[cell.key]
+      if (meta) out[cell.key] = meta
+    }
+    return out
+  }
+
+  const respawnRocks = () => {
     if (!rockTemplates) return
     syncRockTuneLabels()
     clearPlacedRocks()
     const opts = getRockSpawnOptions()
-    const rockPlacements = findRockPlacements(surfaceCells, spawnIx, spawnIy, opts)
-    if (finalize) {
-      resolveRockGroundY(rockPlacements, surfaceGroup)
-    }
-    placedRocks = placeRocks(rockTemplates, rockPlacements, rocksGroup)
+    const rockPlacements = findRockPlacements(
+      loadedRockCells(),
+      terrainGrid,
+      spawnIx,
+      spawnIy,
+      opts,
+    )
+    resolveRockGroundY(rockPlacements, surfaceGroup, surfaceChunks.group)
+    const rockGround = { surface: surfaceGroup, chunkRoot: surfaceChunks.group }
+    placedRocks = placeRocks(rockTemplates, rockPlacements, rocksGroup, rockGround)
     syncPropCollision()
   }
 
@@ -806,7 +831,7 @@ async function main() {
     syncRockTuneLabels()
     if (rockRespawnDebounce) clearTimeout(rockRespawnDebounce)
     rockRespawnDebounce = setTimeout(
-      () => requestAnimationFrame(() => respawnRocks(false)),
+      () => requestAnimationFrame(() => respawnRocks()),
       250,
     )
   }
@@ -815,7 +840,7 @@ async function main() {
       clearTimeout(rockRespawnDebounce)
       rockRespawnDebounce = undefined
     }
-    requestAnimationFrame(() => respawnRocks(true))
+    requestAnimationFrame(() => respawnRocks())
   }
   const bindRockSlider = (el: HTMLInputElement) => {
     el.addEventListener('input', scheduleRockRespawn)
@@ -828,14 +853,14 @@ async function main() {
 
   info.textContent = 'Click to play — explore the terrain'
   controlsHint.textContent =
-    'WASD move · Shift sprint · Space jump · hold click or N to dig · Esc release mouse'
+    'WASD move · Shift sprint · Space jump · hold click or N to mine · Esc release mouse'
 
   void (async () => {
     const [trees, rocks] = await Promise.all([treeTemplatePromise, rockTemplatesPromise])
     treeTemplate = trees
     rockTemplates = rocks
     respawnTrees(true)
-    respawnRocks(true)
+    respawnRocks()
 
     if (deferredMetas.length > 0) {
       await loadSurfaceBatch(deferredMetas)
@@ -844,12 +869,14 @@ async function main() {
         .map((m) => cells.get(cellKey(m.ix, m.iy)))
         .filter((c): c is Cell => c?.surfaceRoot !== undefined)
       syncVoxelPlacement(loaded)
+      respawnRocks()
     }
   })()
 
   const digProgressFill = document.getElementById('dig-progress-fill')!
   const digSpeedSlider = document.getElementById('dig-speed-slider') as HTMLInputElement
   const digSpeedValue = document.getElementById('dig-speed-value')!
+  const inventory = new Inventory()
 
   /** Base dig duration at 1.0× speed (seconds to complete). */
   const VOXEL_DIG_TIME_BASE = 1.1
@@ -865,22 +892,80 @@ async function main() {
 
   type DigTarget = {
     id: string
-    cell: Cell
-    kind: 'surface' | 'voxel'
+    cell?: Cell
+    kind: 'surface' | 'voxel' | 'rock' | 'tree'
     layer?: number
     visualRoot: THREE.Object3D
+    propRef?: THREE.Group
+  }
+
+  function findMineableFromHit(
+    hit: THREE.Intersection,
+  ): { kind: 'rock' | 'tree'; root: THREE.Group } | null {
+    let current: THREE.Object3D | null = hit.object
+    while (current) {
+      if (placedRocks.includes(current as THREE.Group)) {
+        return { kind: 'rock', root: current as THREE.Group }
+      }
+      if (placedTrees.includes(current as THREE.Group)) {
+        return { kind: 'tree', root: current as THREE.Group }
+      }
+      current = current.parent
+    }
+    return null
+  }
+
+  function disposeMineableProp(root: THREE.Group) {
+    root.traverse((child) => {
+      if (child instanceof THREE.Mesh) child.geometry.dispose()
+    })
+  }
+
+  function removeMineableProp(root: THREE.Group, kind: 'rock' | 'tree') {
+    if (kind === 'rock') {
+      const idx = placedRocks.indexOf(root)
+      if (idx >= 0) placedRocks.splice(idx, 1)
+      rocksGroup.remove(root)
+      inventory.add('stone', STONE_PER_ROCK)
+      info.textContent = `Mined rock (+${STONE_PER_ROCK} stone)`
+    } else {
+      const idx = placedTrees.indexOf(root)
+      if (idx >= 0) placedTrees.splice(idx, 1)
+      treesGroup.remove(root)
+      inventory.add('wood', WOOD_PER_TREE)
+      info.textContent = `Chopped tree (+${WOOD_PER_TREE} wood)`
+    }
+    disposeMineableProp(root)
+    syncPropCollision()
   }
 
   let digTarget: DigTarget | null = null
   let digProgress = 0
   let digMouseDown = false
   let digEffectId: string | null = null
+  let surfaceDigPreviewCell: Cell | null = null
+
+  function setSurfaceDigPreview(cell: Cell | null) {
+    if (surfaceDigPreviewCell?.key === cell?.key) return
+    if (surfaceDigPreviewCell?.surfaceRoot) {
+      surfaceDigPreviewCell.surfaceRoot.visible = false
+    }
+    surfaceDigPreviewCell = cell
+    surfaceChunks.setDigPreviewCell(cell)
+    if (cell?.surfaceRoot) {
+      cell.surfaceRoot.visible = true
+      cell.surfaceRoot.updateMatrixWorld(true)
+    }
+  }
 
   const keys = new Set<string>()
   window.addEventListener('keydown', (e) => {
     if (e.repeat) return
     keys.add(e.code)
-    if (e.code === 'KeyN') e.preventDefault()
+    if (e.code === 'KeyN') {
+      e.preventDefault()
+      if (player.isLocked()) viewmodelHand.whack()
+    }
     if (e.code === 'Space' || e.code.startsWith('Arrow')) {
       e.preventDefault()
     }
@@ -914,6 +999,7 @@ async function main() {
       return
     }
     digMouseDown = true
+    viewmodelHand.whack()
   })
   window.addEventListener('mouseup', (e) => {
     if (e.button === 0) digMouseDown = false
@@ -921,7 +1007,7 @@ async function main() {
 
   player.controls.addEventListener('lock', () => {
     document.body.classList.add('playing')
-    info.textContent = 'Running on terrain — hold click or N to dig'
+    info.textContent = 'Running — hold click or N to mine rocks, trees, and terrain'
     renderer.domElement.style.cursor = 'none'
   })
 
@@ -970,9 +1056,16 @@ async function main() {
   }
 
   function completeDig(target: DigTarget) {
-    const { cell } = target
+    if (target.kind === 'rock' || target.kind === 'tree') {
+      if (target.propRef) removeMineableProp(target.propRef, target.kind)
+      return
+    }
+
+    const cell = target.cell
+    if (!cell) return
 
     if (target.kind === 'surface') {
+      setSurfaceDigPreview(null)
       if (!cell.surfaceRoot) return
       disposeSurfaceGeometries(cell.surfaceRoot)
       cell.surfaceRoot.parent?.remove(cell.surfaceRoot)
@@ -1007,6 +1100,12 @@ async function main() {
     for (const mesh of voxelInstancer.meshes) {
       raycaster.intersectObject(mesh, false, _pickHits)
     }
+    for (const tree of placedTrees) {
+      raycaster.intersectObject(tree, true, _pickHits)
+    }
+    for (const rock of placedRocks) {
+      raycaster.intersectObject(rock, true, _pickHits)
+    }
     if (_pickHits.length === 0) return null
 
     let best: THREE.Intersection | null = null
@@ -1026,7 +1125,8 @@ async function main() {
 
   function clearDigState(cancelFx = true) {
     if (cancelFx) digBreakFx.cancel()
-    else digBreakFx.cancelDig()
+    else digBreakFx.releaseHidden()
+    setSurfaceDigPreview(null)
     voxelInstancer.restoreDigHidden(cells, voxelSize)
     digEffectId = null
     digTarget = null
@@ -1040,53 +1140,77 @@ async function main() {
     digBreakFx.cancelDig()
     digEffectId = target.id
 
-    const digFxOptions = (excludeBottomFace: boolean) =>
-      excludeBottomFace ? { excludeBottomFace: true } : undefined
+    const digFxOptions = (
+      excludeBottomFace: boolean,
+      style: DigBreakOptions['style'] = 'dirt',
+    ): DigBreakOptions => ({
+      style,
+      ...(excludeBottomFace ? { excludeBottomFace: true } : {}),
+    })
+
+    if (target.kind === 'rock' || target.kind === 'tree') {
+      const mat = target.kind === 'rock' ? stoneBreakMaterial : woodBreakMaterial
+      const style = target.kind === 'rock' ? 'stone' : 'wood'
+      digBreakFx.startFromObject(target.visualRoot, mat, 4, digFxOptions(false, style))
+      return
+    }
+
+    const cell = target.cell
+    if (!cell) return
 
     if (target.kind === 'voxel' && target.layer !== undefined) {
       const layer = target.layer
       const excludeBottomFace =
-        layer < voxelLayers - 1 &&
-        voxelInstancer.hasLayer(target.cell, layer + 1)
-      voxelInstancer.tempHideLayer(target.cell, layer)
-      patchCellCollision(target.cell, target.cell.layerMask & ~(1 << layer))
-      voxelBoundsBox(target.cell, layer, _boundsBox)
+        layer < voxelLayers - 1 && voxelInstancer.hasLayer(cell, layer + 1)
+      voxelBoundsBox(cell, layer, _boundsBox)
       digBreakFx.startFromBox(
         _boundsBox,
         dirtMaterial,
         4,
         [],
-        digFxOptions(excludeBottomFace),
+        digFxOptions(excludeBottomFace, 'dirt'),
       )
       return
     }
 
-    const excludeBottomFace = voxelInstancer.layerCount(target.cell) > 0
-    if (target.cell.surfaceRoot) {
-      target.cell.surfaceRoot.updateWorldMatrix(true, false)
-      _boundsBox.setFromObject(target.cell.surfaceRoot)
+    const excludeBottomFace = voxelInstancer.layerCount(cell) > 0
+    if (target.kind === 'surface' && cell.surfaceRoot) {
+      setSurfaceDigPreview(cell)
+      cell.surfaceRoot.updateMatrixWorld(true)
+      _boundsBox.setFromObject(cell.surfaceRoot)
       if (!_boundsBox.isEmpty()) {
         digBreakFx.startFromBox(
           _boundsBox,
           dirtMaterial,
           5,
-          [target.visualRoot],
-          digFxOptions(excludeBottomFace),
+          [cell.surfaceRoot],
+          digFxOptions(excludeBottomFace, 'dirt'),
         )
         return
       }
+      setSurfaceDigPreview(null)
     }
     if (target.visualRoot) {
       digBreakFx.startFromObject(
         target.visualRoot,
         dirtMaterial,
         5,
-        digFxOptions(excludeBottomFace),
+        digFxOptions(excludeBottomFace, 'dirt'),
       )
     }
   }
 
   function digTargetFromHit(hit: THREE.Intersection): DigTarget | null {
+    const prop = findMineableFromHit(hit)
+    if (prop) {
+      return {
+        id: `prop:${prop.kind}:${prop.root.uuid}`,
+        kind: prop.kind,
+        visualRoot: prop.root,
+        propRef: prop.root,
+      }
+    }
+
     const cell = getCellFromHit(hit)
     if (!cell) return null
 
@@ -1115,9 +1239,17 @@ async function main() {
   }
 
   function digTargetStillValid(target: DigTarget): boolean {
-    if (target.kind === 'surface') return target.cell.surfaceRoot !== undefined
+    if (target.kind === 'rock') {
+      return target.propRef !== undefined && placedRocks.includes(target.propRef)
+    }
+    if (target.kind === 'tree') {
+      return target.propRef !== undefined && placedTrees.includes(target.propRef)
+    }
+    const cell = target.cell
+    if (!cell) return false
+    if (target.kind === 'surface') return cell.surfaceRoot !== undefined
     if (target.layer === undefined) return false
-    return voxelInstancer.hasLayer(target.cell, target.layer)
+    return voxelInstancer.hasLayer(cell, target.layer)
   }
 
   function updateDig(dt: number) {
@@ -1149,10 +1281,26 @@ async function main() {
     ensureDigEffect(target)
 
     const digTimeBase =
-      target.kind === 'surface' ? SURFACE_DIG_TIME_BASE : VOXEL_DIG_TIME_BASE
+      target.kind === 'surface'
+        ? SURFACE_DIG_TIME_BASE
+        : target.kind === 'voxel'
+          ? VOXEL_DIG_TIME_BASE
+          : target.kind === 'rock'
+            ? ROCK_DIG_TIME_BASE
+            : TREE_DIG_TIME_BASE
     const digTime = digTimeBase / getDigSpeed()
     digProgress = Math.min(1, digProgress + dt / digTime)
-    digBreakFx.update(digProgress)
+    const swingImpact = viewmodelHand.getSwingImpact()
+    digBreakFx.update(digProgress, swingImpact)
+    if (target.kind === 'voxel' && target.cell && target.layer !== undefined) {
+      voxelInstancer.applyDigWobble(
+        target.cell,
+        target.layer,
+        digProgress,
+        voxelSize,
+        swingImpact,
+      )
+    }
 
     document.body.classList.add('digging')
     digProgressFill.style.setProperty('--dig-deg', `${digProgress * 360}deg`)
@@ -1160,7 +1308,13 @@ async function main() {
     if (digProgress >= 1) {
       digBreakFx.releaseHidden()
       completeDig(target)
-      digBreakFx.finish(dirtMaterial)
+      const finishMat =
+        target.kind === 'rock'
+          ? stoneBreakMaterial
+          : target.kind === 'tree'
+            ? woodBreakMaterial
+            : dirtMaterial
+      digBreakFx.finish(finishMat)
       clearDigState(false)
     }
   }
@@ -1229,9 +1383,11 @@ async function main() {
       updateTerrainVisibility(p.x, p.z, visibilityCtx)
     }
 
-    if (isDigging()) updateDig(dt)
+    const digging = isDigging() && player.isLocked()
+    viewmodelHand.group.visible = player.isLocked()
+    viewmodelHand.update(dt, digging)
+    if (digging) updateDig(dt)
     else if (digTarget || digProgress > 0) clearDigState()
-
     digBreakFx.tick(dt)
 
     renderer.render(scene, camera)

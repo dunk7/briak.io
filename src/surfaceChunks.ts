@@ -11,10 +11,10 @@ const _matrix = new THREE.Matrix4()
 /** Cells per merged surface block (aligned to terrain grid indices). */
 const CELLS_PER_CHUNK_AXIS = 6
 
-const SNAP_EPS = 0.12
+const SNAP_EPS = 0.02
 const WELD_TOLERANCE = 0.05
 
-/** Snap verts on cell faces to exact grid planes so neighbors share coordinates. */
+/** Nudge verts already on a cell face onto the exact grid plane (seam weld only). */
 function snapPositionsToTerrainGrid(
   geometry: THREE.BufferGeometry,
   grid: TerrainGrid,
@@ -116,9 +116,20 @@ export class SurfaceChunkManager {
 
   private readonly dirtyChunkIds = new Set<string>()
   private flushGen = 0
+  /** Cell shown solo while digging; excluded from merged chunk meshes. */
+  private digPreviewCell: SurfaceChunkCell | null = null
 
   markDirtyForCell(cell: SurfaceChunkCell) {
     this.dirtyChunkIds.add(this.chunkId(cell))
+  }
+
+  /** Peel one cell out of the chunk batch so it can wobble in place while digging. */
+  setDigPreviewCell(cell: SurfaceChunkCell | null) {
+    if (this.digPreviewCell?.key === cell?.key) return
+    const prev = this.digPreviewCell
+    this.digPreviewCell = cell
+    if (prev) this.rebuildChunk(this.chunkId(prev))
+    if (cell) this.rebuildChunk(this.chunkId(cell))
   }
 
   flushDirty() {
@@ -172,6 +183,7 @@ export class SurfaceChunkManager {
 
     for (const cell of cells) {
       if (!cell.surfaceRoot) continue
+      if (this.digPreviewCell?.key === cell.key) continue
       cell.surfaceRoot.updateWorldMatrix(true, false)
       cell.surfaceRoot.traverse((child) => {
         if (!(child instanceof THREE.Mesh)) return

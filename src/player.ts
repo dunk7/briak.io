@@ -55,6 +55,8 @@ export class PlayerController {
   private readonly camera: THREE.PerspectiveCamera
   private readonly moveDir = new THREE.Vector3()
   private readonly wishVel = new THREE.Vector3()
+  private readonly horizontal = new THREE.Vector3()
+  private readonly target = new THREE.Vector3()
   private readonly lookFlat = new THREE.Vector3()
   private readonly rightFlat = new THREE.Vector3()
   private readonly yAxis = new THREE.Vector3(0, 1, 0)
@@ -243,7 +245,7 @@ export class PlayerController {
     const box = this.world!.boxes[boxIndex]!
     if (!xzOverlaps(feetX, feetZ, PLAYER_RADIUS, box)) return false
     const walkY = this.walkSurfaceY(feetY)
-    return Math.abs(box.max.y - walkY) <= 0.2
+    return Math.abs(box.max.y - walkY) <= 0.12
   }
 
   private canMoveTo(feetX: number, feetY: number, feetZ: number, dx: number, dz: number) {
@@ -287,6 +289,29 @@ export class PlayerController {
     }
 
     this.playerMin.y = savedMinY
+    return false
+  }
+
+  /** Walk delta at current height, or step up onto a low ledge when blocked. */
+  private moveHorizontal(dx: number, dz: number): boolean {
+    const pos = this.object.position
+    if (this.canMoveTo(pos.x, pos.y, pos.z, dx, dz)) {
+      pos.x += dx
+      pos.z += dz
+      return true
+    }
+
+    const stepY = pos.y + STEP_HEIGHT
+    if (
+      this.canMoveTo(pos.x, stepY, pos.z, dx, dz) &&
+      this.hasHeadroom(stepY, pos.x + dx, pos.z + dz)
+    ) {
+      pos.y = stepY
+      pos.x += dx
+      pos.z += dz
+      return true
+    }
+
     return false
   }
 
@@ -342,16 +367,16 @@ export class PlayerController {
 
     const accel = this.grounded ? GROUND_ACCEL : AIR_ACCEL
     const drag = this.grounded ? GROUND_DRAG : AIR_DRAG
-    const horizontal = new THREE.Vector3(this.velocity.x, 0, this.velocity.z)
-    const target = new THREE.Vector3(this.wishVel.x, 0, this.wishVel.z)
-    horizontal.lerp(target, 1 - Math.exp(-accel * dt))
+    this.horizontal.set(this.velocity.x, 0, this.velocity.z)
+    this.target.set(this.wishVel.x, 0, this.wishVel.z)
+    this.horizontal.lerp(this.target, 1 - Math.exp(-accel * dt))
 
     if (this.wishVel.lengthSq() < 0.01) {
-      horizontal.multiplyScalar(Math.exp(-drag * dt))
+      this.horizontal.multiplyScalar(Math.exp(-drag * dt))
     }
 
-    this.velocity.x = horizontal.x
-    this.velocity.z = horizontal.z
+    this.velocity.x = this.horizontal.x
+    this.velocity.z = this.horizontal.z
 
     if (this.grounded) {
       this.coyoteTimer = COYOTE_SEC
@@ -366,13 +391,19 @@ export class PlayerController {
     if (
       this.jumpQueued &&
       (this.grounded || this.coyoteTimer > 0) &&
-      this.jumpSpeed > 0
+      this.jumpSpeed > 0 &&
+      !this.overlapsAt(this.object.position.x, this.object.position.y, this.object.position.z)
     ) {
+      this.depenetrateAtFeet(4, { floor: true, ceiling: false })
       this.velocity.y = this.jumpSpeed
       this.grounded = false
       this.coyoteTimer = 0
       this.jumpQueued = false
-      this.object.position.y += 0.05
+      const pos = this.object.position
+      pos.y += 0.04
+      if (this.overlapsAt(pos.x, pos.y, pos.z)) {
+        pos.y -= 0.04
+      }
     }
 
     this.velocity.y -= this.gravity * dt
@@ -479,18 +510,14 @@ export class PlayerController {
     const falling = dy < -1e-10
 
     if (Math.abs(dx) > 1e-10) {
-      if (this.canMoveTo(pos.x, pos.y, pos.z, dx, 0)) {
-        pos.x += dx
-      } else {
+      if (!this.moveHorizontal(dx, 0)) {
         this.velocity.x = 0
       }
       this.depenetrateAtFeet(6, { floor: false, ceiling: rising })
     }
 
     if (Math.abs(dz) > 1e-10) {
-      if (this.canMoveTo(pos.x, pos.y, pos.z, 0, dz)) {
-        pos.z += dz
-      } else {
+      if (!this.moveHorizontal(0, dz)) {
         this.velocity.z = 0
       }
       this.depenetrateAtFeet(6, { floor: false, ceiling: rising })
@@ -567,6 +594,10 @@ export class PlayerController {
     if (gap > snapDownMax) {
       this.grounded = false
       return
+    }
+
+    if (this.overlapsAt(pos.x, pos.y, pos.z)) {
+      this.depenetrateAtFeet(6, { floor: true, ceiling: false })
     }
 
     if (Math.abs(gap) > 1e-4) {

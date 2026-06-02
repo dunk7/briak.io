@@ -46,9 +46,12 @@ export function voxelSeamY(cell: VoxelPlacementCell, voxelSize: number) {
   return cell.voxelBaseY ?? voxelStackBase(cell.capBottomY, voxelSize)
 }
 
+/** Sub-millimeter nudge when a face was snapped to the grid during export. */
+const GRID_FACE_NUDGE = 0.02
+
 /**
- * Snap the loaded cap mesh to the integer cell corner on the terrain grid and
- * lock the voxel seam to metadata so columns line up with neighbors.
+ * Lock the voxel seam to metadata and record the cap mesh AABB.
+ * Pieces are exported in world space; do not pull partial caps to the cell corner.
  */
 export function alignSurfaceToCellGrid(
   cell: Pick<
@@ -63,15 +66,23 @@ export function alignSurfaceToCellGrid(
   if (!cell.surfaceRoot) return
 
   const { x: x0, z: z0 } = cellWorldOrigin(grid, cell.ix, cell.iy)
+  const x1 = x0 + grid.cellSize
+  const z1 = z0 + grid.cellSize
   const targetY = cell.capBottomY
 
   const root = cell.surfaceRoot
   _cellBox.setFromObject(root)
 
-  const dx = x0 - _cellBox.min.x
-  const dy = targetY - _cellBox.min.y
-  const dz = z0 - _cellBox.min.z
-  if (Math.abs(dx) > 1e-6 || Math.abs(dy) > 1e-6 || Math.abs(dz) > 1e-6) {
+  let dx = 0
+  let dy = 0
+  let dz = 0
+  if (Math.abs(_cellBox.min.x - x0) < GRID_FACE_NUDGE) dx = x0 - _cellBox.min.x
+  else if (Math.abs(_cellBox.min.x - x1) < GRID_FACE_NUDGE) dx = x1 - _cellBox.min.x
+  if (Math.abs(_cellBox.min.y - targetY) < GRID_FACE_NUDGE) dy = targetY - _cellBox.min.y
+  if (Math.abs(_cellBox.min.z - z0) < GRID_FACE_NUDGE) dz = z0 - _cellBox.min.z
+  else if (Math.abs(_cellBox.min.z - z1) < GRID_FACE_NUDGE) dz = z1 - _cellBox.min.z
+
+  if (Math.abs(dx) > 1e-9 || Math.abs(dy) > 1e-9 || Math.abs(dz) > 1e-9) {
     root.position.x += dx
     root.position.y += dy
     root.position.z += dz

@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import { cellWorldOrigin, type TerrainGrid } from './voxelPlacement'
 
 const ROCK_MODEL_URLS = [
   '/assets/rock1.glb',
@@ -11,6 +12,16 @@ const _box = new THREE.Box3()
 const _rayOrigin = new THREE.Vector3()
 const _down = new THREE.Vector3(0, -1, 0)
 const _raycaster = new THREE.Raycaster()
+const _rayHits: THREE.Intersection[] = []
+
+/** Rays start at y = RAY_ORIGIN_Y; far must reach lowest terrain from that height. */
+const RAY_ORIGIN_Y = 500
+const RAYCAST_FAR = 1200
+
+export type RockGroundTargets = {
+  surface: THREE.Object3D
+  chunkRoot?: THREE.Object3D
+}
 
 export const DEFAULT_ROCK_CLUMP_COUNT = 14
 export const DEFAULT_ROCKS_PER_CLUMP = 4
@@ -101,22 +112,53 @@ export async function loadRockModels(
   return templates
 }
 
-function raycastGroundY(x: number, z: number, surface: THREE.Object3D): number | null {
-  _rayOrigin.set(x, 500, z)
+/** World XZ at the center of a terrain grid cell (metadata center_y is world Z). */
+function cellCenterXZ(grid: TerrainGrid, ix: number, iy: number) {
+  const { x: x0, z: z0 } = cellWorldOrigin(grid, ix, iy)
+  const half = grid.cellSize * 0.5
+  return { x: x0 + half, z: z0 + half }
+}
+
+function raycastGroundY(
+  x: number,
+  z: number,
+  surface: THREE.Object3D,
+  chunkRoot?: THREE.Object3D,
+): number | null {
+  _rayOrigin.set(x, RAY_ORIGIN_Y, z)
   _raycaster.near = 0
   _raycaster.set(_rayOrigin, _down)
-  _raycaster.far = 500
+  _raycaster.far = RAYCAST_FAR
 
-  const hits = _raycaster.intersectObject(surface, true)
-  return hits.length > 0 ? hits[0].point.y : null
+  _rayHits.length = 0
+  if (chunkRoot && chunkRoot.children.length > 0) {
+    _raycaster.intersectObjects(chunkRoot.children, false, _rayHits)
+  }
+  _raycaster.intersectObject(surface, true, _rayHits)
+  if (_rayHits.length === 0) return null
+
+  _rayHits.sort((a, b) => a.distance - b.distance)
+  return _rayHits[0].point.y
+}
+
+/** Drop rock so its world-space bounding-box bottom sits on the terrain surface. */
+function snapRockToGround(rock: THREE.Object3D, ground: RockGroundTargets): boolean {
+  const groundY = raycastGroundY(rock.position.x, rock.position.z, ground.surface, ground.chunkRoot)
+  if (groundY === null) return false
+
+  rock.updateWorldMatrix(true, true)
+  _box.setFromObject(rock)
+  rock.position.y += groundY - _box.min.y
+  return true
 }
 
 export function resolveRockGroundY(
   placements: RockPlacement[],
   surface: THREE.Object3D,
+  chunkRoot?: THREE.Object3D,
 ): void {
   for (const spot of placements) {
-    const y = raycastGroundY(spot.x, spot.z, surface)
+    const y = raycastGroundY(spot.x, spot.z, surface, chunkRoot)
     if (y !== null) spot.y = y
   }
 }
@@ -124,6 +166,7 @@ export function resolveRockGroundY(
 /** Random clumps: pick spaced cells, then scatter rocks in a disk around each center. */
 export function findRockPlacements(
   cells: Record<string, RockCellMeta>,
+  grid: TerrainGrid,
   spawnIx: number,
   spawnIy: number,
   options: RockSpawnOptions,
@@ -144,6 +187,7 @@ export function findRockPlacements(
     if (!cellSpacingOk(center.ix, center.iy, reserved, minSpacing)) continue
 
     reserved.push({ ix: center.ix, iy: center.iy })
+    const { x: cx, z: cz } = cellCenterXZ(grid, center.ix, center.iy)
 
     for (let r = 0; r < options.rocksPerClump; r++) {
       const angle = Math.random() * Math.PI * 2
@@ -152,9 +196,9 @@ export function findRockPlacements(
           ? Math.sqrt(Math.random()) * options.clumpRadius
           : 0
       placements.push({
-        x: center.center_x + Math.cos(angle) * dist,
+        x: cx + Math.cos(angle) * dist,
         y: center.cap_top_y,
-        z: center.center_y + Math.sin(angle) * dist,
+        z: cz + Math.sin(angle) * dist,
         modelIndex: Math.floor(Math.random() * ROCK_MODEL_URLS.length),
         rotationY: Math.random() * Math.PI * 2,
         scale: 0.75 + Math.random() * 0.55,
@@ -169,6 +213,7 @@ export function placeRocks(
   templates: THREE.Group[],
   placements: RockPlacement[],
   parent: THREE.Object3D,
+  ground?: RockGroundTargets,
 ): THREE.Group[] {
   const rocks: THREE.Group[] = []
 
@@ -181,6 +226,12 @@ export function placeRocks(
     rock.rotation.y = spot.rotationY
     rock.scale.setScalar(spot.scale)
     parent.add(rock)
+
+    if (ground && !snapRockToGround(rock, ground)) {
+      parent.remove(rock)
+      continue
+    }
+
     rocks.push(rock)
   }
 

@@ -8,6 +8,11 @@ const _zeroScale = new THREE.Vector3(0, 0, 0)
 const _hiddenPos = new THREE.Vector3(0, -1e6, 0)
 const _hiddenQuat = new THREE.Quaternion()
 const _hiddenMatrix = new THREE.Matrix4()
+const _wobblePos = new THREE.Vector3()
+const _wobbleQuat = new THREE.Quaternion()
+const _wobbleScale = new THREE.Vector3()
+const _wobbleEuler = new THREE.Euler()
+const _wobbleOffset = new THREE.Quaternion()
 
 export type VoxelCellRef = VoxelPlacementCell
 
@@ -18,6 +23,7 @@ export class VoxelInstancer {
   readonly geometry: THREE.BoxGeometry
   private readonly cellKeys: string[] = []
   private readonly hiddenDuringDig = new Set<string>()
+  private digWobbleId: string | null = null
 
   constructor(
     material: THREE.Material,
@@ -148,6 +154,61 @@ export class VoxelInstancer {
       this.meshes[layer]!.instanceMatrix.needsUpdate = true
     }
     this.hiddenDuringDig.clear()
+    this.clearDigWobble(cells, voxelSize)
+  }
+
+  applyDigWobble(
+    cell: VoxelCellRef,
+    layer: number,
+    progress: number,
+    voxelSize: number,
+    swingImpact = 0,
+  ) {
+    if (!this.hasLayer(cell, layer)) return
+    this.digWobbleId = `${cell.key}:${layer}`
+
+    composeVoxelMatrix(cell, layer, voxelSize, _matrix)
+    _wobblePos.setFromMatrixPosition(_matrix)
+    _wobbleQuat.setFromRotationMatrix(_matrix)
+    _wobbleScale.setFromMatrixScale(_matrix)
+
+    const stress = progress * progress
+    const intensity = stress * 0.042
+    const progressSquash = 1 - stress * 0.07
+    const hitSquash = 1 - Math.min(1, swingImpact) * 0.12 * (0.65 + stress * 0.35)
+    const scaleMul = progressSquash * hitSquash
+    const hitKick = swingImpact * 0.05
+    const t = performance.now() * 0.001
+
+    _wobblePos.x += Math.sin(t * 54 + _wobblePos.x * 11) * intensity
+    _wobblePos.y += Math.sin(t * 63 + _wobblePos.y * 8) * intensity * 0.4 - hitKick
+    _wobblePos.z += Math.sin(t * 49 + _wobblePos.z * 12) * intensity * 0.85
+
+    const twist = intensity * 0.1
+    _wobbleEuler.set(
+      Math.sin(t * 42) * twist,
+      Math.sin(t * 37 + 1) * twist * 1.1,
+      Math.sin(t * 45 + 2) * twist * 0.75,
+    )
+    _wobbleOffset.setFromEuler(_wobbleEuler)
+    _wobbleQuat.premultiply(_wobbleOffset)
+
+    _wobbleScale.multiplyScalar(scaleMul)
+    _matrix.compose(_wobblePos, _wobbleQuat, _wobbleScale)
+    this.meshes[layer]!.setMatrixAt(cell.instanceIndex, _matrix)
+    this.meshes[layer]!.instanceMatrix.needsUpdate = true
+  }
+
+  clearDigWobble(cells: Map<string, VoxelCellRef>, voxelSize: number) {
+    if (!this.digWobbleId) return
+    const [key, layerStr] = this.digWobbleId.split(':')
+    const layer = Number(layerStr)
+    const cell = cells.get(key!)
+    this.digWobbleId = null
+    if (!cell || !this.hasLayer(cell, layer)) return
+    composeVoxelMatrix(cell, layer, voxelSize, _matrix)
+    this.meshes[layer]!.setMatrixAt(cell.instanceIndex, _matrix)
+    this.meshes[layer]!.instanceMatrix.needsUpdate = true
   }
 
   dispose() {

@@ -2,13 +2,16 @@
 """
 Slice map3.stl into exact 5 m terrain columns for the voxel game.
 
-Pipeline (all in game space: Y-up, integer cell corners):
-  1. Convert STL once to game coordinates.
-  2. Lay out a fixed X/Z grid aligned to CELL_SIZE.
-  3. Per cell: intersect a vertical column, read the highest surface Y.
-  4. Cap top = next grid layer at/above that peak; cap bottom = top - CAP_HEIGHT.
-  5. Boolean-cut the cap slab with an exact axis-aligned box.
-  6. Snap boundary vertices to cell faces and weld duplicates.
+Each cell is a perfect axis-aligned box on the integer grid:
+  X/Z: [min + ix*CELL, min + (ix+1)*CELL]
+  Y cap: [cap_bottom, cap_top] with cap_top = ceil(peak / CELL) * CELL
+
+Pipeline (game space: Y-up):
+  1. STL → game coordinates once.
+  2. Per cell: boolean ∩ vertical column → accurate peak Y.
+  3. Boolean ∩ cap slab (column ∩ slab, not full mesh).
+  4. Hard-clip vertices to the cell box; snap boundary verts to exact planes.
+  5. Export in world space (no shift to cell corner — partial caps keep true position).
 
 Usage (from project root):
   .venv/bin/python scripts/slice_terrain.py
@@ -30,13 +33,15 @@ CELL_SIZE = 5
 CAP_HEIGHT = CELL_SIZE
 VOXEL_LAYERS = 5
 
-# Tall enough to contain the map in game Y after STL→Y-up conversion.
+# Tall column used to find terrain inside each XZ cell.
 COLUMN_Y_MIN = -500.0
 COLUMN_Y_MAX = 500.0
 
-# Snap verts within this distance of a cell face onto the face (meters).
-FACE_SNAP_EPS = 0.25
-VERTEX_MERGE_EPS = 1e-4
+# Vert within this distance of a cell face is snapped to that face (meters).
+BOUNDARY_SNAP = 1e-3
+# After snap, clip any overshoot (boolean tolerance).
+CLIP_PAD = 1e-6
+VERTEX_MERGE_DIGITS = 8
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STL_PATH = os.path.join(PROJECT_ROOT, "map3.stl")
@@ -44,7 +49,7 @@ OUTPUT_DIR = os.path.join(PROJECT_ROOT, "assets", "terrain", "surface_pieces")
 
 
 def stl_to_y_up(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    """STL (X, Y, Z) → game (X, Y-up, Z) where game Y = STL Z, game Z = STL Y."""
+    """STL (X, Y, Z) → game (X, Y-up, Z): game Y = STL Z, game Z = STL Y."""
     out = mesh.copy()
     v = out.vertices
     out.vertices = np.column_stack([v[:, 0], v[:, 2], v[:, 1]])
@@ -52,14 +57,11 @@ def stl_to_y_up(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     return out
 
 
-def layer_floor(y: float) -> int:
-    """Largest grid layer coordinate <= y."""
-    return int(math.floor((y + 1e-9) / CELL_SIZE)) * CELL_SIZE
-
-
 def layer_ceil(y: float) -> int:
-    """Smallest grid layer coordinate >= y."""
-    return int(math.ceil((y - 1e-9) / CELL_SIZE)) * CELL_SIZE
+    """Smallest grid layer coordinate >= y (CELL_SIZE steps)."""
+    if y <= 0:
+        return int(math.ceil(y / CELL_SIZE - 1e-12)) * CELL_SIZE
+    return int(math.ceil((y - 1e-12) / CELL_SIZE)) * CELL_SIZE
 
 
 def cell_origin(min_corner: int, index: int) -> int:
@@ -79,22 +81,20 @@ def exact_box(
     z1: float,
 ) -> trimesh.Trimesh:
     """Axis-aligned box with corners exactly on (x0,y0,z0) and (x1,y1,z1)."""
-    extents = [x1 - x0, y1 - y0, z1 - z0]
-    center = [(x0 + x1) * 0.5, (y0 + y1) * 0.5, (z0 + z1) * 0.5]
+    extents = (x1 - x0, y1 - y0, z1 - z0)
+    center = ((x0 + x1) * 0.5, (y0 + y1) * 0.5, (z0 + z1) * 0.5)
     box = trimesh.creation.box(extents=extents)
     box.apply_translation(center)
     return box
 
 
 def _drop_bad_faces(mesh: trimesh.Trimesh) -> None:
-    """Remove degenerate and duplicate faces (trimesh 4.x)."""
     mesh.update_faces(mesh.nondegenerate_faces())
     mesh.update_faces(mesh.unique_faces())
     mesh.remove_unreferenced_vertices()
 
 
 def preprocess_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    """Clean source mesh before booleans."""
     m = mesh.copy()
     m.merge_vertices(merge_tex=True, merge_norm=True)
     _drop_bad_faces(m)
@@ -102,9 +102,8 @@ def preprocess_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
 
 
 def clean_piece(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    """Clean boolean output (normals recomputed in-game on load)."""
     m = mesh.copy()
-    m.merge_vertices(merge_tex=True, merge_norm=True, digits_vertex=6)
+    m.merge_vertices(merge_tex=True, merge_norm=True, digits_vertex=VERTEX_MERGE_DIGITS)
     _drop_bad_faces(m)
     return m
 
@@ -119,7 +118,7 @@ def boolean_intersection(a: trimesh.Trimesh, b: trimesh.Trimesh) -> trimesh.Trim
     return clean_piece(out)
 
 
-def snap_vertices_to_cell(
+def snap_and_clip_to_box(
     piece: trimesh.Trimesh,
     x0: int,
     x1: int,
@@ -128,20 +127,20 @@ def snap_vertices_to_cell(
     z0: int,
     z1: int,
 ) -> trimesh.Trimesh:
-    """Snap verts on cell faces to exact grid planes so neighbors share edges."""
+    """
+    Force the piece inside the cell box and weld boundary verts to exact grid planes.
+    """
+    lo = (float(x0), float(y0), float(z0))
+    hi = (float(x1), float(y1), float(z1))
     verts = piece.vertices.copy()
-    planes = (
-        (0, float(x0), float(x1)),
-        (1, float(y0), float(y1)),
-        (2, float(z0), float(z1)),
-    )
-    for axis, lo, hi in planes:
+
+    for axis, (plane_lo, plane_hi) in enumerate(zip(lo, hi)):
         col = verts[:, axis]
-        near_lo = np.abs(col - lo) < FACE_SNAP_EPS
-        near_hi = np.abs(col - hi) < FACE_SNAP_EPS
-        col[near_lo] = lo
-        col[near_hi] = hi
-        verts[:, axis] = np.clip(col, lo, hi)
+        near_lo = np.abs(col - plane_lo) <= BOUNDARY_SNAP
+        near_hi = np.abs(col - plane_hi) <= BOUNDARY_SNAP
+        col[near_lo] = plane_lo
+        col[near_hi] = plane_hi
+        verts[:, axis] = np.clip(col, plane_lo - CLIP_PAD, plane_hi + CLIP_PAD)
 
     out = piece.copy()
     out.vertices = verts
@@ -149,21 +148,17 @@ def snap_vertices_to_cell(
 
 
 def cap_layers_for_peak(peak_y: float) -> tuple[int, int]:
-    """
-    Grid-aligned cap spanning exactly one layer band below the surface peak.
-    cap_top is the first layer boundary at or above peak_y; cap_bottom = cap_top - CAP_HEIGHT.
-    """
     cap_top = layer_ceil(peak_y)
     cap_bottom = cap_top - CAP_HEIGHT
     return cap_bottom, cap_top
 
 
 def load_game_mesh(path: str) -> trimesh.Trimesh:
-    print(f"Loading {path} …")
+    print(f"Loading {path} …", flush=True)
     raw = trimesh.load(path)
     if not isinstance(raw, trimesh.Trimesh):
         raw = raw.dump(concatenate=True)
-    print(f"  watertight: {raw.is_watertight}")
+    print(f"  watertight: {raw.is_watertight}", flush=True)
     if not raw.is_watertight:
         print(
             "ERROR: mesh is not watertight — fix map3.stl and re-run slice-terrain.",
@@ -172,12 +167,11 @@ def load_game_mesh(path: str) -> trimesh.Trimesh:
         raise SystemExit(1)
 
     mesh = preprocess_mesh(stl_to_y_up(raw))
-    print(f"  game bounds: {mesh.bounds[0]} → {mesh.bounds[1]}")
+    print(f"  game bounds: {mesh.bounds[0]} → {mesh.bounds[1]}", flush=True)
     return mesh
 
 
 def grid_extent(mesh: trimesh.Trimesh) -> tuple[int, int, int, int]:
-    """Integer-aligned grid covering the mesh in game X/Z."""
     lo, hi = mesh.bounds
     min_x = int(math.floor(lo[0] / CELL_SIZE)) * CELL_SIZE
     min_z = int(math.floor(lo[2] / CELL_SIZE)) * CELL_SIZE
@@ -192,32 +186,21 @@ def grid_centers(min_corner: int, num_cells: int) -> list[float]:
     return [cell_center(min_corner, i) for i in range(num_cells)]
 
 
-def column_peak_y(
+def intersect_column(
     mesh: trimesh.Trimesh,
     x0: int,
     x1: int,
     z0: int,
     z1: int,
-) -> float | None:
-    """
-    Highest game-Y in the vertical column [x0,x1]×[z0,z1].
-    Uses mesh vertices for speed; confirms with a boolean only when the peak is ambiguous.
-    """
-    v = mesh.vertices
-    in_column = (
-        (v[:, 0] >= x0)
-        & (v[:, 0] <= x1)
-        & (v[:, 2] >= z0)
-        & (v[:, 2] <= z1)
+) -> trimesh.Trimesh | None:
+    column = exact_box(
+        float(x0), float(x1), COLUMN_Y_MIN, COLUMN_Y_MAX, float(z0), float(z1)
     )
-    if not np.any(in_column):
-        return None
-
-    return float(np.max(v[in_column, 1]))
+    return boolean_intersection(mesh, column)
 
 
-def extract_cap(
-    mesh: trimesh.Trimesh,
+def extract_cap_from_column(
+    column: trimesh.Trimesh,
     x0: int,
     x1: int,
     z0: int,
@@ -225,19 +208,13 @@ def extract_cap(
     cap_bottom: int,
     cap_top: int,
 ) -> trimesh.Trimesh | None:
-    """Exact cap slab cut from the terrain."""
     slab = exact_box(
-        float(x0),
-        float(x1),
-        float(cap_bottom),
-        float(cap_top),
-        float(z0),
-        float(z1),
+        float(x0), float(x1), float(cap_bottom), float(cap_top), float(z0), float(z1)
     )
-    piece = boolean_intersection(mesh, slab)
+    piece = boolean_intersection(column, slab)
     if piece is None:
         return None
-    return snap_vertices_to_cell(piece, x0, x1, cap_bottom, cap_top, z0, z1)
+    return snap_and_clip_to_box(piece, x0, x1, cap_bottom, cap_top, z0, z1)
 
 
 def slice_cell(
@@ -248,18 +225,18 @@ def slice_cell(
     min_x: int,
     min_z: int,
 ) -> tuple[trimesh.Trimesh, int, int] | None:
-    """Slice one grid cell; returns (mesh, cap_bottom, cap_top) or None."""
     x0 = cell_origin(min_x, ix)
     z0 = cell_origin(min_z, iy)
     x1 = x0 + CELL_SIZE
     z1 = z0 + CELL_SIZE
 
-    peak = column_peak_y(mesh, x0, x1, z0, z1)
-    if peak is None:
+    column = intersect_column(mesh, x0, x1, z0, z1)
+    if column is None:
         return None
 
+    peak = float(np.max(column.vertices[:, 1]))
     cap_bottom, cap_top = cap_layers_for_peak(peak)
-    piece = extract_cap(mesh, x0, x1, z0, z1, cap_bottom, cap_top)
+    piece = extract_cap_from_column(column, x0, x1, z0, z1, cap_bottom, cap_top)
     if piece is None:
         return None
 
@@ -273,7 +250,6 @@ def active_cell_range(
     num_x: int,
     num_z: int,
 ) -> tuple[int, int, int, int]:
-    """Index range [ix0, ix1) × [iy0, iy1) that can intersect the mesh."""
     lo, hi = mesh.bounds
     ix0 = max(0, (int(math.floor(lo[0])) - min_x) // CELL_SIZE)
     ix1 = min(num_x, (int(math.ceil(hi[0])) - min_x) // CELL_SIZE + 1)
@@ -288,23 +264,36 @@ def validate_cell(
     z0: int,
     cap_bottom: int,
     cap_top: int,
-) -> None:
-    """Warn if cut drifted off the intended grid cell."""
+) -> bool:
+    """Return False if geometry drifted outside the intended cell box."""
     b = piece.bounds
     if b is None:
-        return
-    tol = 0.05
+        return False
+    tol = 0.01
     x1 = x0 + CELL_SIZE
     z1 = z0 + CELL_SIZE
-    if b[0][0] < x0 - tol or b[1][0] > x1 + tol:
-        print(f"  WARN: X bounds {b[0][0]:.3f}..{b[1][0]:.3f} outside [{x0},{x1}]")
-    if b[0][2] < z0 - tol or b[1][2] > z1 + tol:
-        print(f"  WARN: Z bounds {b[0][2]:.3f}..{b[1][2]:.3f} outside [{z0},{z1}]")
-    if b[0][1] < cap_bottom - tol or b[1][1] > cap_top + tol:
-        print(
-            f"  WARN: Y bounds {b[0][1]:.3f}..{b[1][1]:.3f} "
-            f"outside [{cap_bottom},{cap_top}]"
-        )
+    ok = True
+    checks = (
+        (b[0][0] < x0 - tol, f"X min {b[0][0]:.4f} < {x0}"),
+        (b[1][0] > x1 + tol, f"X max {b[1][0]:.4f} > {x1}"),
+        (b[0][2] < z0 - tol, f"Z min {b[0][2]:.4f} < {z0}"),
+        (b[1][2] > z1 + tol, f"Z max {b[1][2]:.4f} > {z1}"),
+        (b[0][1] < cap_bottom - tol, f"Y min {b[0][1]:.4f} < {cap_bottom}"),
+        (b[1][1] > cap_top + tol, f"Y max {b[1][1]:.4f} > {cap_top}"),
+    )
+    for bad, msg in checks:
+        if bad:
+            print(f"  WARN: {msg}")
+            ok = False
+    return ok
+
+
+def mesh_bounds_dict(piece: trimesh.Trimesh) -> dict[str, list[float]]:
+    b = piece.bounds
+    return {
+        "min": [float(b[0][0]), float(b[0][1]), float(b[0][2])],
+        "max": [float(b[1][0]), float(b[1][1]), float(b[1][2])],
+    }
 
 
 def main() -> int:
@@ -319,7 +308,6 @@ def main() -> int:
     mesh = load_game_mesh(STL_PATH)
     min_x, min_z, num_x, num_z = grid_extent(mesh)
 
-    # Game expects a square index grid; pad the shorter axis with empty indices.
     num_cells = max(num_x, num_z)
     if num_x != num_z:
         print(
@@ -341,13 +329,14 @@ def main() -> int:
 
     meta_cells: dict[str, dict] = {}
     exported = 0
+    warn_count = 0
     total = (ix1 - ix0) * (iy1 - iy0)
     done = 0
 
     for ix in range(ix0, ix1):
         for iy in range(iy0, iy1):
             done += 1
-            if done % 25 == 0 or done == total:
+            if done % 10 == 0 or done == total:
                 print(f"  progress {done}/{total} ({exported} exported) …", flush=True)
 
             result = slice_cell(mesh, ix, iy, min_x=min_x, min_z=min_z)
@@ -357,14 +346,12 @@ def main() -> int:
             piece, cap_bottom, cap_top = result
             x0 = cell_origin(min_x, ix)
             z0 = cell_origin(min_z, iy)
-            x1 = x0 + CELL_SIZE
-            z1 = z0 + CELL_SIZE
 
-            validate_cell(piece, x0, z0, cap_bottom, cap_top)
+            if not validate_cell(piece, x0, z0, cap_bottom, cap_top):
+                warn_count += 1
 
             center_x = cell_center(min_x, ix)
             center_z = cell_center(min_z, iy)
-            b = piece.bounds
 
             filename = f"surf_{ix}_{iy}.glb"
             filepath = os.path.join(OUTPUT_DIR, filename)
@@ -379,10 +366,7 @@ def main() -> int:
                 "tri_count": int(len(piece.faces)),
                 "cap_bottom_y": cap_bottom,
                 "cap_top_y": cap_top,
-                "bounds": {
-                    "min": [float(x0), cap_bottom, float(z0)],
-                    "max": [float(x1), float(cap_top), float(z1)],
-                },
+                "bounds": mesh_bounds_dict(piece),
             }
             exported += 1
 
@@ -411,8 +395,9 @@ def main() -> int:
             "source": "map3.stl",
             "game_up": "Y",
             "note": (
-                "Caps are exact CELL_SIZE slabs on integer X/Z/Y grid; "
-                "cap_top = ceil(surface_peak / CELL_SIZE) * CELL_SIZE"
+                "Each cap is mesh ∩ exact CELL_SIZE slab on integer grid; "
+                "pieces keep world position (partial caps are not shifted to cell corner); "
+                "cap_top = ceil(peak_y / CELL_SIZE) * CELL_SIZE"
             ),
         },
     }
@@ -423,6 +408,8 @@ def main() -> int:
 
     print()
     print(f"Exported {exported} surface pieces → {OUTPUT_DIR}")
+    if warn_count:
+        print(f"  {warn_count} cells had boundary validation warnings")
     print(f"Global voxel seam_y = {seam_y}")
     print(f"Metadata → {meta_path}")
     return 0
