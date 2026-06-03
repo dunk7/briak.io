@@ -7,7 +7,50 @@
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
-    <div id="inventory-hud" aria-label="Inventory"></div>
+    <div id="bottom-hud">
+      <div id="health-hud" aria-label="Health">
+        <div id="health-bar-track">
+          <div id="health-bar-fill"></div>
+        </div>
+        <span id="health-value">100</span>
+      </div>
+      <div id="inventory-hud" aria-label="Hotbar"></div>
+    </div>
+    <div id="inventory-panel" hidden aria-label="Inventory and crafting">
+      <div class="inventory-panel-inner">
+        <header class="inventory-panel-header">
+          <h2 class="inventory-panel-title">Inventory</h2>
+          <button
+            type="button"
+            class="inventory-close"
+            data-inventory-close
+            aria-label="Close inventory"
+            title="Close (E)"
+          >
+            ×
+          </button>
+        </header>
+        <div class="inventory-panel-body">
+          <div class="inventory-column" aria-label="Items">
+            <section class="inventory-section">
+              <h3 class="inventory-section-label">Storage</h3>
+              <div class="inventory-grid inventory-grid--backpack" data-backpack-grid></div>
+            </section>
+            <section class="inventory-section inventory-section--hotbar">
+              <h3 class="inventory-section-label">Hotbar</h3>
+              <div class="inventory-grid inventory-grid--hotbar" data-panel-hotbar></div>
+            </section>
+          </div>
+          <aside class="inventory-craft-column" aria-label="Crafting">
+            <h3 class="inventory-section-label">Crafting</h3>
+            <div class="craft-scroll">
+              <div class="craft-grid" data-craft-grid></div>
+            </div>
+          </aside>
+        </div>
+      </div>
+      <div id="inventory-cursor-float" hidden aria-hidden="true"></div>
+    </div>
     <div id="perf-hud" aria-hidden="true">--</div>
     <div id="info">Loading terrain…</div>
     <div id="crosshair" aria-hidden="true"></div>
@@ -104,11 +147,6 @@
         </label>
         <input type="range" id="debris-divisions-slider" min="1" max="8" step="1" value="4" />
         <output id="debris-divisions-value">64</output>
-      </div>
-      <div class="jump-tune-row">
-        <label for="brightness-slider">Brightness</label>
-        <input type="range" id="brightness-slider" min="0.5" max="2.5" step="0.05" value="1.75" />
-        <output id="brightness-value">1.75</output>
       </div>
       <div class="jump-tune-row">
         <label for="graphics-slider">Graphics</label>
@@ -213,6 +251,30 @@
         </label>
         <input type="range" id="rock-clump-spacing-slider" min="2" max="12" step="1" value="3" />
         <output id="rock-clump-spacing-value">3</output>
+      </div>
+      <div class="jump-tune-row">
+        <label
+          for="enemy-spawn-rate-slider"
+          title="Lower = slower spawns; higher = more frequent"
+        >
+          Enemy spawn rate
+        </label>
+        <input type="range" id="enemy-spawn-rate-slider" min="0" max="100" step="1" value="58" />
+        <output id="enemy-spawn-rate-value">2.8s</output>
+      </div>
+      <div class="jump-tune-row">
+        <label for="enemy-speed-slider" title="How fast enemies crawl">
+          Enemy speed
+        </label>
+        <input type="range" id="enemy-speed-slider" min="0" max="100" step="1" value="58" />
+        <output id="enemy-speed-value">1.79</output>
+      </div>
+      <div class="jump-tune-row">
+        <label for="enemy-light-height-slider" title="Vertical offset of the glow inside the enemy mesh">
+          Enemy light height
+        </label>
+        <input type="range" id="enemy-light-height-slider" min="0" max="100" step="1" value="50" />
+        <output id="enemy-light-height-value">0.00</output>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

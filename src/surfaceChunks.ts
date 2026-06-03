@@ -279,7 +279,8 @@ export class SurfaceChunkManager {
     }
 
     const meshes: THREE.Mesh[] = []
-    const mergedDirtRaw = mergeGeometries(dirtGeos, false)
+    const mergedDirtRaw =
+      dirtGeos.length > 0 ? mergeGeometries(dirtGeos, false) : null
     if (mergedDirtRaw) {
       const mergedDirt = finalizeMergedSurfaceGeometry(
         mergedDirtRaw,
@@ -298,7 +299,8 @@ export class SurfaceChunkManager {
     }
     for (const g of dirtGeos) g.dispose()
 
-    const mergedGrassRaw = mergeGeometries(grassGeos, false)
+    const mergedGrassRaw =
+      grassGeos.length > 0 ? mergeGeometries(grassGeos, false) : null
     if (mergedGrassRaw) {
       const mergedGrass = finalizeMergedSurfaceGeometry(
         mergedGrassRaw,

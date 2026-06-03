@@ -3,6 +3,18 @@ import * as THREE from 'three'
 /** Player-placed build cubes are 2.5 m on a side, snapped to their own grid. */
 export const BUILD_BLOCK_SIZE = 2.5
 
+/** Box with +Y top face in material group 1; other faces in group 0. */
+export function createGrassTopDirtBoxGeometry(size: number): THREE.BoxGeometry {
+  const geo = new THREE.BoxGeometry(size, size, size)
+  geo.clearGroups()
+  // BoxGeometry face order: +X, -X, +Y, -Y, +Z, -Z (6 indices per face).
+  const face = 6
+  geo.addGroup(0, face * 2, 0)
+  geo.addGroup(face * 2, face, 1)
+  geo.addGroup(face * 3, face * 3, 0)
+  return geo
+}
+
 export type BuildBlockType = 'dirt' | 'wood' | 'stone'
 
 export const BUILD_BLOCK_TYPES: readonly BuildBlockType[] = ['dirt', 'wood', 'stone']
@@ -165,21 +177,36 @@ export class BlockBuilder {
   readonly group = new THREE.Group()
   readonly ghost = new THREE.Group()
   readonly materials: Record<BuildBlockType, THREE.Material>
+  readonly grassTopMaterial: THREE.Material | null
 
-  private readonly geometry: THREE.BoxGeometry
+  private readonly plainGeometry: THREE.BoxGeometry
+  private readonly dirtGeometry: THREE.BoxGeometry
   private readonly ghostBox: THREE.Mesh
   private readonly layers = new Map<BuildBlockType, TypeLayer>()
   private readonly cellByKey = new Map<string, BuildCell>()
 
-  constructor(materials: Record<BuildBlockType, THREE.Material>, capacity = 4096) {
+  constructor(
+    materials: Record<BuildBlockType, THREE.Material>,
+    grassTopMaterial: THREE.Material | null = null,
+    capacity = 4096,
+  ) {
     this.materials = materials
-    this.geometry = new THREE.BoxGeometry(
+    this.grassTopMaterial = grassTopMaterial
+    this.plainGeometry = new THREE.BoxGeometry(
       BUILD_BLOCK_SIZE,
       BUILD_BLOCK_SIZE,
       BUILD_BLOCK_SIZE,
     )
+    this.dirtGeometry = grassTopMaterial
+      ? createGrassTopDirtBoxGeometry(BUILD_BLOCK_SIZE)
+      : this.plainGeometry
     for (const type of BUILD_BLOCK_TYPES) {
-      const mesh = this.createMesh(materials[type], capacity)
+      const geometry = type === 'dirt' ? this.dirtGeometry : this.plainGeometry
+      const material =
+        type === 'dirt' && grassTopMaterial
+          ? [materials.dirt, grassTopMaterial]
+          : materials[type]
+      const mesh = this.createMesh(material, geometry, capacity)
       this.layers.set(type, {
         mesh,
         order: [],
@@ -195,10 +222,10 @@ export class BlockBuilder {
       opacity: 0.35,
       depthWrite: false,
     })
-    this.ghostBox = new THREE.Mesh(this.geometry, ghostMat)
+    this.ghostBox = new THREE.Mesh(this.plainGeometry, ghostMat)
     this.ghostBox.raycast = () => {}
     const edges = new THREE.LineSegments(
-      new THREE.EdgesGeometry(this.geometry),
+      new THREE.EdgesGeometry(this.plainGeometry),
       new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.65 }),
     )
     edges.raycast = () => {}
@@ -209,8 +236,12 @@ export class BlockBuilder {
     this.group.add(this.ghost)
   }
 
-  private createMesh(material: THREE.Material, capacity: number): THREE.InstancedMesh {
-    const mesh = new THREE.InstancedMesh(this.geometry, material, capacity)
+  private createMesh(
+    material: THREE.Material | THREE.Material[],
+    geometry: THREE.BufferGeometry,
+    capacity: number,
+  ): THREE.InstancedMesh {
+    const mesh = new THREE.InstancedMesh(geometry, material, capacity)
     mesh.count = 0
     mesh.castShadow = false
     mesh.receiveShadow = false
@@ -367,7 +398,12 @@ export class BlockBuilder {
     const old = layer.mesh
     const newCapacity = layer.capacity * 2
     const type = [...this.layers.entries()].find(([, l]) => l === layer)?.[0] ?? 'dirt'
-    const grown = this.createMesh(this.materials[type], newCapacity)
+    const geometry = type === 'dirt' ? this.dirtGeometry : this.plainGeometry
+    const material =
+      type === 'dirt' && this.grassTopMaterial
+        ? [this.materials.dirt, this.grassTopMaterial]
+        : this.materials[type]
+    const grown = this.createMesh(material, geometry, newCapacity)
     for (let i = 0; i < layer.order.length; i++) {
       old.getMatrixAt(i, _matrix)
       grown.setMatrixAt(i, _matrix)

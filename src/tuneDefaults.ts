@@ -7,7 +7,6 @@ export type TuneState = {
   lookSpeed: number
   digSpeed: number
   debrisDivisions: number
-  brightness: number
   graphics: number
   fog: number
   grassGreenSlope: number
@@ -19,6 +18,9 @@ export type TuneState = {
   rocksPerClump: number
   rockClumpRadius: number
   rockClumpSpacing: number
+  enemySpawnRate: number
+  enemySpeed: number
+  enemyLightHeight: number
 }
 
 /** Canonical tuning defaults — keep `index.html` slider `value`s in sync. */
@@ -31,7 +33,6 @@ export const TUNE_DEFAULTS: TuneState = {
   lookSpeed: 1,
   digSpeed: 0.5,
   debrisDivisions: 4,
-  brightness: 1.75,
   graphics: 50,
   fog: 50,
   grassGreenSlope: 20,
@@ -43,6 +44,9 @@ export const TUNE_DEFAULTS: TuneState = {
   rocksPerClump: 4,
   rockClumpRadius: 2.5,
   rockClumpSpacing: 3,
+  enemySpawnRate: 58,
+  enemySpeed: 58,
+  enemyLightHeight: 50,
 }
 
 export const DEFAULT_GRAVITY = TUNE_DEFAULTS.gravity
@@ -53,7 +57,8 @@ const SPRINT_SPEED_RATIO = 13.5 / 7.5
 export const DEFAULT_RUN_SPEED = DEFAULT_WALK_SPEED * SPRINT_SPEED_RATIO
 export const DEFAULT_EYE_HEIGHT = TUNE_DEFAULTS.cameraHeight
 export const DEFAULT_LOOK_SPEED = TUNE_DEFAULTS.lookSpeed
-export const DEFAULT_BRIGHTNESS = TUNE_DEFAULTS.brightness
+/** Peak exposure during the day phase of the automatic cycle. */
+export const DEFAULT_BRIGHTNESS = 1.75
 export const DEFAULT_GRAPHICS = TUNE_DEFAULTS.graphics
 export const DEFAULT_DIG_SPEED = TUNE_DEFAULTS.digSpeed
 export const DEFAULT_GRASS_GREEN_SLOPE_SLIDER = TUNE_DEFAULTS.grassGreenSlope
@@ -80,34 +85,43 @@ export type TuneSliderElements = {
 
 const STORAGE_KEY = 'briak-tune-v1'
 
+function sliderValue(sliders: TuneSliderElements, key: keyof TuneState): number {
+  const el = sliders[key]
+  return el ? Number(el.value) : TUNE_DEFAULTS[key]
+}
+
 export function readTuneFromSliders(sliders: TuneSliderElements): TuneState {
   return {
-    gravity: Number(sliders.gravity.value),
-    jumpVelocity: Number(sliders.jumpVelocity.value),
-    jetpackHold: Number(sliders.jetpackHold.value),
-    moveSpeed: Number(sliders.moveSpeed.value),
-    cameraHeight: Number(sliders.cameraHeight.value),
-    lookSpeed: Number(sliders.lookSpeed.value),
-    digSpeed: Number(sliders.digSpeed.value),
-    debrisDivisions: Number(sliders.debrisDivisions.value),
-    brightness: Number(sliders.brightness.value),
-    graphics: Number(sliders.graphics.value),
-    fog: Number(sliders.fog.value),
-    grassGreenSlope: Number(sliders.grassGreenSlope.value),
-    grassTuftCluster: Number(sliders.grassTuftCluster.value),
-    treeFlatness: Number(sliders.treeFlatness.value),
-    treeRadius: Number(sliders.treeRadius.value),
-    treeCount: Number(sliders.treeCount.value),
-    rockClumpCount: Number(sliders.rockClumpCount.value),
-    rocksPerClump: Number(sliders.rocksPerClump.value),
-    rockClumpRadius: Number(sliders.rockClumpRadius.value),
-    rockClumpSpacing: Number(sliders.rockClumpSpacing.value),
+    gravity: sliderValue(sliders, 'gravity'),
+    jumpVelocity: sliderValue(sliders, 'jumpVelocity'),
+    jetpackHold: sliderValue(sliders, 'jetpackHold'),
+    moveSpeed: sliderValue(sliders, 'moveSpeed'),
+    cameraHeight: sliderValue(sliders, 'cameraHeight'),
+    lookSpeed: sliderValue(sliders, 'lookSpeed'),
+    digSpeed: sliderValue(sliders, 'digSpeed'),
+    debrisDivisions: sliderValue(sliders, 'debrisDivisions'),
+    graphics: sliderValue(sliders, 'graphics'),
+    fog: sliderValue(sliders, 'fog'),
+    grassGreenSlope: sliderValue(sliders, 'grassGreenSlope'),
+    grassTuftCluster: sliderValue(sliders, 'grassTuftCluster'),
+    treeFlatness: sliderValue(sliders, 'treeFlatness'),
+    treeRadius: sliderValue(sliders, 'treeRadius'),
+    treeCount: sliderValue(sliders, 'treeCount'),
+    rockClumpCount: sliderValue(sliders, 'rockClumpCount'),
+    rocksPerClump: sliderValue(sliders, 'rocksPerClump'),
+    rockClumpRadius: sliderValue(sliders, 'rockClumpRadius'),
+    rockClumpSpacing: sliderValue(sliders, 'rockClumpSpacing'),
+    enemySpawnRate: sliderValue(sliders, 'enemySpawnRate'),
+    enemySpeed: sliderValue(sliders, 'enemySpeed'),
+    enemyLightHeight: sliderValue(sliders, 'enemyLightHeight'),
   }
 }
 
 export function applyTuneToSliders(sliders: TuneSliderElements, state: TuneState) {
   for (const key of Object.keys(TUNE_DEFAULTS) as (keyof TuneState)[]) {
-    sliders[key].value = String(state[key])
+    const el = sliders[key]
+    if (!el) continue
+    el.value = String(state[key])
   }
 }
 
@@ -170,7 +184,7 @@ export function applyTuneFromStorage(sliders: TuneSliderElements) {
 export function bindTunePersistence(sliders: TuneSliderElements) {
   const persist = () => saveTuneState(readTuneFromSliders(sliders))
   for (const key of Object.keys(TUNE_DEFAULTS) as (keyof TuneState)[]) {
-    sliders[key].addEventListener('input', persist)
+    sliders[key]?.addEventListener('input', persist)
   }
 }
 

@@ -144,7 +144,7 @@ function clearTerrainDetail(ctx: GraphicsQualityContext) {
   detailEnabled = false
 }
 
-/** Fill-light multiplier from the graphics slider (brightness scales on top in main). */
+/** Fill-light multiplier from the graphics slider (day/night cycle scales on top in main). */
 export let graphicsLightScale = 1
 
 function applyFlatTerrainMaterials(ctx: GraphicsQualityContext) {
@@ -202,6 +202,29 @@ function setShadowRoots(
   }
 }
 
+/** How the main-loop adaptive resolution scaler behaves for this quality tier. */
+export type AdaptiveResolutionPolicy = {
+  /** When false, render at maxPixelRatio only (no extra downscale under load). */
+  enabled: boolean
+  /** Minimum multiplier applied on top of maxPixelRatio when enabled. */
+  floor: number
+  /** Smoothed frame time (ms) above which resolution scales down. */
+  frameMsHigh: number
+  /** Smoothed frame time (ms) below which resolution scales back up. */
+  frameMsLow: number
+}
+
+/** Potato/Low already cap pixel ratio — do not stack adaptive downscaling on top. */
+export function adaptiveResolutionPolicy(t: number): AdaptiveResolutionPolicy {
+  if (t < 0.42) {
+    return { enabled: false, floor: 1, frameMsHigh: Infinity, frameMsLow: Infinity }
+  }
+  if (t < 0.68) {
+    return { enabled: true, floor: 0.72, frameMsHigh: 22, frameMsLow: 18 }
+  }
+  return { enabled: true, floor: 0.5, frameMsHigh: 17, frameMsLow: 14 }
+}
+
 export type GraphicsQualityResult = {
   /** True when the graphics slider is in the Potato tier (no textures anywhere). */
   potatoMode: boolean
@@ -209,6 +232,9 @@ export type GraphicsQualityResult = {
   grassMap: THREE.CanvasTexture
   /** Upper bound for renderer pixel ratio (adaptive scaler multiplies below this). */
   maxPixelRatio: number
+  adaptiveResolution: AdaptiveResolutionPolicy
+  /** How often (s) the visibility pass runs; longer on low tiers saves CPU. */
+  visibilityInterval: number
   /** Distance (m) at which surface chunk meshes are culled. */
   chunkRadius: number
   /** Distance (m) at which underground voxel columns are culled. */
@@ -239,7 +265,9 @@ export function applyGraphicsQuality(
 
   // ---- Resolution ceiling (adaptive scaler multiplies this in main) --------
   const dprCeil = Math.min(window.devicePixelRatio, 2)
-  const maxPixelRatio = lerp(0.5, dprCeil, t)
+  const maxPixelRatio = lerp(0.45, dprCeil, t)
+  const adaptiveResolution = adaptiveResolutionPolicy(t)
+  const visibilityInterval = lerp(0.4, 0.2, t)
 
   // ---- Shadows -------------------------------------------------------------
   const shadowsEnabled = t > SHADOWS_MIN_T
@@ -312,6 +340,8 @@ export function applyGraphicsQuality(
       dirtMap,
       grassMap,
       maxPixelRatio,
+      adaptiveResolution,
+      visibilityInterval,
       chunkRadius,
       voxelRadius,
       cameraFar,
@@ -352,6 +382,8 @@ export function applyGraphicsQuality(
     dirtMap,
     grassMap,
     maxPixelRatio,
+    adaptiveResolution,
+    visibilityInterval,
     chunkRadius,
     voxelRadius,
     cameraFar,

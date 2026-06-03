@@ -37,6 +37,12 @@ const GROUND_PROBE_EPS = 0.06
 const RESOLVE_ITERS = 5
 const LOOK_SENSITIVITY_SCALE = 0.002
 const PI_2 = Math.PI / 2
+/** Brief window where movement input does not override enemy knockback. */
+const KNOCKBACK_CONTROL_SEC = 0.2
+/** Minecraft-style hurt camera wobble duration. */
+const HURT_SHAKE_SEC = 0.38
+const HURT_SHAKE_YAW = 0.11
+const HURT_SHAKE_PITCH = 0.065
 
 export type PlayerInput = {
   forward: boolean
@@ -82,6 +88,11 @@ export class PlayerController {
   private lookSpeed = DEFAULT_LOOK_SPEED
   private pendingLookX = 0
   private pendingLookY = 0
+  private knockbackTimer = 0
+  private hurtShakeTime = 0
+  private hurtShakeSign = 1
+  private readonly hurtShakeQuat = new THREE.Quaternion()
+  private readonly hurtShakeEuler = new THREE.Euler(0, 0, 0, 'YXZ')
   private readonly onLookMouseMove = (e: MouseEvent) => {
     if (!this.controls.isLocked) return
     this.pendingLookX += e.movementX
@@ -165,11 +176,11 @@ export class PlayerController {
 
   lock() {
     this.controls.lock(true)
+    this.euler.setFromQuaternion(this.camera.quaternion, 'YXZ')
   }
 
   private applyLookDelta(dx: number, dy: number) {
     if (dx === 0 && dy === 0) return
-    this.euler.setFromQuaternion(this.camera.quaternion, 'YXZ')
     const scale = LOOK_SENSITIVITY_SCALE * this.lookSpeed
     this.euler.y -= dx * scale
     this.euler.x -= dy * scale
@@ -274,6 +285,58 @@ export class PlayerController {
     return best
   }
 
+  /**
+   * Walkable floor near `feetY` (not the topmost surface in the column).
+   * Used by enemies so they follow terrain without snapping onto distant voxel tops.
+   */
+  probeWalkableY(
+    x: number,
+    z: number,
+    feetY: number,
+    stepHeight = STEP_HEIGHT,
+  ): number | null {
+    const recoverBelow = 1.85
+    const maxAbove = stepHeight + 0.05
+    const minBelow = feetY - stepHeight - recoverBelow
+
+    let best: number | null = null
+    const terrain = this.terrain
+    if (terrain) {
+      const ty = terrain.raycastDownY(x, z, feetY + 1.5, stepHeight + 3)
+      if (ty !== null && ty <= feetY + maxAbove && ty >= minBelow) best = ty
+    }
+    const world = this.world
+    if (world) {
+      const bw = world.findGroundTop(x, feetY, z, PLAYER_RADIUS, stepHeight)
+      if (bw !== null && bw <= feetY + maxAbove && bw >= minBelow) {
+        if (best === null) {
+          best = bw
+        } else if (bw > best && feetY - best < 0.22) {
+          best = bw
+        }
+      }
+    }
+    return best
+  }
+
+  /** Shove the player along a world XZ direction (need not be normalized). */
+  applyKnockback(dirX: number, dirZ: number, speed: number, lift = 2.2) {
+    const len = Math.hypot(dirX, dirZ)
+    if (len > 1e-6) {
+      this.velocity.x = (dirX / len) * speed
+      this.velocity.z = (dirZ / len) * speed
+    }
+    this.velocity.y = Math.max(this.velocity.y, lift)
+    this.grounded = false
+    this.knockbackTimer = KNOCKBACK_CONTROL_SEC
+  }
+
+  /** Quick decaying camera wobble when taking damage (Minecraft-style). */
+  applyHurtCameraShake() {
+    this.hurtShakeTime = HURT_SHAKE_SEC
+    this.hurtShakeSign = Math.random() < 0.5 ? -1 : 1
+  }
+
   spawnAt(x: number, z: number, fallbackY = 12) {
     const ground = this.findWalkableY(x, z)
     const y = (ground ?? fallbackY) + SPAWN_CLEARANCE
@@ -321,16 +384,24 @@ export class PlayerController {
 
     this.wishVel.copy(this.moveDir).multiplyScalar(speed)
 
-    const accel = this.grounded ? GROUND_ACCEL : AIR_ACCEL
-    const drag = this.grounded ? GROUND_DRAG : AIR_DRAG
-    this.horizontal.set(this.velocity.x, 0, this.velocity.z)
-    this.target.set(this.wishVel.x, 0, this.wishVel.z)
-    this.horizontal.lerp(this.target, 1 - Math.exp(-accel * dt))
-    if (this.wishVel.lengthSq() < 0.01) {
-      this.horizontal.multiplyScalar(Math.exp(-drag * dt))
+    this.knockbackTimer = Math.max(0, this.knockbackTimer - dt)
+    if (this.knockbackTimer > 0) {
+      this.horizontal.set(this.velocity.x, 0, this.velocity.z)
+      this.horizontal.multiplyScalar(Math.exp(-AIR_DRAG * 0.4 * dt))
+      this.velocity.x = this.horizontal.x
+      this.velocity.z = this.horizontal.z
+    } else {
+      const accel = this.grounded ? GROUND_ACCEL : AIR_ACCEL
+      const drag = this.grounded ? GROUND_DRAG : AIR_DRAG
+      this.horizontal.set(this.velocity.x, 0, this.velocity.z)
+      this.target.set(this.wishVel.x, 0, this.wishVel.z)
+      this.horizontal.lerp(this.target, 1 - Math.exp(-accel * dt))
+      if (this.wishVel.lengthSq() < 0.01) {
+        this.horizontal.multiplyScalar(Math.exp(-drag * dt))
+      }
+      this.velocity.x = this.horizontal.x
+      this.velocity.z = this.horizontal.z
     }
-    this.velocity.x = this.horizontal.x
-    this.velocity.z = this.horizontal.z
 
     if (this.grounded) this.coyoteTimer = COYOTE_SEC
     else this.coyoteTimer = Math.max(0, this.coyoteTimer - dt)
@@ -377,6 +448,10 @@ export class PlayerController {
     }
     this.wasGrounded = this.grounded
     this.landBob = Math.max(0, this.landBob - dt * 3.5)
+
+    if (this.hurtShakeTime > 0) {
+      this.hurtShakeTime = Math.max(0, this.hurtShakeTime - dt)
+    }
 
     this.syncCamera(moving, input.sprint, dt)
   }
@@ -511,6 +586,7 @@ export class PlayerController {
     const p = this.object.position
     const eyeY = p.y + this.eyeHeight + this.displayBob
     this.camera.position.set(p.x, eyeY, p.z)
+    this.applyHurtCameraShakeOffset()
     const world = this.world
     if (!world) return
     const indices = world.queryNear(
@@ -522,6 +598,20 @@ export class PlayerController {
       true,
     )
     depenetrateSphereInBoxes(this.camera.position, CAMERA_RADIUS, world.boxes, indices)
+  }
+
+  /** Visual-only wobble layered on the locked look quaternion. */
+  private applyHurtCameraShakeOffset() {
+    this.camera.quaternion.setFromEuler(this.euler)
+    if (this.hurtShakeTime <= 0) return
+    const t = this.hurtShakeTime / HURT_SHAKE_SEC
+    const amp = t * t
+    const phase = (1 - t) * Math.PI * 7
+    const yaw = Math.sin(phase) * HURT_SHAKE_YAW * amp * this.hurtShakeSign
+    const pitch = Math.sin(phase * 1.37 + 0.6) * HURT_SHAKE_PITCH * amp
+    this.hurtShakeEuler.set(pitch, yaw, 0)
+    this.hurtShakeQuat.setFromEuler(this.hurtShakeEuler)
+    this.camera.quaternion.multiply(this.hurtShakeQuat)
   }
 
   private cameraBobOffset(moving: boolean, sprint: boolean): number {

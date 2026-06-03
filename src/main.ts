@@ -26,11 +26,13 @@ import {
   placeRocks,
   resolveRockGroundY,
   updateRocksPhysics,
+  wakeRocks,
   type RockGroundTargets,
   type RockSpawnOptions,
 } from './rock'
 import {
   findTreePlacements,
+  loadTreeBerriesModel,
   loadTreeModel,
   placeTrees,
   resolveTreeGroundY,
@@ -46,12 +48,52 @@ import {
   type TuneSliderElements,
 } from './tuneDefaults'
 import {
+  blendExposure,
+  blendSkyAtmosphere,
+  blendSunDirection,
+  cycleFactor,
+  cyclePhase,
+  isNight,
+  nightStrength,
+  OUTDOOR_RAY_ORIGIN_Y,
+  updateShelteredFromSky,
+  sunAnglesFromPhase,
+} from './dayNight'
+import { createSkyDecor } from './skyDecor'
+import {
+  createEnemy,
+  damageEnemy,
+  applyEnemyLightHeight,
+  enemyCrawlSpeedFromSlider,
+  enemyLightHeightOffsetFromSlider,
+  enemySpawnIntervalFromSlider,
+  ENEMY_BIG_SPAWN_CHANCE,
+  ENEMY_KNOCKBACK_LIFT,
+  ENEMY_KNOCKBACK_SPEED,
+  ENEMY_MAX_COUNT,
+  ENEMY_STEP_HEIGHT,
+  meleeStatsForItem,
+  meleeKnockbackForEnemy,
+  enemyFromIntersection,
+  loadEnemyTemplate,
+  pickRandomEnemySpawn,
+  PLAYER_MAX_HEALTH,
+  resolveEnemyGroundY,
+  syncEnemyHealthBars,
+  updateEnemies,
+  type EnemyDeathContext,
+  type EnemyInstance,
+} from './enemy'
+import { EnemyOrbDrops } from './enemyOrbDrops'
+import {
   applyGraphicsQuality,
+  type AdaptiveResolutionPolicy,
   graphicsLightScale,
   qualityLabel,
   fogDensityFromSlider,
   qualityTFromSlider,
 } from './graphicsQuality'
+import { digToolMultiplier } from './digTools'
 import { updateGrassWind } from './grassBlades'
 import { applyTerrainTriplanar } from './terrainTriplanar'
 import {
@@ -61,9 +103,16 @@ import {
   type PlayerInput,
 } from './player'
 import { CapsuleCollider, registerBVHExtensions } from './meshCollider'
-import { ViewmodelHand } from './viewmodelHand'
+import { SPEAR_THROW_COOLDOWN, ViewmodelHand } from './viewmodelHand'
+import {
+  clearThrownSpears,
+  spawnThrownSpear,
+  updateThrownSpears,
+  type ThrownSpear,
+} from './thrownSpear'
 import {
   flushPendingSurfaceSources,
+  freezeSubtreeMatrices,
   loadSurfaceCell,
   runLoadPool,
   sortSurfaceCellsBySpawn,
@@ -76,10 +125,10 @@ import {
   voxelWorldBox,
 } from './voxelPlacement'
 import { createRockAlbedoMap } from './rockTexture'
+import { createWoodPlankAlbedoMap, WOOD_MID } from './woodTexture'
 import {
   BlockBuilder,
   BUILD_BLOCK_DIG_TIME_BASE,
-  BUILD_BLOCK_SIZE,
   buildCellAdjacent,
   buildCellFromPoint,
   buildPlacementNormalAgainstBlock,
@@ -87,6 +136,7 @@ import {
   type BuildBlockType,
   type BuildCell,
 } from './buildBlocks'
+import { PlacedTorchManager } from './placedTorches'
 
 interface CellMeta {
   ix: number
@@ -193,7 +243,7 @@ function createTerrainMaterial(
   return mat
 }
 
-const VISIBILITY_INTERVAL = 0.2
+let visibilityInterval = 0.2
 /** Max distance from the camera to start or continue digging. */
 const DIG_REACH = 7
 /** Start the dig ray in front of the camera so close-range / inside-surface shots still hit. */
@@ -203,8 +253,11 @@ const _digRayOrigin = new THREE.Vector3()
 
 const ROCK_DIG_TIME_BASE = 1.35
 const TREE_DIG_TIME_BASE = 2.1
+const TORCH_DIG_TIME_BASE = 0.55
 const STONE_PER_ROCK = 3
 const WOOD_PER_TREE = 5
+const CRYSTAL_BERRIES_PER_TREE = 16
+const CRYSTAL_BERRY_HEAL = 5
 const DIRT_PER_DIG = 8
 
 function cellToCollision(cell: Cell, layerMask = cell.layerMask): TerrainCellCollision {
@@ -259,8 +312,6 @@ function cellFromChunkSurfaceHit(
   return closestCellAtPoint(point, chunkCells, cellSize * cellSize * 2.25)
 }
 
-const SUN_ELEVATION = 36
-const SUN_AZIMUTH = 158
 const SUN_DISTANCE = 55
 
 function sunDirectionFromAngles(
@@ -300,6 +351,7 @@ async function main() {
   const horizonColor = new THREE.Color(0x6a9ec8)
   scene.background = null
   scene.fog = new THREE.FogExp2(horizonColor, 0.010)
+  const sceneFog = scene.fog as THREE.FogExp2
 
   const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 800)
 
@@ -328,7 +380,12 @@ async function main() {
   // (in the animate loop) multiplies a [floor..1] factor under GPU load.
   let qualityMaxPixelRatio = Math.min(window.devicePixelRatio, 1.5)
   let adaptivePixelScale = 1
-  const ADAPTIVE_PIXEL_FLOOR = 0.5
+  let adaptiveResolution: AdaptiveResolutionPolicy = {
+    enabled: true,
+    floor: 0.5,
+    frameMsHigh: 17,
+    frameMsLow: 14,
+  }
   const commitPixelRatio = () => {
     renderer.setPixelRatio(qualityMaxPixelRatio * adaptivePixelScale)
   }
@@ -343,14 +400,16 @@ async function main() {
   sky.scale.setScalar(450000)
   scene.add(sky)
 
-  const skyUniforms = (sky.material as THREE.ShaderMaterial).uniforms
-  skyUniforms.turbidity.value = 5
-  skyUniforms.rayleigh.value = 2.4
-  skyUniforms.mieCoefficient.value = 0.004
-  skyUniforms.mieDirectionalG.value = 0.76
+  const skyDecor = createSkyDecor(scene)
+  let lastSkyTint = new THREE.Color()
+  let lastSunColor = new THREE.Color()
+  let shelterBlend = 0
+  let shelteredLatch = false
+  let outdoorSurfaceYSmooth: number | null = null
+  const _outdoorSunDir = new THREE.Vector3()
 
-  const sunDirection = sunDirectionFromAngles(SUN_ELEVATION, SUN_AZIMUTH)
-  skyUniforms.sunPosition.value.copy(sunDirection)
+  const skyUniforms = (sky.material as THREE.ShaderMaterial).uniforms
+  const sunDirection = sunDirectionFromAngles(0, 0)
 
   const player = new PlayerController(camera, renderer.domElement)
 
@@ -398,8 +457,6 @@ async function main() {
   const cameraHeightValue = document.getElementById('camera-height-value')!
   const lookSpeedSlider = document.getElementById('look-speed-slider') as HTMLInputElement
   const lookSpeedValue = document.getElementById('look-speed-value')!
-  const brightnessSlider = document.getElementById('brightness-slider') as HTMLInputElement
-  const brightnessValue = document.getElementById('brightness-value')!
   const graphicsSlider = document.getElementById('graphics-slider') as HTMLInputElement
   const graphicsValue = document.getElementById('graphics-value')!
   const fogSlider = document.getElementById('fog-slider') as HTMLInputElement
@@ -438,6 +495,16 @@ async function main() {
     'rock-clump-spacing-slider',
   ) as HTMLInputElement
   const rockClumpSpacingValue = document.getElementById('rock-clump-spacing-value')!
+  const enemySpawnRateSlider = document.getElementById(
+    'enemy-spawn-rate-slider',
+  ) as HTMLInputElement
+  const enemySpawnRateValue = document.getElementById('enemy-spawn-rate-value')!
+  const enemySpeedSlider = document.getElementById('enemy-speed-slider') as HTMLInputElement
+  const enemySpeedValue = document.getElementById('enemy-speed-value')!
+  const enemyLightHeightSlider = document.getElementById(
+    'enemy-light-height-slider',
+  ) as HTMLInputElement
+  const enemyLightHeightValue = document.getElementById('enemy-light-height-value')!
 
   const tuneSliders: TuneSliderElements = {
     gravity: gravitySlider,
@@ -448,7 +515,6 @@ async function main() {
     lookSpeed: lookSpeedSlider,
     digSpeed: digSpeedSlider,
     debrisDivisions: debrisDivisionsSlider,
-    brightness: brightnessSlider,
     graphics: graphicsSlider,
     fog: fogSlider,
     grassGreenSlope: grassGreenSlopeSlider,
@@ -460,6 +526,9 @@ async function main() {
     rocksPerClump: rocksPerClumpSlider,
     rockClumpRadius: rockClumpRadiusSlider,
     rockClumpSpacing: rockClumpSpacingSlider,
+    enemySpawnRate: enemySpawnRateSlider,
+    enemySpeed: enemySpeedSlider,
+    enemyLightHeight: enemyLightHeightSlider,
   }
   applyTuneFromStorage(tuneSliders)
   bindTunePersistence(tuneSliders)
@@ -488,35 +557,40 @@ async function main() {
     cameraHeightValue.textContent = height.toFixed(2)
     lookSpeedValue.textContent = look.toFixed(2)
   }
-  const syncBrightness = () => {
-    const exposure = Number(brightnessSlider.value)
-    renderer.toneMappingExposure = exposure
-    brightnessValue.textContent = exposure.toFixed(2)
-    const fillScale = (exposure / DEFAULT_BRIGHTNESS) * graphicsLightScale
-    hemisphereLight.intensity = 0.58 * fillScale
-    ambientLight.intensity = 0.24 * fillScale
-    fill.intensity = 0.32 * fillScale
-    fill2.intensity = 0.2 * fillScale
-    sun.intensity = 1.45 * fillScale
-  }
   gravitySlider.addEventListener('input', syncJumpTune)
   jumpVelocitySlider.addEventListener('input', syncJumpTune)
   jetpackHoldSlider.addEventListener('input', syncJumpTune)
   moveSpeedSlider.addEventListener('input', syncMoveTune)
   cameraHeightSlider.addEventListener('input', syncMoveTune)
   lookSpeedSlider.addEventListener('input', syncMoveTune)
-  const sceneFog = scene.fog as THREE.FogExp2
   const syncFog = () => {
     const density = fogDensityFromSlider(Number(fogSlider.value))
     sceneFog.density = density
     fogValue.textContent = density.toFixed(3)
   }
-  brightnessSlider.addEventListener('input', syncBrightness)
   fogSlider.addEventListener('input', syncFog)
   syncJumpTune()
   syncMoveTune()
-  syncBrightness()
   syncFog()
+
+  const healthHud = document.getElementById('health-hud')!
+  const healthBarFill = document.getElementById('health-bar-fill')!
+  const healthValue = document.getElementById('health-value')!
+  let playerHealth = PLAYER_MAX_HEALTH
+
+  const syncHealthHud = () => {
+    const t = Math.max(0, playerHealth / PLAYER_MAX_HEALTH)
+    healthBarFill.style.transform = `scaleX(${t})`
+    healthValue.textContent = String(Math.max(0, Math.ceil(playerHealth)))
+    const hue = t * 128
+    const sat = 68 + t * 14
+    const light = 36 + t * 10
+    healthBarFill.style.backgroundColor = `hsl(${hue}, ${sat}%, ${light}%)`
+    healthBarFill.style.boxShadow =
+      t > 0.01 ? `0 0 10px hsla(${hue}, ${sat}%, ${light}%, 0.4)` : 'none'
+    healthHud.classList.toggle('low', playerHealth <= PLAYER_MAX_HEALTH * 0.3)
+  }
+  syncHealthHud()
   scene.add(camera)
   const viewmodelHand = new ViewmodelHand(camera)
 
@@ -539,16 +613,34 @@ async function main() {
   applyTerrainTriplanar(grassMaterial, triplanarScale)
   const stoneBreakMaterial = createTerrainMaterial(0x8a8580, undefined, 0x1a1816)
   const woodBreakMaterial = createTerrainMaterial(0x5c3a22, undefined, 0x1a0f08)
+  const treeBreakMaterial = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    vertexColors: true,
+    flatShading: true,
+    roughness: 0.98,
+    metalness: 0,
+    emissive: 0x1a0f08,
+    emissiveIntensity: 0.42,
+  })
   let rockMap = createRockAlbedoMap()
   rockMap.repeat.set(DIRT_TEXTURE_REPEAT, DIRT_TEXTURE_REPEAT)
   const stoneBlockMaterial = createTerrainMaterial(0xffffff, rockMap, 0x1a1816)
   applyTerrainTriplanar(stoneBlockMaterial, triplanarScale)
-  const woodBlockMaterial = createTerrainMaterial(0x5c3a22, undefined, 0x1a0f08)
+  const woodMap = createWoodPlankAlbedoMap()
+  woodMap.repeat.set(DIRT_TEXTURE_REPEAT, DIRT_TEXTURE_REPEAT)
+  const woodBlockMaterial = createTerrainMaterial(WOOD_MID, woodMap, 0x1a0f08)
+  applyTerrainTriplanar(woodBlockMaterial, triplanarScale)
   const cells = new Map<string, Cell>()
   const surfaceGroup = new THREE.Group()
+  // Static container: it never moves, and its ~1800 per-cell roots are frozen
+  // (matrixAutoUpdate off across each subtree at load) so the per-frame
+  // scene.updateMatrixWorld() does no matrix work for them. Freeze the container
+  // itself too so it doesn't recompose its own world matrix each frame.
+  surfaceGroup.matrixAutoUpdate = false
   const voxelGroup = new THREE.Group()
   terrainRoot.add(voxelGroup)
   terrainRoot.add(surfaceGroup)
+  surfaceGroup.updateMatrixWorld(true)
 
   const gridSpan = gridCenters.length
   const surfaceCells = meta.surface_pieces.cells
@@ -574,6 +666,14 @@ async function main() {
     cells.set(key, cell)
     cellList.push(cell)
   }
+
+  const cellGrid: (Cell | undefined)[][] = Array.from({ length: gridSpan }, () =>
+    Array(gridSpan),
+  )
+  for (const cell of cells.values()) {
+    cellGrid[cell.ix]![cell.iy] = cell
+  }
+  const voxelVisibleSet = new Set<Cell>()
 
   const voxelInstancer = new VoxelInstancer(
     dirtMaterial,
@@ -603,12 +703,18 @@ async function main() {
   // Quality-driven cull radii live here; syncGraphics overwrites them.
   const visibilityCtx = {
     cells,
+    cellGrid,
+    gridMinX,
+    gridMinZ,
+    cellSize,
+    gridSpan,
     surfaceChunks,
     voxelInstancer,
     voxelSize,
     layerCount: voxelLayers,
     chunkRadius: DEFAULT_CHUNK_RADIUS,
     voxelRadius: DEFAULT_VOXEL_RADIUS,
+    voxelVisibleSet,
   }
   const refreshVisibilityNow = () => {
     const p = player.object.position
@@ -641,6 +747,69 @@ async function main() {
   const capsuleCollider = new CapsuleCollider()
   capsuleCollider.setTargets(surfaceChunks.group, surfaceGroup)
   player.setTerrainCollider(capsuleCollider)
+
+  const applyDayNight = (elapsedSec: number, dt: number) => {
+    const phase = cyclePhase(elapsedSec)
+    const cycleT = cycleFactor(elapsedSec)
+
+    const p = player.object.position
+    const outdoorSurfaceY = capsuleCollider.raycastDownY(
+      p.x,
+      p.z,
+      OUTDOOR_RAY_ORIGIN_Y,
+      OUTDOOR_RAY_ORIGIN_Y,
+    )
+    if (outdoorSurfaceY !== null) {
+      outdoorSurfaceYSmooth =
+        outdoorSurfaceYSmooth === null
+          ? outdoorSurfaceY
+          : THREE.MathUtils.damp(outdoorSurfaceYSmooth, outdoorSurfaceY, 10, dt)
+    } else {
+      outdoorSurfaceYSmooth = null
+    }
+    shelteredLatch = updateShelteredFromSky(
+      p.y,
+      outdoorSurfaceYSmooth,
+      shelteredLatch,
+    )
+    shelterBlend = THREE.MathUtils.damp(shelterBlend, shelteredLatch ? 1 : 0, 2.2, dt)
+
+    const exposure = blendExposure(cycleT, shelterBlend)
+    renderer.toneMappingExposure = exposure
+    const fillScale = (exposure / DEFAULT_BRIGHTNESS) * graphicsLightScale
+
+    const { elevationDeg, azimuthDeg } = sunAnglesFromPhase(phase)
+    sunDirectionFromAngles(elevationDeg, azimuthDeg, _outdoorSunDir)
+    blendSunDirection(_outdoorSunDir, shelterBlend, sunDirection)
+    skyUniforms.sunPosition.value.copy(sunDirection)
+
+    const atmo = blendSkyAtmosphere(phase, cycleT, shelterBlend)
+    skyUniforms.turbidity.value = atmo.turbidity
+    skyUniforms.rayleigh.value = atmo.rayleigh
+    skyUniforms.mieCoefficient.value = atmo.mieCoefficient
+    skyUniforms.mieDirectionalG.value = atmo.mieDirectionalG
+
+    horizonColor.copy(atmo.fogColor)
+    sceneFog.color.copy(atmo.fogColor)
+
+    sun.color.copy(atmo.sunColor)
+    lastSunColor.copy(atmo.sunColor)
+    lastSkyTint.copy(atmo.hemisphereSky)
+    hemisphereLight.color.copy(atmo.hemisphereSky)
+    hemisphereLight.groundColor.copy(atmo.hemisphereGround)
+    ambientLight.color.copy(atmo.ambientColor)
+    fill.color.copy(atmo.fillColor)
+    fill2.color.copy(atmo.fill2Color)
+
+    const night = nightStrength(cycleT)
+    hemisphereLight.intensity = 0.58 * fillScale
+    ambientLight.intensity = 0.24 * fillScale * THREE.MathUtils.lerp(1, 1.35, night)
+    fill.intensity = 0.32 * fillScale
+    fill2.intensity = 0.2 * fillScale
+    sun.intensity = 1.45 * fillScale
+  }
+  applyDayNight(0, 0)
+
   const _boundsBox = new THREE.Box3()
   const _pickHits: THREE.Intersection[] = []
   let placedTrees: THREE.Group[] = []
@@ -736,7 +905,9 @@ async function main() {
     spawnCellMeta?.cap_top_y ?? seamY + (meta.voxels.surface_cap_height ?? voxelSize) + 1
 
   const treeTemplatePromise = loadTreeModel('/assets/tree.glb')
+  const treeBerriesTemplatePromise = loadTreeBerriesModel('/assets/tree berries.glb')
   const rockTemplatesPromise = loadRockModels()
+  const enemyTemplatePromise = loadEnemyTemplate()
 
   info.textContent = 'Loading nearby terrain…'
 
@@ -804,11 +975,12 @@ async function main() {
     )
     tagWithCellKey(root, cell.key)
     root.visible = false
-    root.matrixAutoUpdate = false
     root.updateMatrixWorld(true)
     surfaceGroup.add(root)
     cell.surfaceRoot = root
     alignSurfaceToCellGrid(cell, terrainGrid, voxelSize)
+    // Static once rebuilt — freeze the subtree so it costs nothing per frame.
+    freezeSubtreeMatrices(root)
     surfaceChunks.markDirtyForCell(cell)
   }
 
@@ -870,10 +1042,26 @@ async function main() {
 
   const rocksGroup = new THREE.Group()
   scene.add(rocksGroup)
+
+  const enemiesGroup = new THREE.Group()
+  scene.add(enemiesGroup)
+  const projectilesGroup = new THREE.Group()
+  scene.add(projectilesGroup)
+  const thrownSpears: ThrownSpear[] = []
+  let spearThrowCooldown = 0
+  let spearThrowPending = false
+  const SPEAR_THROW_RELEASE = 0.4
+  const enemies: EnemyInstance[] = []
+  let enemyTemplate: Awaited<ReturnType<typeof loadEnemyTemplate>> | undefined
+  let enemySpawnTimer = 0
+  let nightActive = false
+  let worldTimeSec = 0
+
   const rockGround: RockGroundTargets = {
     surface: surfaceGroup,
     chunkRoot: surfaceChunks.group,
   }
+  const enemyOrbDrops = new EnemyOrbDrops(scene, rockGround)
 
   const graphicsCtx = {
     renderer,
@@ -891,7 +1079,7 @@ async function main() {
     dirtMap,
     grassMap,
     // Surface caps stay shadowless — receiving tree shadows causes dark grid seams.
-    shadowRoots: [treesGroup, rocksGroup],
+    shadowRoots: [treesGroup, rocksGroup, enemiesGroup],
   }
 
   const syncGrassTuftClusterLabel = () => {
@@ -923,13 +1111,16 @@ async function main() {
     refreshGrassBlades()
 
     qualityMaxPixelRatio = result.maxPixelRatio
+    adaptiveResolution = result.adaptiveResolution
+    adaptivePixelScale = 1
+    visibilityInterval = result.visibilityInterval
     commitPixelRatio()
     visibilityCtx.chunkRadius = result.chunkRadius
     visibilityCtx.voxelRadius = result.voxelRadius
     refreshVisibilityNow()
     requestShadowUpdate()
 
-    syncBrightness()
+    applyDayNight(worldTimeSec, 0)
   }
   const scheduleGraphics = () => {
     const t = qualityTFromSlider(Number(graphicsSlider.value))
@@ -938,6 +1129,11 @@ async function main() {
     graphicsDebounce = setTimeout(() => requestAnimationFrame(syncGraphics), 250)
   }
   graphicsSlider.addEventListener('input', scheduleGraphics)
+  graphicsSlider.addEventListener('change', () => {
+    if (graphicsDebounce) clearTimeout(graphicsDebounce)
+    graphicsDebounce = undefined
+    requestAnimationFrame(syncGraphics)
+  })
   syncGraphics()
 
   let grassTuftClusterDebounce: ReturnType<typeof setTimeout> | undefined
@@ -978,6 +1174,7 @@ async function main() {
   }
 
   let treeTemplate: Awaited<ReturnType<typeof loadTreeModel>> | undefined
+  let treeBerriesTemplate: Awaited<ReturnType<typeof loadTreeBerriesModel>> | undefined
 
   const respawnTrees = () => {
     if (!treeTemplate) return
@@ -992,7 +1189,13 @@ async function main() {
       cellSize,
     )
     resolveTreeGroundY(treePlacements, surfaceGroup, surfaceChunks.group)
-    placedTrees = placeTrees(treeTemplate, treePlacements, treesGroup)
+    placedTrees = placeTrees(treeTemplate, treePlacements, treesGroup, treeBerriesTemplate)
+    // Trees never move after placement — freeze their matrices so the renderer
+    // skips recomposing every trunk/foliage mesh each frame.
+    for (const tree of placedTrees) {
+      tree.updateMatrixWorld(true)
+      freezeSubtreeMatrices(tree)
+    }
     syncPropCollision()
   }
 
@@ -1028,6 +1231,38 @@ async function main() {
     clumpRadius: Number(rockClumpRadiusSlider.value),
     clumpSpacing: Number(rockClumpSpacingSlider.value),
   })
+
+  const enemyLightHeightOffset = () =>
+    enemyLightHeightOffsetFromSlider(Number(enemyLightHeightSlider.value))
+
+  const getEnemyDeathContext = (): EnemyDeathContext | undefined => {
+    if (!enemyTemplate) return undefined
+    return {
+      parent: enemiesGroup,
+      enemies,
+      template: enemyTemplate,
+      barParent: enemiesGroup,
+      groundTargets: rockGround,
+      lightHeightOffset: enemyLightHeightOffset(),
+      onOrbBurst: (x, y, z) => enemyOrbDrops.spawnBurst(x, y, z),
+    }
+  }
+
+  const applyEnemyLightHeightAll = () => {
+    const offset = enemyLightHeightOffset()
+    if (enemyTemplate) applyEnemyLightHeight(enemyTemplate, offset)
+    for (const enemy of enemies) applyEnemyLightHeight(enemy.visual, offset)
+  }
+
+  const syncEnemyTuneLabels = () => {
+    const spawnRate = Number(enemySpawnRateSlider.value)
+    const speed = Number(enemySpeedSlider.value)
+    enemySpawnRateValue.textContent = `${enemySpawnIntervalFromSlider(spawnRate).toFixed(1)}s`
+    enemySpeedValue.textContent = enemyCrawlSpeedFromSlider(speed).toFixed(2)
+    const lightY = enemyLightHeightOffset()
+    enemyLightHeightValue.textContent =
+      (lightY >= 0 ? '+' : '') + lightY.toFixed(2)
+  }
 
   const syncRockTuneLabels = () => {
     rockClumpCountValue.textContent = rockClumpCountSlider.value
@@ -1100,15 +1335,30 @@ async function main() {
   bindRockSlider(rocksPerClumpSlider)
   bindRockSlider(rockClumpRadiusSlider)
   bindRockSlider(rockClumpSpacingSlider)
+  enemySpawnRateSlider.addEventListener('input', syncEnemyTuneLabels)
+  enemySpeedSlider.addEventListener('input', syncEnemyTuneLabels)
+  enemyLightHeightSlider.addEventListener('input', () => {
+    applyEnemyLightHeightAll()
+    syncEnemyTuneLabels()
+  })
   syncTreeTuneLabels()
   syncRockTuneLabels()
+  syncEnemyTuneLabels()
 
   info.textContent = 'Loading terrain…'
 
   void (async () => {
-    const [trees, rocks] = await Promise.all([treeTemplatePromise, rockTemplatesPromise])
+    const [trees, berries, rocks, enemyTpl] = await Promise.all([
+      treeTemplatePromise,
+      treeBerriesTemplatePromise,
+      rockTemplatesPromise,
+      enemyTemplatePromise,
+    ])
     treeTemplate = trees
+    treeBerriesTemplate = berries
     rockTemplates = rocks
+    enemyTemplate = enemyTpl
+    applyEnemyLightHeightAll()
     respawnTrees()
     respawnRocks()
 
@@ -1127,16 +1377,23 @@ async function main() {
 
   const digProgressFill = document.getElementById('dig-progress-fill')!
   const inventory = new Inventory()
+  enemyOrbDrops.setInventory(inventory)
 
-  // Player-placed dirt cubes (2.5 m). Shares the dirt material so they tile/light
-  // like terrain. Lives in world space alongside the terrain root.
-  const blockBuilder = new BlockBuilder({
-    dirt: dirtMaterial,
-    wood: woodBlockMaterial,
-    stone: stoneBlockMaterial,
-  })
+  // Player-placed dirt cubes (2.5 m). Dirt sides use terrain dirt; top uses grass.
+  const blockBuilder = new BlockBuilder(
+    {
+      dirt: dirtMaterial,
+      wood: woodBlockMaterial,
+      stone: stoneBlockMaterial,
+    },
+    grassMaterial,
+  )
   scene.add(blockBuilder.group)
+  const placedTorches = new PlacedTorchManager()
+  scene.add(placedTorches.group)
   const _buildBox = new THREE.Box3()
+  const _torchPos = new THREE.Vector3()
+  const _torchNormal = new THREE.Vector3()
   const _buildNormal = new THREE.Vector3()
   const _buildCell: BuildCell = {
     gx: 0,
@@ -1202,9 +1459,87 @@ async function main() {
     )
   }
 
+  function tryThrowSpear() {
+    if (!player.isLocked() || inventory.getHeldItem() !== 'spear') return
+    if (spearThrowCooldown > 0 || spearThrowPending || viewmodelHand.isThrowing()) return
+    if (!inventory.consumeSelected(1)) return
+    if (!viewmodelHand.startThrow()) return
+
+    spearThrowPending = true
+    spearThrowCooldown = SPEAR_THROW_COOLDOWN
+    info.textContent = 'Spear thrown'
+  }
+
+  function releasePendingSpearThrow() {
+    if (!spearThrowPending) return
+    const progress = viewmodelHand.getThrowProgress()
+    if (progress < SPEAR_THROW_RELEASE && viewmodelHand.isThrowing()) return
+
+    viewmodelHand.getThrowSpawnPosition(_digRayOrigin)
+    raycaster.setFromCamera(_screenCenter, camera)
+    _digRayDir.copy(raycaster.ray.direction)
+    spawnThrownSpear(projectilesGroup, _digRayOrigin, _digRayDir, thrownSpears)
+    spearThrowPending = false
+  }
+
+  function tryEatCrystalBerries() {
+    if (!player.isLocked() || inventory.getHeldItem() !== 'crystal_berries') return
+    if (playerHealth <= 0) return
+    if (inventory.getSelectedCount() <= 0) {
+      info.textContent = 'Out of crystal berries'
+      return
+    }
+    if (playerHealth >= PLAYER_MAX_HEALTH) {
+      info.textContent = 'Health is full'
+      return
+    }
+    if (!inventory.consumeSelected(1)) return
+    playerHealth = Math.min(PLAYER_MAX_HEALTH, playerHealth + CRYSTAL_BERRY_HEAL)
+    syncHealthHud()
+    info.textContent = `+${CRYSTAL_BERRY_HEAL} health`
+  }
+
+  function tryPlaceTorch() {
+    if (!player.isLocked() || inventory.getHeldItem() !== 'torch') return
+    if (inventory.getSelectedCount() <= 0) {
+      info.textContent = 'Out of torches'
+      return
+    }
+    const hit = pickBuildHit()
+    if (!hit || !placedTorches.placementFromHit(hit, _digRayDir, _torchPos, _torchNormal)) return
+    const p = player.object.position
+    if (
+      !placedTorches.isPlacementValid(_torchPos, p, PLAYER_RADIUS, PLAYER_HEIGHT)
+    ) {
+      return
+    }
+    if (!inventory.consumeSelected(1)) return
+    placedTorches.place(_torchPos, _torchNormal)
+    requestShadowUpdate()
+    forceBuildPreview = true
+    info.textContent = 'Placed torch'
+  }
+
+  function updateTorchPreview() {
+    if (!player.isLocked() || inventory.getHeldItem() !== 'torch') {
+      placedTorches.setGhost(null, null, false)
+      return
+    }
+    const hit = pickBuildHit()
+    if (!hit || !placedTorches.placementFromHit(hit, _digRayDir, _torchPos, _torchNormal)) {
+      placedTorches.setGhost(null, null, false)
+      return
+    }
+    const p = player.object.position
+    const valid =
+      inventory.getSelectedCount() > 0 &&
+      placedTorches.isPlacementValid(_torchPos, p, PLAYER_RADIUS, PLAYER_HEIGHT)
+    placedTorches.setGhost(_torchPos, _torchNormal, valid)
+  }
+
   function tryPlaceBlock() {
     if (!player.isLocked() || !inventory.selectedIsBuildable()) return
-    const item = inventory.getSelected()
+    const item = inventory.getSelectedBuildable()
     if (!item || inventory.getSelectedCount() <= 0) {
       info.textContent = item ? `Out of ${item}` : 'Select a block to place'
       return
@@ -1228,7 +1563,7 @@ async function main() {
       blockBuilder.setGhost(null)
       return
     }
-    const item = inventory.getSelected()
+    const item = inventory.getSelectedBuildable()
     if (!item) {
       blockBuilder.setGhost(null)
       return
@@ -1268,6 +1603,8 @@ async function main() {
   const getDigSpeed = () => Number(digSpeedSlider.value)
   const getDebrisDivisions = () =>
     Math.max(1, Math.round(Number(debrisDivisionsSlider.value)))
+  const getTreeDebrisDivisions = () =>
+    Math.min(7, getDebrisDivisions() + 2)
 
   const syncDigSpeed = () => {
     digSpeedValue.textContent = `${getDigSpeed().toFixed(2)}×`
@@ -1285,12 +1622,13 @@ async function main() {
   type DigTarget = {
     id: string
     cell?: Cell
-    kind: 'surface' | 'voxel' | 'rock' | 'tree' | 'block'
+    kind: 'surface' | 'voxel' | 'rock' | 'tree' | 'block' | 'torch'
     layer?: number
     visualRoot: THREE.Object3D
     propRef?: THREE.Group
     blockKey?: string
     blockType?: BuildBlockType
+    torchId?: string
   }
 
   function findMineableFromHit(
@@ -1327,7 +1665,12 @@ async function main() {
       if (idx >= 0) placedTrees.splice(idx, 1)
       treesGroup.remove(root)
       inventory.add('wood', WOOD_PER_TREE)
-      info.textContent = `Chopped tree (+${WOOD_PER_TREE} wood)`
+      if (root.userData.hasCrystalBerries) {
+        inventory.add('crystal_berries', CRYSTAL_BERRIES_PER_TREE)
+        info.textContent = `Chopped tree (+${WOOD_PER_TREE} wood, +${CRYSTAL_BERRIES_PER_TREE} crystal berries)`
+      } else {
+        info.textContent = `Chopped tree (+${WOOD_PER_TREE} wood)`
+      }
     }
     disposeMineableProp(root)
     syncPropCollision()
@@ -1361,9 +1704,24 @@ async function main() {
   }
 
   const keys = new Set<string>()
+  let onInventoryLock: (locked: boolean) => void = () => {}
+
   window.addEventListener('keydown', (e) => {
     if (e.repeat) return
+    if (e.code === 'KeyE') {
+      e.preventDefault()
+      if (!inventory.isPanelOpen()) inventory.noteLockedBeforePanel(player.isLocked())
+      inventory.togglePanel(onInventoryLock)
+      return
+    }
     keys.add(e.code)
+    if (inventory.isPanelOpen()) {
+      if (e.code.startsWith('Digit') && e.code !== 'Digit0') {
+        const n = Number(e.code.slice(5))
+        if (n >= 1 && n <= 9) inventory.selectIndex(n - 1)
+      }
+      return
+    }
     if (e.code === 'KeyN') {
       e.preventDefault()
       if (player.isLocked()) viewmodelHand.whack()
@@ -1411,6 +1769,15 @@ async function main() {
   }
 
   function readInput() {
+    if (inventory.isPanelOpen()) {
+      input.forward = false
+      input.backward = false
+      input.left = false
+      input.right = false
+      input.sprint = false
+      input.jump = false
+      return
+    }
     input.forward = keys.has('KeyW') || keys.has('ArrowUp')
     input.backward = keys.has('KeyS') || keys.has('ArrowDown')
     input.left = keys.has('KeyA') || keys.has('ArrowLeft')
@@ -1421,12 +1788,23 @@ async function main() {
 
   renderer.domElement.tabIndex = 0
   renderer.domElement.addEventListener('mousedown', (e) => {
+    if (inventory.isPanelOpen()) return
     renderer.domElement.focus()
     if (e.button === 2) {
-      // Right-click: place the selected build block.
+      // Right-click: throw spear or place the selected build block.
       if (player.isLocked()) {
-        viewmodelHand.whack()
-        tryPlaceBlock()
+        if (inventory.getHeldItem() === 'spear' && inventory.getSelectedCount() > 0) {
+          tryThrowSpear()
+        } else if (inventory.getHeldItem() === 'crystal_berries') {
+          viewmodelHand.whack()
+          tryEatCrystalBerries()
+        } else if (inventory.getHeldItem() === 'torch') {
+          viewmodelHand.whack()
+          tryPlaceTorch()
+        } else {
+          viewmodelHand.whack()
+          tryPlaceBlock()
+        }
       }
       return
     }
@@ -1445,7 +1823,7 @@ async function main() {
   renderer.domElement.addEventListener(
     'wheel',
     (e) => {
-      if (!player.isLocked()) return
+      if (!player.isLocked() || inventory.isPanelOpen()) return
       e.preventDefault()
       inventory.cycle(e.deltaY > 0 ? 1 : -1)
     },
@@ -1462,15 +1840,18 @@ async function main() {
     document.body.classList.remove('playing')
     digMouseDown = false
     clearDigState()
+    clearThrownSpears(thrownSpears, projectilesGroup)
     blockBuilder.setGhost(null)
+    placedTorches.setGhost(null, null, false)
     info.textContent = ''
     renderer.domElement.style.cursor = 'crosshair'
   })
 
   const raycaster = new THREE.Raycaster()
+  const _screenCenter = new THREE.Vector2(0, 0)
 
   function aimDigRaycaster() {
-    raycaster.setFromCamera(new THREE.Vector2(0, 0), camera)
+    raycaster.setFromCamera(_screenCenter, camera)
     _digRayDir.copy(raycaster.ray.direction)
     _digRayOrigin.copy(camera.position).addScaledVector(_digRayDir, DIG_RAY_ORIGIN_OFFSET)
     raycaster.ray.set(_digRayOrigin, _digRayDir)
@@ -1536,6 +1917,9 @@ async function main() {
   }
 
   function completeDig(target: DigTarget) {
+    // Terrain (or a prop) is about to change; let resting rocks re-check support.
+    wakeRocks(placedRocks)
+
     if (target.kind === 'rock' || target.kind === 'tree') {
       if (target.propRef) removeMineableProp(target.propRef, target.kind)
       return
@@ -1547,6 +1931,14 @@ async function main() {
       removePlacedBlock(target.blockKey, true)
       if (removed) {
         info.textContent = `Mined ${removed.type} block (+1 ${removed.type})`
+      }
+      return
+    }
+
+    if (target.kind === 'torch') {
+      if (target.torchId && placedTorches.remove(target.torchId)) {
+        inventory.add('torch', 1)
+        info.textContent = 'Mined torch (+1 torch)'
       }
       return
     }
@@ -1589,9 +1981,9 @@ async function main() {
     aimDigRaycaster()
     _pickHits.length = 0
     raycaster.intersectObjects(surfaceChunks.group.children, false, _pickHits)
-    for (const child of surfaceGroup.children) {
-      if (child === surfaceChunks.group || !child.visible) continue
-      raycaster.intersectObject(child, true, _pickHits)
+    const digPreview = surfaceDigPreviewCell?.surfaceRoot
+    if (digPreview?.visible) {
+      raycaster.intersectObject(digPreview, true, _pickHits)
     }
     for (const mesh of voxelInstancer.meshes) {
       if (!mesh.visible) continue
@@ -1600,12 +1992,18 @@ async function main() {
     if (blockBuilder.count > 0) {
       blockBuilder.intersectMeshes(raycaster, _pickHits)
     }
+    if (placedTorches.count > 0) {
+      placedTorches.intersectMeshes(raycaster, _pickHits)
+    }
     if (!forBuild) {
       for (const tree of placedTrees) {
         raycaster.intersectObject(tree, true, _pickHits)
       }
       for (const rock of placedRocks) {
         raycaster.intersectObject(rock, true, _pickHits)
+      }
+      for (const enemy of enemies) {
+        raycaster.intersectObject(enemy.pickMesh, false, _pickHits)
       }
     }
     if (_pickHits.length === 0) return null
@@ -1666,6 +2064,18 @@ async function main() {
     digProgressFill.style.setProperty('--dig-deg', '0deg')
   }
 
+  onInventoryLock = (locked: boolean) => {
+    if (locked) {
+      player.lock()
+    } else {
+      player.controls.unlock()
+      digMouseDown = false
+      clearDigState()
+      blockBuilder.setGhost(null)
+      placedTorches.setGhost(null, null, false)
+    }
+  }
+
   function ensureDigEffect(target: DigTarget) {
     if (digEffectId === target.id) return
     digBreakFx.cancelDig()
@@ -1679,14 +2089,21 @@ async function main() {
       ...(excludeBottomFace ? { excludeBottomFace: true } : {}),
     })
 
-    if (target.kind === 'rock' || target.kind === 'tree') {
-      const mat = target.kind === 'rock' ? stoneBreakMaterial : woodBreakMaterial
-      const style = target.kind === 'rock' ? 'stone' : 'wood'
+    if (target.kind === 'rock') {
       digBreakFx.startFromObject(
         target.visualRoot,
-        mat,
+        stoneBreakMaterial,
         getDebrisDivisions(),
-        digFxOptions(false, style),
+        digFxOptions(false, 'stone'),
+      )
+      return
+    }
+    if (target.kind === 'tree') {
+      digBreakFx.startFromObject(
+        target.visualRoot,
+        treeBreakMaterial,
+        getTreeDebrisDivisions(),
+        digFxOptions(false, 'tree'),
       )
       return
     }
@@ -1753,6 +2170,19 @@ async function main() {
   }
 
   function digTargetFromHit(hit: THREE.Intersection): DigTarget | null {
+    const torchId = placedTorches.findIdFromObject(hit.object)
+    if (torchId) {
+      const torch = placedTorches.get(torchId)
+      if (torch) {
+        return {
+          id: `torch:${torchId}`,
+          kind: 'torch',
+          torchId,
+          visualRoot: torch.group,
+        }
+      }
+    }
+
     const prop = findMineableFromHit(hit)
     if (prop) {
       return {
@@ -1808,6 +2238,9 @@ async function main() {
   }
 
   function digTargetStillValid(target: DigTarget): boolean {
+    if (target.kind === 'torch') {
+      return target.torchId !== undefined && placedTorches.get(target.torchId) !== undefined
+    }
     if (target.kind === 'block') {
       return target.blockKey !== undefined && blockBuilder.has(target.blockKey)
     }
@@ -1824,6 +2257,24 @@ async function main() {
     return voxelInstancer.hasLayer(cell, target.layer)
   }
 
+  let lastMeleeSwingImpact = 0
+
+  function tryMeleeEnemyHit() {
+    const impact = viewmodelHand.getSwingImpact()
+    const crossed = impact >= 0.72 && lastMeleeSwingImpact < 0.72
+    lastMeleeSwingImpact = impact
+    if (!crossed) return
+    const hit = pickHit()
+    if (!hit) return
+    const enemy = enemyFromIntersection(hit, enemies)
+    if (!enemy) return
+    const held = inventory.getHeldItem()
+    const { damage: dmg } = meleeStatsForItem(held)
+    const knock = meleeKnockbackForEnemy(held, enemy)
+    const p = player.object.position
+    damageEnemy(enemy, dmg, enemiesGroup, enemies, p.x, p.z, knock, getEnemyDeathContext())
+  }
+
   function updateDig(dt: number) {
     if (!player.isLocked()) {
       clearDigState()
@@ -1833,6 +2284,12 @@ async function main() {
     let target = digTarget
     const hit = pickHit()
     if (hit) {
+      if (enemyFromIntersection(hit, enemies)) {
+        target = null
+        digTarget = null
+        digProgress = 0
+        return
+      }
       const picked = digTargetFromHit(hit)
       if (picked) {
         if (!target || target.id !== picked.id) {
@@ -1868,16 +2325,19 @@ async function main() {
           ? BUILD_BLOCK_DIG_TIME_BASE[target.blockType ?? 'dirt']
           : target.kind === 'voxel'
             ? VOXEL_DIG_TIME_BASE
-            : target.kind === 'rock'
-              ? ROCK_DIG_TIME_BASE
-              : TREE_DIG_TIME_BASE
-    const digTime = digTimeBase / getDigSpeed()
+            : target.kind === 'torch'
+              ? TORCH_DIG_TIME_BASE
+              : target.kind === 'rock'
+                ? ROCK_DIG_TIME_BASE
+                : TREE_DIG_TIME_BASE
+    const digTime =
+      digTimeBase / (getDigSpeed() * digToolMultiplier(inventory.getHeldItem(), target))
     digProgress = Math.min(1, digProgress + dt / digTime)
     digBreakFx.update(digProgress)
     const crackStyle =
       target.kind === 'rock' || target.blockType === 'stone'
         ? 'stone'
-        : target.kind === 'tree' || target.blockType === 'wood'
+        : target.kind === 'tree' || target.blockType === 'wood' || target.kind === 'torch'
           ? 'wood'
           : 'dirt'
     digCrackOverlay.setStyle(crackStyle)
@@ -1909,9 +2369,11 @@ async function main() {
       const finishMat =
         target.kind === 'rock' || target.blockType === 'stone'
           ? stoneBreakMaterial
-          : target.kind === 'tree' || target.blockType === 'wood'
-            ? woodBreakMaterial
-            : dirtMaterial
+          : target.kind === 'tree'
+            ? treeBreakMaterial
+            : target.blockType === 'wood'
+              ? woodBreakMaterial
+              : dirtMaterial
       digBreakFx.finish(finishMat)
       clearDigState(false)
     }
@@ -1963,9 +2425,6 @@ async function main() {
   let adaptTimer = 0
   const ADAPT_INTERVAL = 0.5
   // Slow frames → drop resolution; comfortable frames → climb back toward 1.
-  const FRAME_MS_HIGH = 20 // ~50 fps
-  const FRAME_MS_LOW = 16 // ~62 fps
-
   // ---- Build-preview ghost throttle ----------------------------------------
   // Re-raycasting for the placement ghost traverses every visible surface chunk
   // plus all voxel instanced meshes (~9k instance tests). Dirt (buildable) is the
@@ -1982,6 +2441,38 @@ async function main() {
   // ---- FPS / perf HUD ------------------------------------------------------
   let perfHudTimer = 0
   const PERF_HUD_INTERVAL = 0.25
+
+  // ---- Temporary CPU profiler (enable with ?prof in the URL) ---------------
+  const profEnabled = location.search.includes('prof')
+  const profAccum: Record<string, number> = {}
+  let profFrames = 0
+  let profElapsed = 0
+  let profMark = 0
+  const profStart = () => {
+    if (profEnabled) profMark = performance.now()
+  }
+  const profEnd = (label: string) => {
+    if (!profEnabled) return
+    const now = performance.now()
+    profAccum[label] = (profAccum[label] ?? 0) + (now - profMark)
+    profMark = now
+  }
+  const profReport = (dt: number) => {
+    if (!profEnabled) return
+    profFrames++
+    profElapsed += dt
+    if (profElapsed < 1) return
+    const parts = Object.entries(profAccum)
+      .map(([k, v]) => `${k}=${(v / profFrames).toFixed(2)}ms`)
+      .sort()
+    // eslint-disable-next-line no-console
+    console.log(
+      `[prof] fps=${(profFrames / profElapsed).toFixed(0)} ` + parts.join(' '),
+    )
+    for (const k of Object.keys(profAccum)) profAccum[k] = 0
+    profFrames = 0
+    profElapsed = 0
+  }
 
   function updatePerfHud() {
     const fps = Math.max(0, Math.round(1000 / Math.max(frameMs, 0.0001)))
@@ -2003,22 +2494,121 @@ async function main() {
     adaptTimer += dt
     if (adaptTimer >= ADAPT_INTERVAL) {
       adaptTimer = 0
-      if (frameMs > FRAME_MS_HIGH && adaptivePixelScale > ADAPTIVE_PIXEL_FLOOR) {
+      if (!adaptiveResolution.enabled) {
+        if (adaptivePixelScale !== 1) {
+          adaptivePixelScale = 1
+          commitPixelRatio()
+        }
+      } else if (
+        frameMs > adaptiveResolution.frameMsHigh &&
+        adaptivePixelScale > adaptiveResolution.floor
+      ) {
         // Drop faster the worse the frame time is, so weak GPUs settle quickly
         // instead of crawling down 6% at a time over several seconds.
         const drop = frameMs > 40 ? 0.16 : frameMs > 28 ? 0.1 : 0.06
-        adaptivePixelScale = Math.max(ADAPTIVE_PIXEL_FLOOR, adaptivePixelScale - drop)
+        adaptivePixelScale = Math.max(adaptiveResolution.floor, adaptivePixelScale - drop)
         commitPixelRatio()
-      } else if (frameMs < FRAME_MS_LOW && adaptivePixelScale < 1) {
+      } else if (
+        frameMs < adaptiveResolution.frameMsLow &&
+        adaptivePixelScale < 1
+      ) {
         adaptivePixelScale = Math.min(1, adaptivePixelScale + 0.04)
         commitPixelRatio()
       }
     }
 
+    worldTimeSec += dt
+    const cycleT = cycleFactor(worldTimeSec)
+    applyDayNight(worldTimeSec, dt)
+    const skyDecorFade = 1 - shelterBlend
+    skyDecor.update(
+      worldTimeSec,
+      cycleT,
+      sunDirection,
+      camera,
+      lastSunColor,
+      lastSkyTint,
+      sky.visible && skyDecorFade > 0.03,
+      skyDecorFade,
+      dt,
+    )
+
+    const nowNight = isNight(cycleT)
+    if (nowNight && !nightActive) nightActive = true
+    if (!nowNight && nightActive) {
+      nightActive = false
+      enemySpawnTimer = 0
+    }
+
+    profStart()
     readInput()
     collisionWorld.beginFrame()
     player.update(dt, input)
+    profEnd('player')
     updateSunShadow()
+
+    const enemyCrawlSpeed = enemyCrawlSpeedFromSlider(Number(enemySpeedSlider.value))
+
+    if (nowNight && enemyTemplate && playerHealth > 0) {
+      const enemySpawnInterval = enemySpawnIntervalFromSlider(
+        Number(enemySpawnRateSlider.value),
+      )
+      enemySpawnTimer += dt
+      if (enemySpawnTimer >= enemySpawnInterval && enemies.length < ENEMY_MAX_COUNT) {
+        enemySpawnTimer = 0
+        const playerPos = player.object.position
+        const spot = pickRandomEnemySpawn(
+          surfaceCells,
+          playerPos.x,
+          playerPos.z,
+          gridMinX,
+          gridMinZ,
+          cellSize,
+          gridSpan,
+        )
+        if (spot) {
+          const gy = resolveEnemyGroundY(spot.x, spot.z, rockGround)
+          if (gy !== null) {
+            const isBig = Math.random() < ENEMY_BIG_SPAWN_CHANCE
+            const enemy = createEnemy(
+              enemyTemplate,
+              spot.x,
+              gy,
+              spot.z,
+              enemiesGroup,
+              enemiesGroup,
+              { big: isBig },
+            )
+            applyEnemyLightHeight(enemy.visual, enemyLightHeightOffset())
+            enemies.push(enemy)
+          }
+        }
+      }
+    }
+
+    enemyOrbDrops.update(dt, player.object.position)
+
+    if (enemies.length > 0) {
+      const { damage, knockbackX, knockbackZ } = updateEnemies(
+        enemies,
+        player.object.position,
+        rockGround,
+        dt,
+        enemyCrawlSpeed,
+        (x, z, feetY) => player.probeWalkableY(x, z, feetY, ENEMY_STEP_HEIGHT),
+        collisionWorld,
+      )
+      if (damage > 0 && playerHealth > 0) {
+        playerHealth = Math.max(0, playerHealth - damage)
+        syncHealthHud()
+        player.applyHurtCameraShake()
+        if (knockbackX !== 0 || knockbackZ !== 0) {
+          player.applyKnockback(knockbackX, knockbackZ, ENEMY_KNOCKBACK_SPEED, ENEMY_KNOCKBACK_LIFT)
+        }
+        player.syncCamera()
+      }
+      syncEnemyHealthBars(enemies, camera)
+    }
 
     if (renderer.shadowMap.enabled) {
       const p = player.object.position
@@ -2030,20 +2620,41 @@ async function main() {
     }
 
     visibilityTimer += dt
-    if (visibilityTimer >= VISIBILITY_INTERVAL) {
+    if (visibilityTimer >= visibilityInterval) {
       visibilityTimer = 0
       refreshVisibilityNow()
     }
+    profEnd('visibility')
 
-    const digging = isDigging() && player.isLocked()
-    viewmodelHand.group.visible = player.isLocked()
-    viewmodelHand.update(dt, digging)
+    const panelOpen = inventory.isPanelOpen()
+    const digging = isDigging() && player.isLocked() && !panelOpen
+    viewmodelHand.group.visible = player.isLocked() && !panelOpen
+    viewmodelHand.setHeldItem(inventory.getHeldItem())
+    if (spearThrowCooldown > 0) spearThrowCooldown = Math.max(0, spearThrowCooldown - dt)
+    viewmodelHand.update(dt, digging && !viewmodelHand.isThrowing())
+    releasePendingSpearThrow()
+    if (player.isLocked() && !panelOpen) {
+      tryMeleeEnemyHit()
+      updateThrownSpears(
+        dt,
+        thrownSpears,
+        projectilesGroup,
+        enemies,
+        enemiesGroup,
+        raycaster,
+        getEnemyDeathContext(),
+      )
+    }
     if (digging) {
       blockBuilder.setGhost(null)
+      placedTorches.setGhost(null, null, false)
       updateDig(dt)
       _bpHasQuat = false
     } else {
       if (digTarget || digProgress > 0) clearDigState()
+      if (lastMeleeSwingImpact > 0 && viewmodelHand.getSwingImpact() <= 0) {
+        lastMeleeSwingImpact = 0
+      }
       if (player.isLocked() && inventory.selectedIsBuildable()) {
         buildPreviewTimer += dt
         const rotDelta = _bpHasQuat ? camera.quaternion.angleTo(_bpQuat) : Infinity
@@ -2053,6 +2664,22 @@ async function main() {
           buildPreviewTimer >= BUILD_PREVIEW_HEARTBEAT
         ) {
           updateBuildPreview()
+          placedTorches.setGhost(null, null, false)
+          _bpQuat.copy(camera.quaternion)
+          _bpHasQuat = true
+          buildPreviewTimer = 0
+          forceBuildPreview = false
+        }
+      } else if (player.isLocked() && inventory.getHeldItem() === 'torch') {
+        buildPreviewTimer += dt
+        const rotDelta = _bpHasQuat ? camera.quaternion.angleTo(_bpQuat) : Infinity
+        if (
+          forceBuildPreview ||
+          rotDelta > BUILD_PREVIEW_ROT_EPS ||
+          buildPreviewTimer >= BUILD_PREVIEW_HEARTBEAT
+        ) {
+          updateTorchPreview()
+          blockBuilder.setGhost(null)
           _bpQuat.copy(camera.quaternion)
           _bpHasQuat = true
           buildPreviewTimer = 0
@@ -2060,11 +2687,13 @@ async function main() {
         }
       } else {
         blockBuilder.setGhost(null)
+        placedTorches.setGhost(null, null, false)
         _bpHasQuat = false
       }
     }
     digBreakFx.tick(dt)
     updateBlockExpiry()
+    placedTorches.update(clock.elapsedTime)
 
     if (
       placedRocks.length > 0 &&
@@ -2074,13 +2703,16 @@ async function main() {
     }
 
     updateGrassWind(clock.elapsedTime)
+    profEnd('digbuild')
     renderer.render(scene, camera)
+    profEnd('render')
 
     perfHudTimer += dt
     if (perfHudTimer >= PERF_HUD_INTERVAL) {
       perfHudTimer = 0
       updatePerfHud()
     }
+    profReport(dt)
   }
   updatePerfHud()
   animate()

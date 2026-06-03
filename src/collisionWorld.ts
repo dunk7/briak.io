@@ -50,6 +50,10 @@ export class CollisionWorld {
     string,
     { x: number; z: number; top: number }
   >()
+  private readonly hintsByBucket = new Map<
+    string,
+    { x: number; z: number; top: number; key: string }[]
+  >()
   private queryStamp = 0
   private queryStamped: number[] = []
   private gridCell = DEFAULT_GRID_CELL
@@ -96,7 +100,7 @@ export class CollisionWorld {
       this.meshGround,
       this.meshGroundHits,
       maxDistance,
-      { intersectInvisibleChunks: true },
+      { intersectInvisibleChunks: false },
     )
     this.groundCacheStamp = this.groundFrameStamp
     this.groundCacheX = feetX
@@ -133,6 +137,7 @@ export class CollisionWorld {
     this.cellSlots.clear()
     this.heightGrid.clear()
     this.columnHints.clear()
+    this.hintsByBucket.clear()
     this.staticBoxIndices.length = 0
     this.buildSlots.clear()
   }
@@ -250,22 +255,51 @@ export class CollisionWorld {
     return top
   }
 
+  private hintBucketKey(centerX: number, centerZ: number) {
+    return gridKey(
+      Math.floor(centerX / this.gridCell),
+      Math.floor(centerZ / this.gridCell),
+    )
+  }
+
+  private removeHintFromBucket(key: string, centerX: number, centerZ: number) {
+    const list = this.hintsByBucket.get(this.hintBucketKey(centerX, centerZ))
+    if (!list) return
+    const idx = list.findIndex((h) => h.key === key)
+    if (idx >= 0) list.splice(idx, 1)
+    if (list.length === 0) this.hintsByBucket.delete(this.hintBucketKey(centerX, centerZ))
+  }
+
   private updateColumnHint(cell: TerrainCellCollision, voxelSize: number) {
+    const prev = this.columnHints.get(cell.key)
+    if (prev) this.removeHintFromBucket(cell.key, prev.x, prev.z)
+
     const top = this.computeColumnWalkableTop(cell, voxelSize)
-    if (top === null) this.columnHints.delete(cell.key)
-    else this.columnHints.set(cell.key, { x: cell.centerX, z: cell.centerZ, top })
+    if (top === null) {
+      this.columnHints.delete(cell.key)
+    } else {
+      const hint = { x: cell.centerX, z: cell.centerZ, top, key: cell.key }
+      this.columnHints.set(cell.key, hint)
+      const gk = this.hintBucketKey(cell.centerX, cell.centerZ)
+      let list = this.hintsByBucket.get(gk)
+      if (!list) {
+        list = []
+        this.hintsByBucket.set(gk, list)
+      }
+      list.push(hint)
+    }
     this.rebuildHeightGridBucket(cell.centerX, cell.centerZ)
   }
 
   private rebuildHeightGridBucket(centerX: number, centerZ: number) {
-    const gx0 = Math.floor(centerX / this.gridCell)
-    const gz0 = Math.floor(centerZ / this.gridCell)
-    const gk = gridKey(gx0, gz0)
+    const gk = this.hintBucketKey(centerX, centerZ)
     let maxTop = -Infinity
-    for (const hint of this.columnHints.values()) {
-      if (Math.floor(hint.x / this.gridCell) !== gx0) continue
-      if (Math.floor(hint.z / this.gridCell) !== gz0) continue
-      if (hint.top > maxTop) maxTop = hint.top
+    const list = this.hintsByBucket.get(gk)
+    if (list) {
+      for (let i = 0; i < list.length; i++) {
+        const top = list[i]!.top
+        if (top > maxTop) maxTop = top
+      }
     }
     if (maxTop === -Infinity) this.heightGrid.delete(gk)
     else this.heightGrid.set(gk, maxTop)
@@ -433,18 +467,27 @@ export class CollisionWorld {
   ) {
     const half = this.gridCell * 0.5
     let best: number | null = null
-    for (const hint of this.columnHints.values()) {
-      if (
-        feetX <= hint.x - half ||
-        feetX >= hint.x + half ||
-        feetZ <= hint.z - half ||
-        feetZ >= hint.z + half
-      ) {
-        continue
+    const gx = Math.floor(feetX / this.gridCell)
+    const gz = Math.floor(feetZ / this.gridCell)
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        const list = this.hintsByBucket.get(gridKey(gx + dx, gz + dz))
+        if (!list) continue
+        for (let i = 0; i < list.length; i++) {
+          const hint = list[i]!
+          if (
+            feetX <= hint.x - half ||
+            feetX >= hint.x + half ||
+            feetZ <= hint.z - half ||
+            feetZ >= hint.z + half
+          ) {
+            continue
+          }
+          if (hint.top > feetY + stepHeight + 0.05) continue
+          if (hint.top < feetY - stepHeight - recoverBelow) continue
+          if (best === null || hint.top > best) best = hint.top
+        }
       }
-      if (hint.top > feetY + stepHeight + 0.05) continue
-      if (hint.top < feetY - stepHeight - recoverBelow) continue
-      if (best === null || hint.top > best) best = hint.top
     }
     return best
   }
@@ -593,6 +636,24 @@ export class CollisionWorld {
       else if (feetY - hint < 0.22 && hint > best && hint <= feetY + maxAbove) {
         best = hint
       }
+    }
+    return best
+  }
+
+  /** Lowest Y of a horizontal surface above `fromY` within `maxAbove` (voxel/prop bottoms). */
+  nearestCeilingYAbove(
+    x: number,
+    z: number,
+    fromY: number,
+    radius: number,
+    maxAbove: number,
+  ): number | null {
+    const indices = this.queryNear(x, z, radius, fromY, fromY + maxAbove, true)
+    let best: number | null = null
+    for (let i = 0; i < indices.length; i++) {
+      const box = this.boxes[indices[i]!]!
+      if (box.min.y <= fromY + 0.35) continue
+      if (best === null || box.min.y < best) best = box.min.y
     }
     return best
   }

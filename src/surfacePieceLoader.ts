@@ -46,6 +46,17 @@ export function cellKey(ix: number, iy: number) {
   return `${ix}_${iy}`
 }
 
+/**
+ * Disable matrixAutoUpdate on every node in a static subtree so the renderer's
+ * per-frame scene.updateMatrixWorld() stops recomposing/multiplying matrices for
+ * it. Call only after the subtree's world matrices are already up to date.
+ */
+export function freezeSubtreeMatrices(root: THREE.Object3D) {
+  root.traverse((node) => {
+    node.matrixAutoUpdate = false
+  })
+}
+
 export function sortSurfaceCellsBySpawn<T extends SurfaceCellMeta>(
   metas: T[],
   spawnX: number,
@@ -107,10 +118,16 @@ export function loadSurfaceCell(
         ctx.tagWithCellKey(root, key)
         cell.surfaceRoot = root
         root.visible = false
-        root.matrixAutoUpdate = false
         root.updateMatrixWorld(true)
         ctx.surfaceGroup.add(root)
         alignSurfaceToCellGrid(cell, ctx.terrainGrid, ctx.voxelSize)
+        // These per-cell roots are static once placed (merged into chunk meshes
+        // and invisible). Freezing matrixAutoUpdate on the WHOLE subtree — not
+        // just the root — stops scene.updateMatrixWorld() from recomposing every
+        // descendant mesh's matrix on every frame, which across ~1800 cells was
+        // the dominant per-frame CPU cost. Matrices were already composed by the
+        // updateMatrixWorld(true) calls above.
+        freezeSubtreeMatrices(root)
         ctx.surfaceChunks.registerCell(cell)
         ctx.surfaceChunks.markDirtyForCell(cell)
         queueSurfaceSource(cell, pristine)

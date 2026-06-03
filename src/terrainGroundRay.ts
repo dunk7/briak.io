@@ -33,17 +33,23 @@ export function sampleMeshGroundY(
   const chunkRoot = targets.chunkRoot
   // The merged chunk meshes are the authoritative walking surface.
   if (chunkRoot && chunkRoot.children.length > 0) {
-    const hidden: THREE.Mesh[] = []
     if (options?.intersectInvisibleChunks) {
+      const hidden: THREE.Mesh[] = []
       for (const child of chunkRoot.children) {
         if (child instanceof THREE.Mesh && !child.visible) {
           hidden.push(child)
           child.visible = true
         }
       }
+      _raycaster.intersectObjects(chunkRoot.children, false, hits)
+      for (const mesh of hidden) mesh.visible = false
+    } else {
+      for (const child of chunkRoot.children) {
+        if (child instanceof THREE.Mesh && child.visible) {
+          _raycaster.intersectObject(child, false, hits)
+        }
+      }
     }
-    _raycaster.intersectObjects(chunkRoot.children, false, hits)
-    for (const mesh of hidden) mesh.visible = false
   }
   // Only raycast individual cell roots that are actually visible (e.g. the cell
   // peeled out for a dig preview). Skipping the ~thousands of hidden roots — and

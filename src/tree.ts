@@ -163,20 +163,60 @@ function trunkBottomY(root: THREE.Object3D): number | null {
   return Number.isFinite(bottom) ? bottom : null
 }
 
-/** Load at the model's authored scale (1 Blender unit = 1 world unit). */
-export async function loadTreeModel(url: string): Promise<THREE.Group> {
-  const gltf = await new GLTFLoader().loadAsync(url)
-  const model = gltf.scene
-  applyTreeMaterials(model)
-
-  const bottom = trunkBottomY(model)
-  if (bottom !== null) {
-    model.position.y -= bottom
+function alignModelToGround(model: THREE.Object3D, bottomY: number | null) {
+  if (bottomY !== null) {
+    model.position.y -= bottomY
   } else {
     model.updateWorldMatrix(true, true)
     _box.setFromObject(model)
     model.position.y -= _box.min.y
   }
+}
+
+/** Load at the model's authored scale (1 Blender unit = 1 world unit). */
+export async function loadTreeModel(url: string): Promise<THREE.Group> {
+  const gltf = await new GLTFLoader().loadAsync(url)
+  const model = gltf.scene
+  applyTreeMaterials(model)
+  alignModelToGround(model, trunkBottomY(model))
+
+  const wrapper = new THREE.Group()
+  wrapper.add(model)
+  return wrapper
+}
+
+const BERRY_EMISSIVE = 0x280840
+const BERRY_PALETTE = [0x8b4fd4, 0xa066e8, 0x7038b8, 0xc090f8]
+
+function applyBerryMaterials(root: THREE.Object3D) {
+  root.updateWorldMatrix(true, true)
+  const material = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    vertexColors: true,
+    flatShading: true,
+    roughness: 0.35,
+    metalness: 0.08,
+    emissive: BERRY_EMISSIVE,
+    emissiveIntensity: 0.28,
+  })
+
+  let idx = 0
+  root.traverse((child) => {
+    if (!(child instanceof THREE.Mesh)) return
+    const hex = BERRY_PALETTE[idx % BERRY_PALETTE.length]!
+    bakeBlobColors(child.geometry, hex, 0.28, 0.05)
+    child.material = material
+    child.castShadow = true
+    child.receiveShadow = true
+    idx++
+  })
+}
+
+/** Purple berry cluster authored to align with the tree GLB at the same origin. */
+export async function loadTreeBerriesModel(url: string): Promise<THREE.Group> {
+  const gltf = await new GLTFLoader().loadAsync(url)
+  const model = gltf.scene
+  applyBerryMaterials(model)
 
   const wrapper = new THREE.Group()
   wrapper.add(model)
@@ -264,6 +304,15 @@ export type TreePlacement = {
   y: number
   z: number
   rotationY?: number
+  /** ~1/5 of trees carry crystal berries (stable per cell). */
+  hasBerries?: boolean
+}
+
+/** Fraction of trees that spawn with crystal berries. */
+export const BERRY_TREE_FRACTION = 0.2
+
+export function hasCrystalBerriesForCell(ix: number, iy: number): boolean {
+  return hashUnit(ix * 48271 + iy * 8191) < BERRY_TREE_FRACTION
 }
 
 function cellSpacingOk(
@@ -348,6 +397,7 @@ export function findTreePlacements(
       y: cellSurfaceY(cell),
       z: cell.center_y + oz,
       rotationY: rotationForCell(cell.ix, cell.iy),
+      hasBerries: hasCrystalBerriesForCell(cell.ix, cell.iy),
     })
   }
 
@@ -358,6 +408,7 @@ export function placeTrees(
   template: THREE.Group,
   placements: TreePlacement[],
   parent: THREE.Object3D,
+  berriesTemplate?: THREE.Group,
 ): THREE.Group[] {
   const trees: THREE.Group[] = []
 
@@ -366,6 +417,14 @@ export function placeTrees(
     tree.position.set(spot.x, spot.y, spot.z)
     if (spot.rotationY !== undefined) tree.rotation.y = spot.rotationY
     tree.scale.setScalar(TREE_SCALE)
+    if (spot.hasBerries && berriesTemplate) {
+      const berries = berriesTemplate.clone(true)
+      const treeModelY = template.children[0]?.position.y ?? 0
+      const berriesModel = berries.children[0]
+      if (berriesModel) berriesModel.position.y = treeModelY
+      tree.add(berries)
+      tree.userData.hasCrystalBerries = true
+    }
     parent.add(tree)
     trees.push(tree)
   }

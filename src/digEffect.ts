@@ -17,6 +17,13 @@ const _instPos = new THREE.Vector3()
 const _instQuat = new THREE.Quaternion()
 const _instScale = new THREE.Vector3()
 const _zeroMatrix = new THREE.Matrix4().makeScale(0, 0, 0)
+const _instColor = new THREE.Color()
+
+/** Bark / canopy tones (match tree.ts palettes). */
+const TREE_DEBRIS_TRUNK = [0x4a2f1c, 0x66421f]
+const TREE_DEBRIS_FOLIAGE = [0x4d9234, 0x5da642, 0x6cb84e]
+/** Grid slots with norm.y above this tint as foliage. */
+const TREE_FOLIAGE_NORM_Y = 0.02
 
 const GRAVITY = 32
 const RESTITUTION = 0.22
@@ -37,7 +44,7 @@ const DEBRIS_CENTER_SPREAD = 0.52
 const DEBRIS_SIZE_SCALE_MIN = 0.4
 const DEBRIS_SIZE_SCALE_RANGE = 0.6
 
-export type DigBreakStyle = 'dirt' | 'stone' | 'wood'
+export type DigBreakStyle = 'dirt' | 'stone' | 'wood' | 'tree'
 
 export type DigBreakOptions = {
   excludeBottomFace?: boolean
@@ -47,12 +54,49 @@ export type DigBreakOptions = {
 type StyleTuning = {
   burstMul: number
   spinMul: number
+  /** Multiplier on crumb box size (default 1). */
+  crumbScaleMul: number
+  /** Multiplier on per-piece size variation (default 1). */
+  pieceSizeMul: number
+  /** World-space spawn shift along box height (negative = lower). */
+  spawnYOffsetFrac: number
+  /** How far below terrain the piece bottom rests, as a fraction of half-extent. */
+  groundEmbed: number
 }
 
 const STYLE_TUNING: Record<DigBreakStyle, StyleTuning> = {
-  dirt: { burstMul: 1, spinMul: 1 },
-  stone: { burstMul: 0.92, spinMul: 0.75 },
-  wood: { burstMul: 1.12, spinMul: 1.4 },
+  dirt: {
+    burstMul: 1,
+    spinMul: 1,
+    crumbScaleMul: 1,
+    pieceSizeMul: 1,
+    spawnYOffsetFrac: 0,
+    groundEmbed: 0,
+  },
+  stone: {
+    burstMul: 0.92,
+    spinMul: 0.75,
+    crumbScaleMul: 0.48,
+    pieceSizeMul: 0.72,
+    spawnYOffsetFrac: -0.22,
+    groundEmbed: 0.38,
+  },
+  wood: {
+    burstMul: 1.12,
+    spinMul: 1.4,
+    crumbScaleMul: 1,
+    pieceSizeMul: 1,
+    spawnYOffsetFrac: 0,
+    groundEmbed: 0,
+  },
+  tree: {
+    burstMul: 1.12,
+    spinMul: 1.4,
+    crumbScaleMul: 0.52,
+    pieceSizeMul: 0.62,
+    spawnYOffsetFrac: 0,
+    groundEmbed: 0,
+  },
 }
 
 type CrumbSlot = {
@@ -180,7 +224,8 @@ export class DigBreakEffect {
     const sx = _size.x / nx
     const sy = _size.y / ny
     const sz = _size.z / nz
-    const crumbScale = DEBRIS_CRUMB_SCALE
+    const crumbScale = DEBRIS_CRUMB_SCALE * this.tuning.crumbScaleMul
+    const spawnYOffset = _size.y * this.tuning.spawnYOffsetFrac
     this.sharedGeo = new THREE.BoxGeometry(
       sx * crumbScale,
       sy * crumbScale,
@@ -204,12 +249,13 @@ export class DigBreakEffect {
           const normZ = (iz + 0.5) / nz - 0.5
           _crumbPos.set(
             _center.x + normX * _size.x * spread,
-            _center.y + normY * _size.y * spread,
+            _center.y + normY * _size.y * spread + spawnYOffset,
             _center.z + normZ * _size.z * spread,
           )
           const idx = this.slots.length
           const sizeScale =
-            DEBRIS_SIZE_SCALE_MIN + Math.random() * DEBRIS_SIZE_SCALE_RANGE
+            (DEBRIS_SIZE_SCALE_MIN + Math.random() * DEBRIS_SIZE_SCALE_RANGE) *
+            this.tuning.pieceSizeMul
           this.slots.push({
             base: _crumbPos.clone(),
             half: halfBase * sizeScale,
@@ -289,10 +335,11 @@ export class DigBreakEffect {
     this.breakFloorY = box.min.y
 
     const spread = DEBRIS_CENTER_SPREAD
+    const spawnYOffset = _size.y * this.tuning.spawnYOffsetFrac
     for (const slot of this.slots) {
       _crumbPos.set(
         _center.x + slot.norm.x * _size.x * spread,
-        _center.y + slot.norm.y * _size.y * spread,
+        _center.y + slot.norm.y * _size.y * spread + spawnYOffset,
         _center.z + slot.norm.z * _size.z * spread,
       )
       slot.base.copy(_crumbPos)
@@ -342,6 +389,17 @@ export class DigBreakEffect {
     mesh.frustumCulled = false
     for (let i = 0; i < capacity; i++) mesh.setMatrixAt(i, _zeroMatrix)
     mesh.instanceMatrix.needsUpdate = true
+    if (this.style === 'tree') {
+      for (let i = 0; i < capacity; i++) {
+        const slot = this.slots[i]!
+        const palette =
+          slot.norm.y > TREE_FOLIAGE_NORM_Y ? TREE_DEBRIS_FOLIAGE : TREE_DEBRIS_TRUNK
+        const pick = Math.floor(((i * 374761393) >>> 0) % palette.length)
+        _instColor.setHex(palette[pick]!)
+        mesh.setColorAt(i, _instColor)
+      }
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+    }
     this.group.add(mesh)
 
     const batch: DebrisBatch = {
@@ -404,7 +462,7 @@ export class DigBreakEffect {
     vel.addScaledVector(_dir, 0.5 + radial * 1.1 + Math.random() * 0.5)
     vel.multiplyScalar(burstScale)
 
-    if (batch.style === 'wood') {
+    if (batch.style === 'wood' || batch.style === 'tree') {
       // Splinters tumble and drift more than dirt.
       vel.y += 0.2
       vel.x += (Math.random() - 0.5) * 0.45
@@ -539,14 +597,17 @@ export class DigBreakEffect {
       this.collisionWorld?.findGroundTop(pos.x, pos.y, pos.z, half, 64) ?? null
     if (groundY === null) groundY = batch.floorY
 
+    const embed = STYLE_TUNING[batch.style].groundEmbed
+    const restY = groundY + half * (1 - embed) + 0.002
+
     if (bottom < groundY - 0.01) {
-      pos.y = groundY + half + 0.002
+      pos.y = restY
       if (vel.y < 0) vel.y = 0
       return
     }
 
     if (vel.length() < SETTLE_SPEED && bottom <= groundY + 0.05) {
-      pos.y = groundY + half + 0.002
+      pos.y = restY
       vel.set(0, 0, 0)
       angVel.multiplyScalar(0.7)
     }

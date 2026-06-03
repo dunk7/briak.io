@@ -42,6 +42,7 @@ const _segment = new THREE.Line3()
 const _raycaster = new THREE.Raycaster()
 const _rayOrigin = new THREE.Vector3()
 const _downDir = new THREE.Vector3(0, -1, 0)
+const _upDir = new THREE.Vector3(0, 1, 0)
 const _rayHits: THREE.Intersection[] = []
 const _triPoint = new THREE.Vector3()
 const _capPoint = new THREE.Vector3()
@@ -94,8 +95,13 @@ export class CapsuleCollider {
     _raycaster.far = maxDistance
     _rayHits.length = 0
 
-    if (this.chunkRoot && this.chunkRoot.children.length > 0) {
-      _raycaster.intersectObjects(this.chunkRoot.children, false, _rayHits)
+    if (this.chunkRoot) {
+      const children = this.chunkRoot.children
+      for (let i = 0; i < children.length; i++) {
+        const mesh = children[i] as THREE.Mesh
+        if (!mesh.visible) continue
+        _raycaster.intersectObject(mesh, false, _rayHits)
+      }
     }
     if (this.surfaceRoot) {
       const children = this.surfaceRoot.children
@@ -116,6 +122,39 @@ export class CapsuleCollider {
       }
     }
     return bestY
+  }
+
+  /** Distance to the nearest terrain surface above (x, y, z), or null if none within range. */
+  raycastUpDistance(x: number, y: number, z: number, maxDistance: number): number | null {
+    _rayOrigin.set(x, y, z)
+    _raycaster.set(_rayOrigin, _upDir)
+    _raycaster.near = 0
+    _raycaster.far = maxDistance
+    _rayHits.length = 0
+
+    if (this.chunkRoot) {
+      const children = this.chunkRoot.children
+      for (let i = 0; i < children.length; i++) {
+        const mesh = children[i] as THREE.Mesh
+        if (!mesh.visible) continue
+        _raycaster.intersectObject(mesh, false, _rayHits)
+      }
+    }
+    if (this.surfaceRoot) {
+      const children = this.surfaceRoot.children
+      for (let i = 0; i < children.length; i++) {
+        const child = children[i]!
+        if (!child.visible || child === this.chunkRoot) continue
+        _raycaster.intersectObject(child, true, _rayHits)
+      }
+    }
+    if (_rayHits.length === 0) return null
+    let bestDist = Infinity
+    for (let i = 0; i < _rayHits.length; i++) {
+      const hit = _rayHits[i]!
+      if (hit.distance < bestDist) bestDist = hit.distance
+    }
+    return bestDist
   }
 
   /**
@@ -185,7 +224,9 @@ export class CapsuleCollider {
     if (this.chunkRoot) {
       const children = this.chunkRoot.children
       for (let i = 0; i < children.length; i++) {
-        this.collideMesh(children[i] as THREE.Mesh, segment, radius)
+        const mesh = children[i] as THREE.Mesh
+        if (!mesh.visible) continue
+        this.collideMesh(mesh, segment, radius)
       }
     }
     if (this.surfaceRoot) {
@@ -203,7 +244,7 @@ export class CapsuleCollider {
   }
 
   private collideMesh(mesh: THREE.Mesh, segment: THREE.Line3, radius: number) {
-    if (!mesh || !(mesh as THREE.Mesh).isMesh) return
+    if (!mesh?.visible || !(mesh as THREE.Mesh).isMesh) return
     const geo = mesh.geometry as GeometryWithTree
 
     // Cheap broadphase: skip meshes whose world bounds miss the capsule.

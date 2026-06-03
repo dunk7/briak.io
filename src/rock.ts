@@ -29,6 +29,13 @@ const ROCK_MESH_OVER_COLLISION_EPS = 0.25
 const ROCK_FALL_GRAVITY = 32
 const ROCK_MAX_DROP = 64
 const ROCK_FALL_VY_KEY = 'fallVy'
+/**
+ * Rocks at rest are skipped by the physics loop. Probing a rock's support point
+ * costs a full terrain raycast (over every chunk mesh) plus several bounding-box
+ * passes, so re-checking already-settled rocks every frame was a large per-frame
+ * cost. Rocks are re-woken (see `wakeRocks`) whenever terrain is dug away.
+ */
+const ROCK_SETTLED_KEY = 'settled'
 
 export type RockGroundTargets = {
   surface: THREE.Object3D
@@ -226,6 +233,9 @@ export function updateRocksPhysics(
   let moved = false
 
   for (const rock of rocks) {
+    // Resting rocks are inert until terrain changes under them (see wakeRocks).
+    if (rock.userData[ROCK_SETTLED_KEY] === true) continue
+
     const bottom = rockBottomY(rock)
     const groundY = resolveRockSupportY(
       rock.position.x,
@@ -246,6 +256,7 @@ export function updateRocksPhysics(
         moved = true
       }
       delete rock.userData[ROCK_FALL_VY_KEY]
+      rock.userData[ROCK_SETTLED_KEY] = true
       continue
     }
 
@@ -259,10 +270,21 @@ export function updateRocksPhysics(
     if (newBottom <= targetBottom) {
       rock.position.y += targetBottom - newBottom
       delete rock.userData[ROCK_FALL_VY_KEY]
+      rock.userData[ROCK_SETTLED_KEY] = true
     }
   }
 
   return moved
+}
+
+/**
+ * Mark rocks as needing a physics re-check (e.g. after a dig removed terrain that
+ * a rock may have been resting on). Settled rocks are otherwise skipped entirely.
+ */
+export function wakeRocks(rocks: readonly THREE.Group[]): void {
+  for (const rock of rocks) {
+    rock.userData[ROCK_SETTLED_KEY] = false
+  }
 }
 
 export function resolveRockGroundY(
