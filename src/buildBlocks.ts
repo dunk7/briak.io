@@ -15,15 +15,25 @@ export function createGrassTopDirtBoxGeometry(size: number): THREE.BoxGeometry {
   return geo
 }
 
-export type BuildBlockType = 'dirt' | 'wood' | 'stone'
+export type BuildBlockType = 'dirt' | 'wood' | 'stone' | 'iron' | 'gold' | 'diamond'
 
-export const BUILD_BLOCK_TYPES: readonly BuildBlockType[] = ['dirt', 'wood', 'stone']
+export const BUILD_BLOCK_TYPES: readonly BuildBlockType[] = [
+  'dirt',
+  'wood',
+  'stone',
+  'iron',
+  'gold',
+  'diamond',
+]
 
 /** How long placed blocks persist before despawning. */
 export const BUILD_BLOCK_LIFETIME_MS: Record<BuildBlockType, number> = {
   dirt: 30 * 60 * 1000,
   wood: 12 * 60 * 60 * 1000,
   stone: 48 * 60 * 60 * 1000,
+  iron: 72 * 60 * 60 * 1000,
+  gold: 96 * 60 * 60 * 1000,
+  diamond: 120 * 60 * 60 * 1000,
 }
 
 /** Base seconds to mine a placed block at 1.0× dig speed (wood 2× dirt, stone 4× dirt). */
@@ -31,12 +41,18 @@ export const BUILD_BLOCK_DIG_TIME_BASE: Record<BuildBlockType, number> = {
   dirt: 1.1,
   wood: 2.2,
   stone: 4.4,
+  iron: 6.0,
+  gold: 7.0,
+  diamond: 9.0,
 }
 
 const GHOST_COLORS: Record<BuildBlockType, { valid: number; invalid: number }> = {
   dirt: { valid: 0x9ad16a, invalid: 0xd1564a },
   wood: { valid: 0xc4a574, invalid: 0xd1564a },
   stone: { valid: 0xa8b0b8, invalid: 0xd1564a },
+  iron: { valid: 0xd0ccc4, invalid: 0xd1564a },
+  gold: { valid: 0xe8c84a, invalid: 0xd1564a },
+  diamond: { valid: 0x5aeee4, invalid: 0xd1564a },
 }
 
 export type BuildCell = {
@@ -161,6 +177,79 @@ export function buildPlacementNormalAgainstBlock(
   return buildPlacementNormalFromFace(faceNormal, objectMatrixWorld, rayDirection, out)
 }
 
+/** Fraction of a build block: hits closer than this to a side count as "on the edge". */
+const SNEAK_BRIDGE_EDGE_FRAC = 0.28
+
+/**
+ * Minecraft-style sneak bridging: when aiming at a top face near an edge, return
+ * the outward ±X/±Z axis to place against instead of stacking on top of yourself.
+ * Returns null when the hit is not a brink top-face placement.
+ */
+export function sneakBridgeOutwardNormal(
+  hitPoint: THREE.Vector3,
+  placementNormal: THREE.Vector3,
+  lookDir: THREE.Vector3,
+  out: THREE.Vector3,
+): THREE.Vector3 | null {
+  if (placementNormal.y < 0.5) return null
+
+  const gx = Math.floor(hitPoint.x / BUILD_BLOCK_SIZE)
+  const gz = Math.floor(hitPoint.z / BUILD_BLOCK_SIZE)
+  const minX = gx * BUILD_BLOCK_SIZE
+  const maxX = minX + BUILD_BLOCK_SIZE
+  const minZ = gz * BUILD_BLOCK_SIZE
+  const maxZ = minZ + BUILD_BLOCK_SIZE
+  const edgeLimit = BUILD_BLOCK_SIZE * SNEAK_BRIDGE_EDGE_FRAC
+
+  const toMinX = hitPoint.x - minX
+  const toMaxX = maxX - hitPoint.x
+  const toMinZ = hitPoint.z - minZ
+  const toMaxZ = maxZ - hitPoint.z
+  const nearMinX = toMinX <= edgeLimit
+  const nearMaxX = toMaxX <= edgeLimit
+  const nearMinZ = toMinZ <= edgeLimit
+  const nearMaxZ = toMaxZ <= edgeLimit
+  if (!nearMinX && !nearMaxX && !nearMinZ && !nearMaxZ) return null
+
+  const ax = Math.abs(lookDir.x)
+  const az = Math.abs(lookDir.z)
+  if (ax >= az && ax > 1e-4) {
+    if (lookDir.x > 0 && nearMaxX) return out.set(1, 0, 0)
+    if (lookDir.x < 0 && nearMinX) return out.set(-1, 0, 0)
+  }
+  if (az > 1e-4) {
+    if (lookDir.z > 0 && nearMaxZ) return out.set(0, 0, 1)
+    if (lookDir.z < 0 && nearMinZ) return out.set(0, 0, -1)
+  }
+
+  const nearest = Math.min(
+    nearMinX ? toMinX : Infinity,
+    nearMaxX ? toMaxX : Infinity,
+    nearMinZ ? toMinZ : Infinity,
+    nearMaxZ ? toMaxZ : Infinity,
+  )
+  if (nearest === toMinX) return out.set(-1, 0, 0)
+  if (nearest === toMaxX) return out.set(1, 0, 0)
+  if (nearest === toMinZ) return out.set(0, 0, -1)
+  return out.set(0, 0, 1)
+}
+
+/**
+ * Support cell under a top-face hit (nudge below the surface so floor() stays in
+ * the stood-on cell even when the hit lands exactly on a grid seam).
+ */
+export function supportCellFromTopHit(
+  hitPoint: THREE.Vector3,
+  out: Pick<BuildCell, 'gx' | 'gy' | 'gz'>,
+): Pick<BuildCell, 'gx' | 'gy' | 'gz'> {
+  _p.copy(hitPoint)
+  _p.y -= PLACEMENT_FACE_NUDGE
+  out.gx = Math.floor(_p.x / BUILD_BLOCK_SIZE)
+  out.gy = Math.floor(_p.y / BUILD_BLOCK_SIZE)
+  out.gz = Math.floor(_p.z / BUILD_BLOCK_SIZE)
+  return out
+}
+
 function cellCenter(cell: Pick<BuildCell, 'gx' | 'gy' | 'gz'>, out: THREE.Vector3) {
   return buildCellWorldCenter(cell, out)
 }
@@ -245,7 +334,8 @@ export class BlockBuilder {
     mesh.count = 0
     mesh.castShadow = false
     mesh.receiveShadow = false
-    mesh.frustumCulled = false
+    // Bounding sphere is refreshed on place/remove — safe to frustum-cull.
+    mesh.frustumCulled = true
     mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage)
     return mesh
   }

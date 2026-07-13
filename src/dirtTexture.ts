@@ -3,7 +3,7 @@ import * as THREE from 'three'
 const DEFAULT_SIZE = 128
 
 /** midBrown — representative soil tone; matches procedural albedo palette below. */
-export const DIRT_MID = 0x76583a
+export const DIRT_MID = 0x7a5e40
 /** Texture repeats per voxel face (must match `dirtMap.repeat` in main). */
 export const DIRT_TEXTURE_REPEAT = 3
 /** darkLoam — shadow fill for dirt materials (emissive). */
@@ -29,34 +29,6 @@ function fade(t: number) {
 
 function lerp(a: number, b: number, t: number) {
   return a + (b - a) * t
-}
-
-function valueNoise2(x: number, y: number) {
-  const xi = Math.floor(x)
-  const yi = Math.floor(y)
-  const xf = x - xi
-  const yf = y - yi
-  const u = fade(xf)
-  const v = fade(yf)
-  const a = hash01(xi, yi)
-  const b = hash01(xi + 1, yi)
-  const c = hash01(xi, yi + 1)
-  const d = hash01(xi + 1, yi + 1)
-  return lerp(lerp(a, b, u), lerp(c, d, u), v)
-}
-
-function fbm(x: number, y: number, octaves: number, lacunarity = 2, gain = 0.5) {
-  let amp = 1
-  let freq = 1
-  let sum = 0
-  let norm = 0
-  for (let i = 0; i < octaves; i++) {
-    sum += amp * valueNoise2(x * freq, y * freq)
-    freq *= lacunarity
-    norm += amp
-    amp *= gain
-  }
-  return sum / norm
 }
 
 const TILE_PERIOD = 32
@@ -204,29 +176,33 @@ function heightFieldToNormalMap(
   return createCanvasTextureFromImageData(image, size, THREE.NoColorSpace)
 }
 
-/** Bumpy soil relief: broad patches, clods, and fine grain. High-quality only. */
+/** Bumpy soil relief: broad patches, clods, and soft hollows. */
 export function createDirtNormalMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
   const height = buildHeightField(size, (u, v) => {
     const patch = fbmT(u * 5.5, v * 5.5, 4)
-    const clump = fbmT(u * 14 + 3.7, v * 14 + 11.2, 3)
-    const grain = fbmT(u * 40 + 1.2, v * 40 + 6.8, 2)
-    return patch * 0.5 + clump * 0.34 + grain * 0.16
+    const clump = fbmT(u * 14 + 3.7, v * 14 + 11.2, 4)
+    const grain = fbmT(u * 36 + 1.2, v * 36 + 6.8, 2)
+    const hollow = fbmT(u * 12 + 4.0, v * 12 + 9.0, 3)
+    let h = patch * 0.44 + clump * 0.4 + grain * 0.16
+    if (hollow < 0.35) h -= (0.35 - hollow) * 0.9
+    return h
   })
-  return heightFieldToNormalMap(height, size, size * 0.028)
+  return heightFieldToNormalMap(height, size, size * 0.032)
 }
 
-/** Soft turf relief: tuft mounds plus faint vertical blade striations. */
+/** Turf relief: tuft mounds plus anisotropic blade striations. */
 export function createGrassNormalMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
   const height = buildHeightField(size, (u, v) => {
-    const tuft = fbmT(u * 9 + 1.5, v * 9 + 7.3, 3)
-    const macro = fbmT(u * 4 + 4.2, v * 4 + 12.8, 2)
-    // Faint near-vertical striations read as blade direction under raking light.
+    const tuft = fbmT(u * 11 + 1.5, v * 11 + 7.3, 4)
+    const macro = fbmT(u * 4.5 + 4.2, v * 4.5 + 12.8, 3)
+    // Near-vertical striations read as blade direction under raking light.
     const blade =
-      valueNoise2T(u * 26 + v * 3, v * 60 - u * 2) * 0.5 +
-      valueNoise2T(u * 30 - v * 2, v * 72 + u * 4) * 0.5
-    return macro * 0.34 + tuft * 0.46 + blade * 0.2
+      valueNoise2T(u * 34 + v * 4, v * 78 - u * 3) * 0.45 +
+      valueNoise2T(u * 42 - v * 3, v * 96 + u * 5) * 0.35 +
+      valueNoise2T(u * 22 + v * 2, v * 52 - u * 1) * 0.2
+    return macro * 0.28 + tuft * 0.48 + blade * 0.24
   })
-  return heightFieldToNormalMap(height, size, size * 0.016)
+  return heightFieldToNormalMap(height, size, size * 0.022)
 }
 
 /** Grayscale roughness map (G channel) tiled to match the albedo noise. */
@@ -254,16 +230,18 @@ function roughnessMapFromFill(
 export function createDirtRoughnessMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
   return roughnessMapFromFill(size, (u, v) => {
     const patch = fbmT(u * 5.5, v * 5.5, 4)
-    const grain = fbmT(u * 36 + 2.5, v * 36 + 9.1, 2)
-    return 0.74 + patch * 0.2 + (grain - 0.5) * 0.12
+    const grain = fbmT(u * 40 + 2.5, v * 40 + 9.1, 2)
+    const damp = fbmT(u * 8 + 6.1, v * 8 + 2.4, 3)
+    return 0.7 + patch * 0.18 + (grain - 0.5) * 0.1 - (damp - 0.5) * 0.08
   })
 }
 
-/** Subtle sheen variation between turf clumps. */
+/** Subtle sheen variation between turf clumps and blade streaks. */
 export function createGrassRoughnessMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
   return roughnessMapFromFill(size, (u, v) => {
-    const tuft = fbmT(u * 10 + 1.5, v * 10 + 7.3, 3)
-    return 0.62 + tuft * 0.26
+    const tuft = fbmT(u * 11 + 1.5, v * 11 + 7.3, 3)
+    const blade = valueNoise2T(u * 36 + v * 3, v * 80 - u * 2)
+    return 0.58 + tuft * 0.28 + (blade - 0.5) * 0.08
   })
 }
 
@@ -272,58 +250,86 @@ export function invalidateGrassAlbedoCache() {
   grassAlbedoCache = null
 }
 
-/** Procedural tiled dirt — layered soil tones, clumps, and mineral flecks. */
+/** Procedural tiled dirt — layered soil, clods, mineral flecks, and soft cracks. */
 export function createDirtAlbedoMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
   const image = new ImageData(size, size)
   const data = image.data
 
   const darkLoam = rgb(DIRT_DARK)
   const midBrown = rgb(DIRT_MID)
-  const warmClay: [number, number, number] = [138, 82, 52]
-  const drySand: [number, number, number] = [168, 132, 88]
-  const pebble: [number, number, number] = [108, 102, 94]
+  const warmClay: [number, number, number] = [138, 82, 50]
+  const richUmber: [number, number, number] = [92, 58, 36]
+  const drySand: [number, number, number] = [158, 124, 86]
+  const pebble: [number, number, number] = [108, 100, 90]
+  const mossFleck: [number, number, number] = [62, 88, 42]
+  const rootStreak: [number, number, number] = [58, 42, 28]
 
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
       const u = x / size
       const v = y / size
 
-      const patch = fbm(u * 5.5 + 17.3, v * 5.5 + 9.1, 4, 2.1, 0.52)
-      const clump = fbm(u * 14 + 3.7, v * 14 + 11.2, 3, 2.0, 0.48)
-      const grain = fbm(u * 38 + 1.2, v * 38 + 6.8, 2, 2.3, 0.42)
-      const streak = valueNoise2(u * 24 + v * 6, v * 18 - u * 4)
+      // Tileable layers so repeats don't seam.
+      const patch = fbmT(u * 5.5 + 17.3, v * 5.5 + 9.1, 4, 2.1, 0.52)
+      const clump = fbmT(u * 14 + 3.7, v * 14 + 11.2, 4, 2.0, 0.5)
+      const grain = fbmT(u * 36 + 1.2, v * 36 + 6.8, 2, 2.2, 0.45)
+      const clayVein = fbmT(u * 8 + 8.4, v * 8 + 2.1, 3, 2.05, 0.5)
+      const streak = valueNoise2T(u * 22 + v * 5, v * 18 - u * 4)
+      // Soft damp hollows instead of a hard crack lattice.
+      const hollow = fbmT(u * 12 + 4.0, v * 12 + 9.0, 3)
 
       let rgb: [number, number, number]
       if (patch < 0.38) {
-        rgb = mix3(darkLoam, midBrown, patch / 0.38)
+        rgb = mix3(darkLoam, richUmber, patch / 0.38)
       } else if (patch < 0.62) {
-        rgb = mix3(midBrown, warmClay, (patch - 0.38) / 0.24)
+        rgb = mix3(richUmber, midBrown, (patch - 0.38) / 0.24)
+      } else if (patch < 0.82) {
+        rgb = mix3(midBrown, warmClay, (patch - 0.62) / 0.2)
       } else {
-        rgb = mix3(warmClay, drySand, (patch - 0.62) / 0.38)
+        // Keep dry sand rare so soil stays rich rather than chalky.
+        rgb = mix3(warmClay, drySand, ((patch - 0.82) / 0.18) * 0.55)
       }
 
-      const clumpShade = (clump - 0.5) * 28
-      const grainShade = (grain - 0.5) * 14
-      const streakShade = (streak - 0.5) * 10
+      // Clay veins — warmer orange-brown ribbons through the loam.
+      const clayAmt = smoothstep(0.6, 0.8, clayVein) * 0.32
+      rgb = mix3(rgb, warmClay, clayAmt)
+
+      // Soft clod shading — mid-frequency structure, not salt-and-pepper.
+      const clumpShade = (clump - 0.5) * 30
+      const grainShade = (grain - 0.5) * 10
+      const streakShade = (streak - 0.5) * 8
       rgb = [
         rgb[0] + clumpShade + grainShade + streakShade,
-        rgb[1] + clumpShade * 0.92 + grainShade * 0.88 + streakShade * 0.9,
-        rgb[2] + clumpShade * 0.78 + grainShade * 0.72 + streakShade * 0.7,
+        rgb[1] + clumpShade * 0.88 + grainShade * 0.82 + streakShade * 0.85,
+        rgb[2] + clumpShade * 0.68 + grainShade * 0.62 + streakShade * 0.6,
       ]
 
+      // Damp hollows — deepen loam pockets without a cellular crack grid.
+      if (hollow < 0.32) {
+        rgb = mix3(rgb, rootStreak, (0.32 - hollow) * 0.7)
+      }
+
+      // Sparse rootlet streaks.
+      if (streak > 0.86 && clump < 0.38) {
+        rgb = mix3(rgb, rootStreak, (streak - 0.86) * 1.2)
+      }
+
       const h = hash2(x, y)
-      if ((h & 255) < 9) {
-        rgb = mix3(rgb, pebble, 0.55 + (h & 15) / 31)
-      } else if ((h & 255) < 22) {
-        rgb = mix3(rgb, darkLoam, 0.35 + (h & 7) / 14)
-      } else if ((h & 255) > 248) {
-        rgb = mix3(rgb, drySand, 0.25)
+      const fleck = h & 255
+      if (fleck < 6) {
+        rgb = mix3(rgb, pebble, 0.4 + (h & 15) / 40)
+      } else if (fleck < 22) {
+        rgb = mix3(rgb, darkLoam, 0.28 + (h & 7) / 18)
+      } else if (fleck > 251) {
+        rgb = mix3(rgb, drySand, 0.2)
+      } else if (fleck > 244) {
+        rgb = mix3(rgb, mossFleck, 0.2)
       }
 
       const i = (y * size + x) * 4
-      data[i] = clampByte(Math.max(52, rgb[0]))
-      data[i + 1] = clampByte(Math.max(40, rgb[1]))
-      data[i + 2] = clampByte(Math.max(28, rgb[2]))
+      data[i] = clampByte(Math.max(48, rgb[0]))
+      data[i + 1] = clampByte(Math.max(36, rgb[1]))
+      data[i + 2] = clampByte(Math.max(24, rgb[2]))
       data[i + 3] = 255
     }
   }
@@ -336,7 +342,7 @@ export const GRASS_MID = 0x58a042
 
 let grassAlbedoCache: THREE.CanvasTexture | null = null
 
-/** Procedural grass — tileable, smooth turf; precomputed layers, no soil peek. */
+/** Procedural grass — tileable turf with blade streaks, hue shifts, and micro flecks. */
 export function createGrassAlbedoMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
   if (grassAlbedoCache && size === DEFAULT_SIZE) return grassAlbedoCache
 
@@ -344,18 +350,21 @@ export function createGrassAlbedoMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
   const macro = new Float32Array(n)
   const tuft = new Float32Array(n)
   const blade = new Float32Array(n)
+  const hue = new Float32Array(n)
 
-  fillNoiseLayer(macro, size, 4, 3, 4.2, 12.8)
-  fillNoiseLayer(tuft, size, 10, 2, 1.5, 7.3)
+  fillNoiseLayer(macro, size, 4.5, 4, 4.2, 12.8)
+  fillNoiseLayer(tuft, size, 10, 3, 1.5, 7.3)
+  fillNoiseLayer(hue, size, 3.2, 3, 15.6, 2.4)
 
   for (let y = 0; y < size; y++) {
     const v = y / size
     for (let x = 0; x < size; x++) {
       const u = x / size
+      // Strong anisotropic streaks — denser vertical frequency reads as blades.
       const streak =
-        (valueNoise2T(u * 32 + v * 4, v * 32 - u * 2) +
-          valueNoise2T(u * 28 - v * 3, v * 30 + u * 5)) *
-        0.5
+        valueNoise2T(u * 42 + v * 6, v * 96 - u * 4) * 0.45 +
+        valueNoise2T(u * 56 - v * 5, v * 120 + u * 7) * 0.35 +
+        valueNoise2T(u * 28 + v * 3, v * 64 - u * 2) * 0.2
       blade[y * size + x] = streak
     }
   }
@@ -363,35 +372,69 @@ export function createGrassAlbedoMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
   const image = new ImageData(size, size)
   const data = image.data
 
-  const shadowGreen: [number, number, number] = [62, 118, 50]
-  const turfGreen: [number, number, number] = [82, 148, 62]
-  const brightGreen: [number, number, number] = [96, 162, 68]
-  const sunTip: [number, number, number] = [108, 172, 72]
+  // Keep turf bright enough that PBR + fog never reads as black grass.
+  const deepShade: [number, number, number] = [40, 88, 36]
+  const coolShadow: [number, number, number] = [46, 104, 56]
+  const shadowGreen: [number, number, number] = [54, 118, 46]
+  const turfGreen: [number, number, number] = [70, 146, 52]
+  const brightGreen: [number, number, number] = [92, 166, 60]
+  const sunTip: [number, number, number] = [114, 182, 70]
+  const warmMeadow: [number, number, number] = [104, 154, 50]
+  const dryBlade: [number, number, number] = [136, 142, 56]
 
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
       const idx = y * size + x
-      const patch = macro[idx] * 0.82 + tuft[idx] * 0.18
-      const t = smoothstep(0.22, 0.78, patch)
+      const patch = macro[idx] * 0.58 + tuft[idx] * 0.42
+      const t = smoothstep(0.14, 0.86, patch)
 
       let rgb = mix3(
-        mix3(shadowGreen, turfGreen, smoothstep(0, 0.55, t)),
-        mix3(brightGreen, sunTip, smoothstep(0.45, 1, t)),
-        smoothstep(0.35, 0.88, t),
+        mix3(deepShade, shadowGreen, smoothstep(0, 0.42, t)),
+        mix3(turfGreen, brightGreen, smoothstep(0.32, 0.88, t)),
+        smoothstep(0.24, 0.76, t),
       )
 
-      const tuftShade = (tuft[idx] - 0.5) * 14
-      const bladeShade = (blade[idx] - 0.5) * 12
+      // Cool blue-green pockets vs warm meadow patches.
+      const hueShift = hue[idx] - 0.5
+      if (hueShift < -0.08) {
+        rgb = mix3(rgb, coolShadow, (-hueShift - 0.08) * 1.5)
+      } else if (hueShift > 0.1) {
+        rgb = mix3(rgb, warmMeadow, (hueShift - 0.1) * 1.3)
+      }
+
+      // Sparse sun tips — keep highlights rare so turf stays saturated.
+      if (t > 0.78) {
+        rgb = mix3(rgb, sunTip, smoothstep(0.78, 1, t) * 0.55)
+      }
+
+      // Blade streaks dominate mid-frequency detail (directional, not speckly).
+      const tuftShade = (tuft[idx] - 0.5) * 16
+      const bladeShade = (blade[idx] - 0.5) * 28
       rgb = [
-        rgb[0] + tuftShade * 0.5 + bladeShade * 0.35,
-        rgb[1] + tuftShade + bladeShade * 0.75,
-        rgb[2] + tuftShade * 0.7 + bladeShade * 0.5,
+        rgb[0] + tuftShade * 0.35 + bladeShade * 0.32,
+        rgb[1] + tuftShade * 1.05 + bladeShade * 1.05,
+        rgb[2] + tuftShade * 0.45 + bladeShade * 0.4,
       ]
 
+      // Bright blade ridges / dark interstices.
+      if (blade[idx] > 0.62 && t > 0.4) {
+        rgb = mix3(rgb, sunTip, (blade[idx] - 0.62) * 0.7)
+      } else if (blade[idx] < 0.36) {
+        rgb = mix3(rgb, deepShade, (0.36 - blade[idx]) * 0.55)
+      }
+
+      const h = hash2(x + 17, y + 31)
+      const fleck = h & 255
+      if (fleck < 5) {
+        rgb = mix3(rgb, dryBlade, 0.24 + (h & 7) / 28)
+      } else if (fleck > 251) {
+        rgb = mix3(rgb, deepShade, 0.24)
+      }
+
       const i = idx * 4
-      data[i] = clampByte(rgb[0])
-      data[i + 1] = clampByte(rgb[1])
-      data[i + 2] = clampByte(rgb[2])
+      data[i] = clampByte(Math.max(38, rgb[0]))
+      data[i + 1] = clampByte(Math.max(70, rgb[1]))
+      data[i + 2] = clampByte(Math.max(32, rgb[2]))
       data[i + 3] = 255
     }
   }

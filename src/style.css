@@ -129,7 +129,7 @@ body.inventory-open #inventory-hud {
     0 28px 80px rgba(0, 0, 0, 0.6),
     inset 0 1px 0 rgba(255, 255, 255, 0.06);
   padding: 16px 18px 18px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .inventory-panel-header {
@@ -191,6 +191,10 @@ body.inventory-open #inventory-hud {
   min-height: 0;
   padding-left: 18px;
   border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.inventory-craft-column[hidden] {
+  display: none !important;
 }
 
 .inventory-section {
@@ -417,6 +421,42 @@ body.inventory-open #crosshair {
   background: rgba(24, 30, 42, 0.98);
 }
 
+.inventory-slot:has(.inventory-tooltip) {
+  overflow: visible;
+  z-index: 1;
+}
+
+.inventory-slot:has(.inventory-tooltip):hover {
+  z-index: 50;
+}
+
+.inventory-tooltip {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+  z-index: 50;
+  min-width: max-content;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(12, 14, 20, 0.96);
+  color: rgba(235, 238, 245, 0.95);
+  font-size: 11px;
+  line-height: 1.35;
+  text-align: left;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.08s ease;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+}
+
+.inventory-slot:hover .inventory-tooltip {
+  opacity: 1;
+  visibility: visible;
+}
+
 .inventory-slot.selected {
   border-color: rgba(255, 240, 180, 0.85);
   box-shadow:
@@ -489,6 +529,33 @@ body.inventory-open #crosshair {
 .inventory-icon--shovel svg,
 .inventory-icon--pickaxe svg,
 .inventory-icon--spear svg,
+.inventory-icon--iron_sword svg,
+.inventory-icon--iron_axe svg,
+.inventory-icon--iron_shovel svg,
+.inventory-icon--iron_pickaxe svg,
+.inventory-icon--iron_spear svg,
+.inventory-icon--gold_sword svg,
+.inventory-icon--gold_axe svg,
+.inventory-icon--gold_shovel svg,
+.inventory-icon--gold_pickaxe svg,
+.inventory-icon--gold_spear svg,
+.inventory-icon--diamond_sword svg,
+.inventory-icon--diamond_axe svg,
+.inventory-icon--diamond_shovel svg,
+.inventory-icon--diamond_pickaxe svg,
+.inventory-icon--diamond_spear svg,
+.inventory-icon--scissors svg,
+.inventory-icon--leaves svg,
+.inventory-icon--rope svg,
+.inventory-icon--bow svg,
+.inventory-icon--arrow svg,
+.inventory-icon--iron_arrow svg,
+.inventory-icon--gold_arrow svg,
+.inventory-icon--diamond_arrow svg,
+.inventory-icon--healing_gold_arrow svg,
+.inventory-icon--glowing_healing_gold_arrow svg,
+.inventory-icon--sapling svg,
+.inventory-icon--glowberry_sapling svg,
 .inventory-icon--torch svg {
   width: 100%;
   height: 100%;
@@ -544,6 +611,40 @@ body.inventory-open #crosshair {
 }
 
 #perf-hud .perf-sub {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+#enemy-count-hud {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 12;
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  background: rgba(12, 16, 24, 0.72);
+  backdrop-filter: blur(8px);
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.8);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+#enemy-count-hud[hidden] {
+  display: none;
+}
+
+#enemy-count-value {
+  font-size: 15px;
+  font-weight: 700;
+  color: #e08a7a;
+}
+
+#enemy-count-hud .enemy-count-label {
   color: rgba(255, 255, 255, 0.5);
 }
 
@@ -604,6 +705,28 @@ body.playing #crosshair {
   opacity: 1;
 }
 
+#loading-overlay {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 22;
+  margin: 40px 0 0 0;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+#loading-overlay[hidden] {
+  display: none;
+}
+
+.loading-label {
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.78);
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.55);
+  white-space: nowrap;
+}
+
 #dig-progress {
   position: absolute;
   left: 50%;
@@ -633,9 +756,35 @@ body.playing #crosshair {
   -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
 }
 
-body.playing.digging #dig-progress {
+body.world-loading #dig-progress,
+body.playing.digging #dig-progress,
+body.playing.reloading #dig-progress {
   opacity: 1;
   transform: scale(1);
+}
+
+/* Same ring as dig/spear; indeterminate sweep while the world loads. */
+body.world-loading #dig-progress {
+  z-index: 21;
+  margin: -22px 0 0 -22px;
+}
+
+body.world-loading #dig-progress-fill {
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    transparent 40deg,
+    #e8c878 100deg,
+    #f0d89a 160deg,
+    transparent 200deg
+  );
+  animation: loading-spin 0.85s linear infinite;
+}
+
+@keyframes loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 #controls {
@@ -660,9 +809,13 @@ body.playing.digging #dig-progress {
 }
 
 .jump-tune-row {
-  display: flex;
+  display: none;
   align-items: center;
   gap: 10px;
+}
+
+.jump-tune-row:has(#graphics-slider) {
+  display: flex;
 }
 
 .jump-tune-row label {

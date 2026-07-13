@@ -1,9 +1,7 @@
 import * as THREE from 'three'
 import {
   createDirtAlbedoMap,
-  createDirtRoughnessMap,
   createGrassAlbedoMap,
-  createGrassRoughnessMap,
   DIRT_DARK,
   DIRT_MID,
   DIRT_TEXTURE_REPEAT,
@@ -14,16 +12,22 @@ import { setRockTexturesEnabled } from './rockTexture'
 
 /** Slider tier boundary for the "Potato" label (matches `qualityLabel`). */
 export const POTATO_MAX_T = 0.18
+/** Slider tier boundary for the "Low" label (matches `qualityLabel`). */
+export const LOW_MAX_T = 0.42
 /** Below this, terrain uses flat brown / green (no texture sampling). */
 const TEXTURED_MIN_T = 0.4
 /** Below this, shadows are fully disabled (cheapest tier). */
 const SHADOWS_MIN_T = 0.3
 /** Below this, the atmospheric Sky shader is swapped for a flat horizon color. */
 const SKY_MIN_T = 0.3
-/** Below this, the two fill directional lights are disabled. */
-const FILL_LIGHTS_MIN_T = 0.25
-/** At/above this ("High" tier and up), terrain gets normal + roughness maps. */
-const TERRAIN_DETAIL_MIN_T = 0.68
+/**
+ * Below this (Potato/Low), fill directionals + berry/torch/enemy PointLights are
+ * off — sun/hemi/ambient only. Medium+ pays for the point-light PBR cost and
+ * darkens sheltered digs so torches matter underground.
+ */
+const FILL_LIGHTS_MIN_T = LOW_MAX_T
+/** Medium+ — berry canopy, torch, and enemy PointLights. */
+const POINT_GLOWS_MIN_T = LOW_MAX_T
 /** At/above this ("High" tier and up), scattered grass-blade tufts are drawn. */
 const GRASS_BLADES_MIN_T = 0.68
 
@@ -39,16 +43,22 @@ export function fogTFromSlider(sliderValue: number) {
 
 export function fogDensityFromSlider(sliderValue: number) {
   const t = fogTFromSlider(sliderValue)
-  return lerp(0.055, 0.008, t)
+  // Slightly clearer than before — Exp2 fog + dark tint was crushing mid-ground.
+  return lerp(0.042, 0.0065, t)
 }
 
 export function isPotatoGraphics(t: number) {
   return t < POTATO_MAX_T
 }
 
+/** Berry / torch / enemy PointLights — Medium and above only. */
+export function pointGlowsEnabledFromT(t: number) {
+  return t >= POINT_GLOWS_MIN_T
+}
+
 export function qualityLabel(t: number): string {
   if (t < POTATO_MAX_T) return 'Potato'
-  if (t < 0.42) return 'Low'
+  if (t < LOW_MAX_T) return 'Low'
   if (t < 0.68) return 'Medium'
   if (t < 0.9) return 'High'
   return 'Ultra'
@@ -83,65 +93,22 @@ export type GraphicsQualityContext = {
 }
 
 const BASE = {
-  emissive: 0.42,
+  emissive: 0.4,
 }
 
 let lastTextureSize = 128
 let texturesEnabled = true
 let lastShadowSize = 0
 
-// ---- High-quality terrain roughness maps (triplanar-sampled) ---------------
-// Note: normal maps are intentionally NOT used on terrain — per-vertex planar UVs
-// stretch on diagonal surface-cap faces, and triplanar tangents are unavailable.
-let detailEnabled = false
-let detailSize = 0
-let dirtRoughMap: THREE.CanvasTexture | null = null
-let grassRoughMap: THREE.CanvasTexture | null = null
-
-function disposeDetailMaps() {
-  dirtRoughMap?.dispose()
-  grassRoughMap?.dispose()
-  dirtRoughMap = grassRoughMap = null
-  detailSize = 0
-}
-
-function ensureDetailMaps(size: number) {
-  if (detailSize === size && dirtRoughMap) return
-  disposeDetailMaps()
-  detailSize = size
-  dirtRoughMap = createDirtRoughnessMap(size)
-  grassRoughMap = createGrassRoughnessMap(size)
-  for (const m of [dirtRoughMap, grassRoughMap]) {
-    m.repeat.set(DIRT_TEXTURE_REPEAT, DIRT_TEXTURE_REPEAT)
+function clearTerrainRoughness(ctx: GraphicsQualityContext) {
+  if (ctx.dirtMaterial.roughnessMap === null && ctx.grassMaterial.roughnessMap === null) {
+    return
   }
-}
-
-function applyTerrainDetail(
-  ctx: GraphicsQualityContext,
-  renderer: THREE.WebGLRenderer,
-  t: number,
-  size: number,
-  useMipmaps: boolean,
-) {
-  ensureDetailMaps(size)
-  ctx.dirtMaterial.roughnessMap = dirtRoughMap
-  ctx.grassMaterial.roughnessMap = grassRoughMap
-  if (dirtRoughMap) configureTexture(dirtRoughMap, renderer, t, useMipmaps)
-  if (grassRoughMap) configureTexture(grassRoughMap, renderer, t, useMipmaps)
-  if (!detailEnabled) {
-    detailEnabled = true
-    ctx.dirtMaterial.needsUpdate = true
-    ctx.grassMaterial.needsUpdate = true
-  }
-}
-
-function clearTerrainDetail(ctx: GraphicsQualityContext) {
-  if (!detailEnabled && ctx.dirtMaterial.roughnessMap === null) return
+  // Roughness maps accent cell-border lighting creases on outer surface caps.
   ctx.dirtMaterial.roughnessMap = null
   ctx.grassMaterial.roughnessMap = null
   ctx.dirtMaterial.needsUpdate = true
   ctx.grassMaterial.needsUpdate = true
-  detailEnabled = false
 }
 
 /** Fill-light multiplier from the graphics slider (day/night cycle scales on top in main). */
@@ -216,13 +183,16 @@ export type AdaptiveResolutionPolicy = {
 
 /** Potato/Low already cap pixel ratio — do not stack adaptive downscaling on top. */
 export function adaptiveResolutionPolicy(t: number): AdaptiveResolutionPolicy {
-  if (t < 0.42) {
+  if (t < LOW_MAX_T) {
     return { enabled: false, floor: 1, frameMsHigh: Infinity, frameMsLow: Infinity }
   }
+  // Wide hysteresis + higher "drop" threshold: the old 17/14 band sat right on a
+  // 60 Hz frame budget and thrash-resized the canvas every half-second — HUD still
+  // averaged ~60 while motion felt like ~10 fps from the hitch cadence.
   if (t < 0.68) {
-    return { enabled: true, floor: 0.72, frameMsHigh: 22, frameMsLow: 18 }
+    return { enabled: true, floor: 0.72, frameMsHigh: 28, frameMsLow: 15 }
   }
-  return { enabled: true, floor: 0.5, frameMsHigh: 17, frameMsLow: 14 }
+  return { enabled: true, floor: 0.55, frameMsHigh: 26, frameMsLow: 14 }
 }
 
 export type GraphicsQualityResult = {
@@ -242,6 +212,11 @@ export type GraphicsQualityResult = {
   /** Camera far plane; coupled to render distance for depth precision. */
   cameraFar: number
   shadowsEnabled: boolean
+  /**
+   * Berry / torch / enemy PointLights. Off on Potato/Low so MeshStandardMaterial
+   * does not evaluate a large fixed light pool every fragment.
+   */
+  pointGlowsEnabled: boolean
   /** Whether scattered grass-blade tufts should be drawn (high tiers only). */
   grassBladesEnabled: boolean
   /** Tuft density (blades per m²) when enabled; 0 otherwise. */
@@ -275,7 +250,8 @@ export function applyGraphicsQuality(
   sun.castShadow = shadowsEnabled
 
   if (shadowsEnabled) {
-    const shadowSize = pow2Size(t, 1024, 4096)
+    // Cap at 2048 — 4096 shadow maps dominate GPU time on Ultra with little visual gain.
+    const shadowSize = pow2Size(t, 1024, 2048)
     if (shadowSize !== lastShadowSize) {
       lastShadowSize = shadowSize
       sun.shadow.mapSize.set(shadowSize, shadowSize)
@@ -287,10 +263,12 @@ export function applyGraphicsQuality(
   }
 
   // ---- Lighting ------------------------------------------------------------
-  graphicsLightScale = lerp(0.72, 1, t)
-  const fillLightsEnabled = t > FILL_LIGHTS_MIN_T
+  // Floor light scale higher so Low/Medium never look pitch-black outdoors.
+  graphicsLightScale = lerp(0.88, 1, t)
+  const fillLightsEnabled = t >= FILL_LIGHTS_MIN_T
   ctx.fill.visible = fillLightsEnabled
   ctx.fill2.visible = fillLightsEnabled
+  const pointGlowsEnabled = pointGlowsEnabledFromT(t)
 
   const treeShadows = shadowsEnabled
   setShadowRoots(ctx.shadowRoots, treeShadows, treeShadows)
@@ -308,7 +286,9 @@ export function applyGraphicsQuality(
   scene.background = skyEnabled ? null : ctx.horizonColor
 
   // ---- Terrain material detail ---------------------------------------------
-  const emissive = lerp(0.58, BASE.emissive, t)
+  const emissive = lerp(0.52, BASE.emissive, t)
+  ctx.dirtMaterial.userData.terrainEmissiveBase = emissive
+  ctx.grassMaterial.userData.terrainEmissiveBase = emissive
   ctx.dirtMaterial.emissiveIntensity = emissive
   ctx.grassMaterial.emissiveIntensity = emissive
 
@@ -322,8 +302,9 @@ export function applyGraphicsQuality(
     0,
     1,
   )
-  const grassBladeDensity = grassBladesEnabled ? lerp(1.4, 3.2, grassDetailT) : 0
-  const grassBladeCullRadius = grassBladesEnabled ? lerp(16, 34, grassDetailT) : 0
+  // Slightly leaner Ultra grass — density was a major fragment cost for little read.
+  const grassBladeDensity = grassBladesEnabled ? lerp(1.4, 2.6, grassDetailT) : 0
+  const grassBladeCullRadius = grassBladesEnabled ? lerp(16, 28, grassDetailT) : 0
 
   const wantTextures = t >= TEXTURED_MIN_T
   let dirtMap = ctx.dirtMap
@@ -334,7 +315,7 @@ export function applyGraphicsQuality(
       texturesEnabled = false
       applyFlatTerrainMaterials(ctx)
     }
-    clearTerrainDetail(ctx)
+    clearTerrainRoughness(ctx)
     return {
       potatoMode: potato,
       dirtMap,
@@ -346,6 +327,7 @@ export function applyGraphicsQuality(
       voxelRadius,
       cameraFar,
       shadowsEnabled,
+      pointGlowsEnabled,
       grassBladesEnabled,
       grassBladeDensity,
       grassBladeCullRadius,
@@ -370,12 +352,7 @@ export function applyGraphicsQuality(
   configureTexture(dirtMap, renderer, t, useMipmaps)
   configureTexture(grassMap, renderer, t, useMipmaps)
   applyTexturedTerrainMaterials(ctx, dirtMap, grassMap)
-
-  if (t >= TERRAIN_DETAIL_MIN_T) {
-    applyTerrainDetail(ctx, renderer, t, textureSize, useMipmaps)
-  } else {
-    clearTerrainDetail(ctx)
-  }
+  clearTerrainRoughness(ctx)
 
   return {
     potatoMode: potato,
@@ -388,6 +365,7 @@ export function applyGraphicsQuality(
     voxelRadius,
     cameraFar,
     shadowsEnabled,
+    pointGlowsEnabled,
     grassBladesEnabled,
     grassBladeDensity,
     grassBladeCullRadius,

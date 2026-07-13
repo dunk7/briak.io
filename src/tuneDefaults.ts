@@ -25,28 +25,28 @@ export type TuneState = {
 
 /** Canonical tuning defaults — keep `index.html` slider `value`s in sync. */
 export const TUNE_DEFAULTS: TuneState = {
-  gravity: 7,
-  jumpVelocity: 4,
-  jetpackHold: 0.85,
-  moveSpeed: 7.5,
+  gravity: 17,
+  jumpVelocity: 2.3,
+  jetpackHold: 0.5,
+  moveSpeed: 3.5,
   cameraHeight: 0.75,
-  lookSpeed: 1,
-  digSpeed: 0.5,
-  debrisDivisions: 4,
-  graphics: 50,
-  fog: 50,
-  grassGreenSlope: 20,
-  grassTuftCluster: 72,
-  treeFlatness: 1.25,
-  treeRadius: 4,
-  treeCount: 14,
-  rockClumpCount: 14,
-  rocksPerClump: 4,
-  rockClumpRadius: 2.5,
-  rockClumpSpacing: 3,
-  enemySpawnRate: 58,
+  lookSpeed: 3.75,
+  digSpeed: 0.45,
+  debrisDivisions: 2,
+  graphics: 45,
+  fog: 82,
+  grassGreenSlope: 97,
+  grassTuftCluster: 82,
+  treeFlatness: 3.05,
+  treeRadius: 2.5,
+  treeCount: 48,
+  rockClumpCount: 40,
+  rocksPerClump: 9,
+  rockClumpRadius: 7,
+  rockClumpSpacing: 2,
+  enemySpawnRate: 78,
   enemySpeed: 58,
-  enemyLightHeight: 50,
+  enemyLightHeight: 33,
 }
 
 export const DEFAULT_GRAVITY = TUNE_DEFAULTS.gravity
@@ -58,7 +58,7 @@ export const DEFAULT_RUN_SPEED = DEFAULT_WALK_SPEED * SPRINT_SPEED_RATIO
 export const DEFAULT_EYE_HEIGHT = TUNE_DEFAULTS.cameraHeight
 export const DEFAULT_LOOK_SPEED = TUNE_DEFAULTS.lookSpeed
 /** Peak exposure during the day phase of the automatic cycle. */
-export const DEFAULT_BRIGHTNESS = 1.75
+export const DEFAULT_BRIGHTNESS = 1.55
 export const DEFAULT_GRAPHICS = TUNE_DEFAULTS.graphics
 export const DEFAULT_DIG_SPEED = TUNE_DEFAULTS.digSpeed
 export const DEFAULT_GRASS_GREEN_SLOPE_SLIDER = TUNE_DEFAULTS.grassGreenSlope
@@ -135,6 +135,10 @@ function migrateSavedTune(raw: Record<string, unknown>): Partial<TuneState> {
   }
   if (out.grassTuftCluster === undefined && raw.grassClump !== undefined) {
     out.grassTuftCluster = raw.grassClump as number
+  }
+  // Bump default look speed down; keep custom values the user actually changed.
+  if (out.lookSpeed === 5.25) {
+    out.lookSpeed = TUNE_DEFAULTS.lookSpeed
   }
   return out
 }

@@ -2,16 +2,25 @@ import * as THREE from 'three'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { sampleMeshGroundY, type MeshGroundTargets } from './terrainGroundRay'
 
-const TRUNK_EMISSIVE = 0x140b06
-const FOLIAGE_EMISSIVE = 0x081406
+const TRUNK_EMISSIVE = 0x1c1208
+const FOLIAGE_EMISSIVE = 0x102010
 
 /** Bark tones — the lower trunk blob reads darker/rooty, the upper one warmer. */
 const TRUNK_PALETTE = [0x4a2f1c, 0x66421f]
 /** Distinct canopy greens so the morphed icospheres layer with depth. */
 const FOLIAGE_PALETTE = [0x4d9234, 0x5da642, 0x6cb84e]
 
-/** World scale applied when placing trees (authored GLB is 1 unit = 1 world unit). */
-const TREE_SCALE = 0.55
+/** World scale applied when placing mature trees (authored GLB is 1 unit = 1 world unit). */
+export const TREE_SCALE = 0.55
+
+/** Growth fractions for planted saplings (stage 0→3). */
+export const TREE_GROWTH_FRACTIONS = [0.25, 0.5, 0.75, 1.0] as const
+export type TreeGrowthStage = 0 | 1 | 2 | 3
+
+export function treeWorldScale(stage: TreeGrowthStage | number): number {
+  const fraction = TREE_GROWTH_FRACTIONS[Math.min(3, Math.max(0, Math.floor(stage)))] ?? 1
+  return TREE_SCALE * fraction
+}
 
 const _box = new THREE.Box3()
 const _rayHits: THREE.Intersection[] = []
@@ -54,10 +63,10 @@ function createTreeMaterial(emissive: number) {
     color: 0xffffff,
     vertexColors: true,
     flatShading: true,
-    roughness: 0.92,
+    roughness: 0.88,
     metalness: 0,
     emissive,
-    emissiveIntensity: 0.16,
+    emissiveIntensity: 0.28,
   })
 }
 
@@ -134,7 +143,7 @@ export function applyTreeMaterials(root: THREE.Object3D) {
   for (const { mesh, foliage } of classified) {
     if (foliage) {
       const hex = FOLIAGE_PALETTE[foliageIdx % FOLIAGE_PALETTE.length]!
-      bakeBlobColors(mesh.geometry, hex, 0.42, 0.06)
+      bakeBlobColors(mesh.geometry, hex, 0.28, 0.06)
       mesh.material = foliageMaterial
       foliageIdx++
     } else {
@@ -185,8 +194,29 @@ export async function loadTreeModel(url: string): Promise<THREE.Group> {
   return wrapper
 }
 
-const BERRY_EMISSIVE = 0x280840
+const BERRY_EMISSIVE = 0x4a18a0
 const BERRY_PALETTE = [0x8b4fd4, 0xa066e8, 0x7038b8, 0xc090f8]
+/** Daytime crystal sheen (medium+). Night multiplies this up in `updateBerryGlow`. */
+const BERRY_EMISSIVE_DAY = 0.55
+const BERRY_EMISSIVE_NIGHT = 2.4
+const BERRY_GLOW_COLOR = 0xb060ff
+const BERRY_GLOW_INTENSITY = 4.8
+const BERRY_GLOW_DISTANCE = 11
+/**
+ * Fixed PointLight count. Cloning a light onto each berry tree (or planting one)
+ * changes NUM_POINT_LIGHTS and forces Three.js to recompile every
+ * MeshStandardMaterial — a ~half-second hitch. Same pattern as torches.
+ */
+const MAX_BERRY_GLOW_LIGHTS = 20
+let berryMaterial: THREE.MeshStandardMaterial | null = null
+let berryGlowEnabled = true
+const berryGlowLights: THREE.PointLight[] = []
+type BerryGlowSlot = {
+  light: THREE.PointLight
+  tree: THREE.Object3D | null
+}
+const berryGlowPool: BerryGlowSlot[] = []
+const _berryWorld = new THREE.Vector3()
 
 function applyBerryMaterials(root: THREE.Object3D) {
   root.updateWorldMatrix(true, true)
@@ -194,22 +224,191 @@ function applyBerryMaterials(root: THREE.Object3D) {
     color: 0xffffff,
     vertexColors: true,
     flatShading: true,
-    roughness: 0.35,
-    metalness: 0.08,
+    roughness: 0.22,
+    metalness: 0.22,
     emissive: BERRY_EMISSIVE,
-    emissiveIntensity: 0.28,
+    emissiveIntensity: BERRY_EMISSIVE_DAY,
   })
+  berryMaterial = material
 
   let idx = 0
   root.traverse((child) => {
     if (!(child instanceof THREE.Mesh)) return
     const hex = BERRY_PALETTE[idx % BERRY_PALETTE.length]!
-    bakeBlobColors(child.geometry, hex, 0.28, 0.05)
+    bakeBlobColors(child.geometry, hex, 0.22, 0.04)
     child.material = material
     child.castShadow = true
     child.receiveShadow = true
+    child.userData.crystalBerry = true
     idx++
   })
+}
+
+function berryClusterCenter(root: THREE.Object3D, out: THREE.Vector3) {
+  _box.setFromObject(root)
+  return out.copy(_box.min).add(_box.max).multiplyScalar(0.5)
+}
+
+function parkBerryGlowLight(light: THREE.PointLight) {
+  light.intensity = 0
+  light.position.set(0, -9999, 0)
+  // When glows are quality-gated off, keep lights out of the WebGL light list so
+  // NUM_POINT_LIGHTS drops. Toggling visible recompiles once (graphics slider).
+  if (!berryGlowEnabled) light.visible = false
+}
+
+/**
+ * Pre-add a fixed set of berry canopy lights so plant/chop/respawn never
+ * changes NUM_POINT_LIGHTS (avoids material recompile hitch).
+ */
+export function initBerryGlowLightPool(parent: THREE.Object3D) {
+  if (berryGlowPool.length > 0) return
+  for (let i = 0; i < MAX_BERRY_GLOW_LIGHTS; i++) {
+    const light = new THREE.PointLight(
+      BERRY_GLOW_COLOR,
+      0,
+      BERRY_GLOW_DISTANCE,
+      2,
+    )
+    // Stay visible while the Medium+ glow path is active — toggling .visible
+    // mid-session (plant/chop) would recompile every MeshStandardMaterial.
+    light.visible = berryGlowEnabled
+    light.userData.berryGlowLight = true
+    light.userData.baseIntensity = BERRY_GLOW_INTENSITY
+    light.userData.baseDistance = BERRY_GLOW_DISTANCE
+    parkBerryGlowLight(light)
+    parent.add(light)
+    berryGlowPool.push({ light, tree: null })
+    berryGlowLights.push(light)
+  }
+}
+
+function rebuildActiveBerryGlowCache() {
+  berryGlowLights.length = 0
+  for (const slot of berryGlowPool) {
+    if (slot.tree) berryGlowLights.push(slot.light)
+  }
+}
+
+/** Bind a pooled canopy light to a berry tree (no new PointLight created). */
+export function assignBerryGlowLight(tree: THREE.Object3D) {
+  if (!tree.userData.hasCrystalBerries) return
+  for (const slot of berryGlowPool) {
+    if (slot.tree === tree) {
+      syncBerryGlowLightTransform(tree, slot.light)
+      return
+    }
+  }
+  const free = berryGlowPool.find((s) => s.tree === null)
+  if (!free) return
+  free.tree = tree
+  tree.userData.berryGlowSlot = free
+  syncBerryGlowLightTransform(tree, free.light)
+  if (!berryGlowLights.includes(free.light)) berryGlowLights.push(free.light)
+  if (!berryGlowEnabled) {
+    free.light.visible = false
+    free.light.intensity = 0
+  }
+}
+
+export function releaseBerryGlowLight(tree: THREE.Object3D) {
+  const slot = tree.userData.berryGlowSlot as BerryGlowSlot | undefined
+  if (slot) {
+    slot.tree = null
+    parkBerryGlowLight(slot.light)
+    delete tree.userData.berryGlowSlot
+    rebuildActiveBerryGlowCache()
+    return
+  }
+  for (const s of berryGlowPool) {
+    if (s.tree !== tree) continue
+    s.tree = null
+    parkBerryGlowLight(s.light)
+    rebuildActiveBerryGlowCache()
+    return
+  }
+}
+
+function syncBerryGlowLightTransform(tree: THREE.Object3D, light: THREE.PointLight) {
+  tree.updateWorldMatrix(true, true)
+  berryClusterCenter(tree, _berryWorld)
+  light.position.copy(_berryWorld)
+  if (berryGlowEnabled) {
+    light.visible = true
+    light.intensity =
+      (light.userData.baseIntensity as number | undefined) ?? BERRY_GLOW_INTENSITY
+  } else {
+    light.visible = false
+    light.intensity = 0
+  }
+}
+
+/** Re-sync pooled lights after a full tree respawn (releases orphans, assigns fresh). */
+export function refreshBerryGlowLights(treesRoot: THREE.Object3D) {
+  for (const slot of berryGlowPool) {
+    slot.tree = null
+    parkBerryGlowLight(slot.light)
+  }
+  berryGlowLights.length = 0
+  for (const child of treesRoot.children) {
+    if (!child.userData.hasCrystalBerries) continue
+    delete child.userData.berryGlowSlot
+    assignBerryGlowLight(child)
+  }
+}
+
+/**
+ * Enable crystal berry shine + canopy lights on Medium+ graphics.
+ * Materials are shared across clones; lights modulate from the fixed pool.
+ * When disabled, lights are hidden (not just intensity 0) so the GPU light
+ * count drops — expect a one-time material recompile on the graphics slider.
+ */
+export function setBerryGlowEnabled(enabled: boolean, treesRoot?: THREE.Object3D) {
+  berryGlowEnabled = enabled
+  if (treesRoot) refreshBerryGlowLights(treesRoot)
+  if (berryMaterial) {
+    berryMaterial.roughness = enabled ? 0.18 : 0.35
+    berryMaterial.metalness = enabled ? 0.28 : 0.08
+    if (!enabled) berryMaterial.emissiveIntensity = 0.28
+  }
+  for (const slot of berryGlowPool) {
+    if (!slot.tree) {
+      parkBerryGlowLight(slot.light)
+      continue
+    }
+    if (!enabled) {
+      slot.light.visible = false
+      slot.light.intensity = 0
+    } else {
+      slot.light.visible = true
+    }
+  }
+}
+
+/** Night-scaled berry emissive + point lights. `exposureScale` counters tone-mapping dimming. */
+export function updateBerryGlow(
+  _treesRoot: THREE.Object3D,
+  night: number,
+  exposureScale = 1,
+  elapsedSec = 0,
+) {
+  if (!berryGlowEnabled) return
+  const n = THREE.MathUtils.clamp(night, 0, 1)
+  const pulse = 0.92 + 0.08 * Math.sin(elapsedSec * 2.4)
+  if (berryMaterial) {
+    berryMaterial.emissiveIntensity =
+      THREE.MathUtils.lerp(BERRY_EMISSIVE_DAY, BERRY_EMISSIVE_NIGHT, n) * pulse
+  }
+  for (const light of berryGlowLights) {
+    const base =
+      (light.userData.baseIntensity as number | undefined) ?? BERRY_GLOW_INTENSITY
+    const baseDist =
+      (light.userData.baseDistance as number | undefined) ?? BERRY_GLOW_DISTANCE
+    // Day: faint shimmer. Night: real canopy glow that paints nearby ground.
+    const strength = THREE.MathUtils.lerp(0.12, 1, n) * pulse
+    light.intensity = base * strength * exposureScale
+    light.distance = baseDist * THREE.MathUtils.lerp(0.55, 1, n)
+  }
 }
 
 /** Purple berry cluster authored to align with the tree GLB at the same origin. */
@@ -217,10 +416,27 @@ export async function loadTreeBerriesModel(url: string): Promise<THREE.Group> {
   const gltf = await new GLTFLoader().loadAsync(url)
   const model = gltf.scene
   applyBerryMaterials(model)
+  // Lights come from initBerryGlowLightPool — never parent a PointLight on the template.
 
   const wrapper = new THREE.Group()
   wrapper.add(model)
   return wrapper
+}
+
+/** Clone berry meshes onto a tree and optionally bind a pooled glow light. */
+export function attachCrystalBerries(
+  tree: THREE.Group,
+  treeTemplate: THREE.Group,
+  berriesTemplate: THREE.Group,
+  opts?: { assignLight?: boolean },
+) {
+  const berries = berriesTemplate.clone(true)
+  const treeModelY = treeTemplate.children[0]?.position.y ?? 0
+  const berriesModel = berries.children[0]
+  if (berriesModel) berriesModel.position.y = treeModelY
+  tree.add(berries)
+  tree.userData.hasCrystalBerries = true
+  if (opts?.assignLight !== false) assignBerryGlowLight(tree)
 }
 
 function raycastGroundY(x: number, z: number, targets: MeshGroundTargets): number | null {
@@ -417,15 +633,11 @@ export function placeTrees(
     tree.position.set(spot.x, spot.y, spot.z)
     if (spot.rotationY !== undefined) tree.rotation.y = spot.rotationY
     tree.scale.setScalar(TREE_SCALE)
-    if (spot.hasBerries && berriesTemplate) {
-      const berries = berriesTemplate.clone(true)
-      const treeModelY = template.children[0]?.position.y ?? 0
-      const berriesModel = berries.children[0]
-      if (berriesModel) berriesModel.position.y = treeModelY
-      tree.add(berries)
-      tree.userData.hasCrystalBerries = true
-    }
     parent.add(tree)
+    if (spot.hasBerries && berriesTemplate) {
+      // Assign light after parenting so world-space canopy position is correct.
+      attachCrystalBerries(tree, template, berriesTemplate)
+    }
     trees.push(tree)
   }
 

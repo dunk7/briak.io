@@ -41,28 +41,39 @@
               <div class="inventory-grid inventory-grid--hotbar" data-panel-hotbar></div>
             </section>
           </div>
-          <aside class="inventory-craft-column" aria-label="Crafting">
+          <aside class="inventory-craft-column" data-craft-column aria-label="Crafting">
             <h3 class="inventory-section-label">Crafting</h3>
             <div class="craft-scroll">
               <div class="craft-grid" data-craft-grid></div>
             </div>
+          </aside>
+          <aside class="inventory-craft-column" data-chest-column hidden aria-label="Chest">
+            <h3 class="inventory-section-label" data-chest-label>Chest</h3>
+            <div class="inventory-grid inventory-grid--backpack" data-chest-grid></div>
           </aside>
         </div>
       </div>
       <div id="inventory-cursor-float" hidden aria-hidden="true"></div>
     </div>
     <div id="perf-hud" aria-hidden="true">--</div>
+    <div id="enemy-count-hud" aria-label="Enemies on map" hidden>
+      <span id="enemy-count-value">0</span>
+      <span class="enemy-count-label">enemies</span>
+    </div>
     <div id="info">Loading terrain…</div>
     <div id="crosshair" aria-hidden="true"></div>
     <div id="dig-progress" aria-hidden="true">
       <div id="dig-progress-fill"></div>
     </div>
+    <div id="loading-overlay" aria-live="polite" aria-busy="true" hidden>
+      <div class="loading-label">Loading…</div>
+    </div>
     <div id="controls" hidden></div>
     <div id="jump-tune">
       <div class="jump-tune-row">
         <label for="gravity-slider">Gravity</label>
-        <input type="range" id="gravity-slider" min="2" max="40" step="0.5" value="7" />
-        <output id="gravity-value">7.0</output>
+        <input type="range" id="gravity-slider" min="2" max="40" step="0.5" value="17" />
+        <output id="gravity-value">17.0</output>
       </div>
       <div class="jump-tune-row">
         <label for="jump-velocity-slider">Jump velocity</label>
@@ -72,9 +83,9 @@
           min="0"
           max="14"
           step="0.1"
-          value="4"
+          value="2.3"
         />
-        <output id="jump-velocity-value">4.0</output>
+        <output id="jump-velocity-value">2.3</output>
       </div>
       <div class="jump-tune-row">
         <label
@@ -89,9 +100,9 @@
           min="0"
           max="1"
           step="0.05"
-          value="0.85"
+          value="0.5"
         />
-        <output id="jetpack-hold-value">0.85</output>
+        <output id="jetpack-hold-value">0.50</output>
       </div>
       <div class="jump-tune-row">
         <label for="move-speed-slider">Move speed</label>
@@ -101,9 +112,9 @@
           min="2"
           max="20"
           step="0.5"
-          value="7.5"
+          value="3.5"
         />
-        <output id="move-speed-value">7.5</output>
+        <output id="move-speed-value">3.5</output>
       </div>
       <div class="jump-tune-row">
         <label for="camera-height-slider" title="Eye height above your feet">
@@ -129,14 +140,14 @@
           min="0.25"
           max="8"
           step="0.05"
-          value="1"
+          value="3.75"
         />
-        <output id="look-speed-value">1.00</output>
+        <output id="look-speed-value">3.75</output>
       </div>
       <div class="jump-tune-row">
         <label for="dig-speed-slider">Dig speed</label>
-        <input type="range" id="dig-speed-slider" min="0.25" max="2" step="0.05" value="0.5" />
-        <output id="dig-speed-value">0.50×</output>
+        <input type="range" id="dig-speed-slider" min="0.25" max="2" step="0.05" value="0.45" />
+        <output id="dig-speed-value">0.45×</output>
       </div>
       <div class="jump-tune-row">
         <label
@@ -145,20 +156,20 @@
         >
           Debris pieces
         </label>
-        <input type="range" id="debris-divisions-slider" min="1" max="8" step="1" value="4" />
-        <output id="debris-divisions-value">64</output>
+        <input type="range" id="debris-divisions-slider" min="1" max="8" step="1" value="2" />
+        <output id="debris-divisions-value">8</output>
       </div>
       <div class="jump-tune-row">
         <label for="graphics-slider">Graphics</label>
-        <input type="range" id="graphics-slider" min="0" max="100" step="1" value="50" />
+        <input type="range" id="graphics-slider" min="0" max="100" step="1" value="45" />
         <output id="graphics-value">Medium</output>
       </div>
       <div class="jump-tune-row">
         <label for="fog-slider" title="Lower = thicker haze; higher = clearer distance">
           Fog
         </label>
-        <input type="range" id="fog-slider" min="0" max="100" step="1" value="50" />
-        <output id="fog-value">0.032</output>
+        <input type="range" id="fog-slider" min="0" max="100" step="1" value="82" />
+        <output id="fog-value">0.016</output>
       </div>
       <div class="jump-tune-row">
         <label for="grass-green-slope-slider" title="Terrain caps: lower = more dirt on slopes; higher = more green">
@@ -170,9 +181,9 @@
           min="0"
           max="100"
           step="1"
-          value="20"
+          value="97"
         />
-        <output id="grass-green-slope-value">0.20</output>
+        <output id="grass-green-slope-value">0.97</output>
       </div>
       <div class="jump-tune-row">
         <label
@@ -187,9 +198,9 @@
           min="0"
           max="100"
           step="1"
-          value="72"
+          value="82"
         />
-        <output id="grass-tuft-cluster-value">72%</output>
+        <output id="grass-tuft-cluster-value">82%</output>
       </div>
       <div class="jump-tune-row">
         <label for="tree-flatness-slider" title="Max height variation allowed under a tree">
@@ -201,35 +212,35 @@
           min="0.25"
           max="4"
           step="0.05"
-          value="1.25"
+          value="3.05"
         />
-        <output id="tree-flatness-value">1.25</output>
+        <output id="tree-flatness-value">3.05</output>
       </div>
       <div class="jump-tune-row">
         <label for="tree-radius-slider" title="How wide an area is checked for flat ground">
           Tree check radius
         </label>
-        <input type="range" id="tree-radius-slider" min="1" max="12" step="0.5" value="4" />
-        <output id="tree-radius-value">4.0</output>
+        <input type="range" id="tree-radius-slider" min="1" max="12" step="0.5" value="2.5" />
+        <output id="tree-radius-value">2.5</output>
       </div>
       <div class="jump-tune-row">
         <label for="tree-count-slider">Tree count</label>
-        <input type="range" id="tree-count-slider" min="0" max="48" step="1" value="14" />
-        <output id="tree-count-value">14</output>
+        <input type="range" id="tree-count-slider" min="0" max="48" step="1" value="48" />
+        <output id="tree-count-value">48</output>
       </div>
       <div class="jump-tune-row">
         <label for="rock-clump-count-slider" title="How many rock clusters to place">
           Rock clumps
         </label>
-        <input type="range" id="rock-clump-count-slider" min="0" max="40" step="1" value="14" />
-        <output id="rock-clump-count-value">14</output>
+        <input type="range" id="rock-clump-count-slider" min="0" max="40" step="1" value="40" />
+        <output id="rock-clump-count-value">40</output>
       </div>
       <div class="jump-tune-row">
         <label for="rocks-per-clump-slider" title="Max rocks in each cluster (actual count is random up to this)">
           Max rocks per clump
         </label>
-        <input type="range" id="rocks-per-clump-slider" min="1" max="12" step="1" value="4" />
-        <output id="rocks-per-clump-value">4</output>
+        <input type="range" id="rocks-per-clump-slider" min="1" max="12" step="1" value="9" />
+        <output id="rocks-per-clump-value">9</output>
       </div>
       <div class="jump-tune-row">
         <label for="rock-clump-radius-slider" title="How far rocks spread from each cluster center">
@@ -241,16 +252,16 @@
           min="0"
           max="8"
           step="0.25"
-          value="2.5"
+          value="7"
         />
-        <output id="rock-clump-radius-value">2.5</output>
+        <output id="rock-clump-radius-value">7.00</output>
       </div>
       <div class="jump-tune-row">
         <label for="rock-clump-spacing-slider" title="Minimum distance between rock cluster centers">
           Rock spacing
         </label>
-        <input type="range" id="rock-clump-spacing-slider" min="2" max="12" step="1" value="3" />
-        <output id="rock-clump-spacing-value">3</output>
+        <input type="range" id="rock-clump-spacing-slider" min="2" max="12" step="1" value="2" />
+        <output id="rock-clump-spacing-value">2</output>
       </div>
       <div class="jump-tune-row">
         <label
@@ -259,8 +270,8 @@
         >
           Enemy spawn rate
         </label>
-        <input type="range" id="enemy-spawn-rate-slider" min="0" max="100" step="1" value="58" />
-        <output id="enemy-spawn-rate-value">2.8s</output>
+        <input type="range" id="enemy-spawn-rate-slider" min="0" max="100" step="1" value="78" />
+        <output id="enemy-spawn-rate-value">1.6s</output>
       </div>
       <div class="jump-tune-row">
         <label for="enemy-speed-slider" title="How fast enemies crawl">
@@ -273,8 +284,8 @@
         <label for="enemy-light-height-slider" title="Vertical offset of the glow inside the enemy mesh">
           Enemy light height
         </label>
-        <input type="range" id="enemy-light-height-slider" min="0" max="100" step="1" value="50" />
-        <output id="enemy-light-height-value">0.00</output>
+        <input type="range" id="enemy-light-height-slider" min="0" max="100" step="1" value="33" />
+        <output id="enemy-light-height-value">-0.02</output>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

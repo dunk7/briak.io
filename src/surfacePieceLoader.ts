@@ -46,14 +46,59 @@ export function cellKey(ix: number, iy: number) {
   return `${ix}_${iy}`
 }
 
+/** Tag GLB children named `layer_N` / `lN` for per-layer dig and chunk merge. */
+export function tagSurfaceLayerMeshes(root: THREE.Object3D) {
+  root.traverse((child) => {
+    if (!(child instanceof THREE.Mesh)) return
+    if (typeof child.userData.surfaceLayer === 'number') return
+    const name = child.name.toLowerCase()
+    const layerMatch = name.match(/layer[_-]?(\d+)/) ?? name.match(/^l(\d+)$/)
+    if (layerMatch) child.userData.surfaceLayer = Number(layerMatch[1])
+  })
+}
+
 /**
  * Disable matrixAutoUpdate on every node in a static subtree so the renderer's
- * per-frame scene.updateMatrixWorld() stops recomposing/multiplying matrices for
- * it. Call only after the subtree's world matrices are already up to date.
+ * per-frame scene.updateMatrixWorld() stops recomposing local matrices for it.
+ *
+ * Do NOT set matrixWorldAutoUpdate=false — that makes updateMatrixWorld(true)
+ * skip world multiplies entirely, which breaks chunk merges, BVH collision, and
+ * frustum bounds (missing faces / falling through the ground).
+ *
+ * Call only after the subtree's world matrices are already up to date.
+ * Scene force-cascades are avoided via scene.matrixAutoUpdate=false.
  */
 export function freezeSubtreeMatrices(root: THREE.Object3D) {
   root.traverse((node) => {
     node.matrixAutoUpdate = false
+  })
+}
+
+/**
+ * Recompose local + world matrices after moving a frozen (matrixAutoUpdate off)
+ * object — dig preview, grid align, chunk extract.
+ */
+export function refreshFrozenMatrixWorld(root: THREE.Object3D) {
+  root.traverse((node) => {
+    node.updateMatrix()
+    node.matrixWorldNeedsUpdate = true
+  })
+  root.updateMatrixWorld(true)
+}
+
+/** Update world matrices whether the subtree uses auto-update or not. */
+export function ensureMatrixWorld(root: THREE.Object3D) {
+  if (root.matrixAutoUpdate === false) {
+    refreshFrozenMatrixWorld(root)
+    return
+  }
+  root.updateMatrixWorld(true)
+}
+
+/** Temporarily allow TRS → matrix updates (dig wobble / rock physics). */
+export function thawSubtreeMatrices(root: THREE.Object3D) {
+  root.traverse((node) => {
+    node.matrixAutoUpdate = true
   })
 }
 
@@ -105,7 +150,9 @@ export function loadSurfaceCell(
       url,
       (gltf) => {
         const root = gltf.scene
+        tagSurfaceLayerMeshes(root)
         const pristine = root.clone()
+        tagSurfaceLayerMeshes(pristine)
         applySurfaceCapMaterials(
           root,
           ctx.dirtMaterial,
@@ -124,9 +171,7 @@ export function loadSurfaceCell(
         // These per-cell roots are static once placed (merged into chunk meshes
         // and invisible). Freezing matrixAutoUpdate on the WHOLE subtree — not
         // just the root — stops scene.updateMatrixWorld() from recomposing every
-        // descendant mesh's matrix on every frame, which across ~1800 cells was
-        // the dominant per-frame CPU cost. Matrices were already composed by the
-        // updateMatrixWorld(true) calls above.
+        // descendant mesh's local matrix on every frame.
         freezeSubtreeMatrices(root)
         ctx.surfaceChunks.registerCell(cell)
         ctx.surfaceChunks.markDirtyForCell(cell)

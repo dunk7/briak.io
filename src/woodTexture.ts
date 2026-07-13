@@ -26,6 +26,11 @@ function lerp(a: number, b: number, t: number) {
   return a + (b - a) * t
 }
 
+function smoothstep(edge0: number, edge1: number, x: number) {
+  const t = THREE.MathUtils.clamp((x - edge0) / (edge1 - edge0), 0, 1)
+  return t * t * (3 - 2 * t)
+}
+
 function wrap(n: number) {
   return ((n % TILE_PERIOD) + TILE_PERIOD) % TILE_PERIOD
 }
@@ -42,20 +47,6 @@ function valueNoise(x: number, y: number) {
   const c = hash01(wrap(xi), wrap(yi + 1))
   const d = hash01(wrap(xi + 1), wrap(yi + 1))
   return lerp(lerp(a, b, u), lerp(c, d, u), v)
-}
-
-function fbm(x: number, y: number, octaves: number) {
-  let amp = 1
-  let freq = 1
-  let sum = 0
-  let norm = 0
-  for (let i = 0; i < octaves; i++) {
-    sum += amp * valueNoise(x * freq, y * freq)
-    freq *= 2
-    norm += amp
-    amp *= 0.5
-  }
-  return sum / norm
 }
 
 function clampByte(v: number) {
@@ -83,18 +74,27 @@ function makeTexture(image: ImageData, size: number): THREE.CanvasTexture {
   return tex
 }
 
-/** Tileable oak planks: board bands, end-grain seams, and lengthwise grain. */
+/** Oak plank base tones — four bands like Minecraft oak_planks. */
+const PLANK_BASES: [number, number, number][] = [
+  [154, 118, 72],
+  [142, 106, 64],
+  [148, 112, 68],
+  [136, 100, 60],
+]
+
+/** Tileable oak planks: sharp seams, per-board color, vertical grain streaks. */
 export function createWoodPlankAlbedoMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
   const image = new ImageData(size, size)
   const data = image.data
 
-  const seam: [number, number, number] = [36, 22, 12]
-  const dark: [number, number, number] = [58, 36, 20]
-  const mid: [number, number, number] = [92, 58, 34]
-  const light: [number, number, number] = [118, 76, 46]
-  const highlight: [number, number, number] = [132, 88, 52]
+  const seamDark: [number, number, number] = [32, 20, 11]
+  const seamMid: [number, number, number] = [48, 30, 16]
+  const highlight: [number, number, number] = [178, 138, 86]
+  const grainDark: [number, number, number] = [98, 62, 36]
+  const knotDark: [number, number, number] = [52, 34, 18]
 
   const plankSpan = TILE_PERIOD / PLANKS_PER_TILE
+  const seamWidth = plankSpan * 0.045
 
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
@@ -102,37 +102,54 @@ export function createWoodPlankAlbedoMap(size = DEFAULT_SIZE): THREE.CanvasTextu
       const v = (y / size) * TILE_PERIOD
 
       const plankFrac = ((v % plankSpan) + plankSpan) % plankSpan
-      const plankId = Math.floor(v / plankSpan)
+      const plankId = Math.floor(v / plankSpan) % PLANKS_PER_TILE
       const plankT = plankFrac / plankSpan
-      const plankHue = hash01(plankId, 17) * 0.5 + 0.25
 
-      const seamDist = Math.min(plankFrac, plankSpan - plankFrac)
-      const seamT = THREE.MathUtils.clamp(1 - seamDist / 0.22, 0, 1)
+      const baseIdx = plankId ^ (Math.floor(u / plankSpan) & 1)
+      let rgb: [number, number, number] = [...PLANK_BASES[baseIdx % PLANK_BASES.length]]
 
-      let rgb = mix3(dark, mid, plankHue)
-      rgb = mix3(rgb, light, THREE.MathUtils.clamp((plankHue - 0.45) * 2.4, 0, 1))
-      if (plankT > 0.72) rgb = mix3(rgb, highlight, (plankT - 0.72) / 0.28)
+      const plankJitter = hash01(plankId, Math.floor(u * 0.25)) * 0.14 - 0.07
+      rgb = mix3(rgb, highlight, plankJitter * 0.35 + 0.02)
 
-      const ring = fbm(u * 0.12 + plankId * 1.7, v * 0.9 + 4.2, 2)
-      const grain = fbm(u * 2.4 + plankId * 3.1, v * 0.08 + 9.5, 3)
-      const fine = valueNoise(u * 6.5 + plankId, v * 0.25 + 2.1)
-      const grainShade = (grain - 0.5) * 22 + (fine - 0.5) * 8 + (ring - 0.5) * 10
+      const topEdge = 1 - smoothstep(0, 0.1, plankT)
+      const bottomEdge = smoothstep(0.88, 1, plankT)
+      rgb = mix3(rgb, highlight, topEdge * 0.22)
+      rgb = mix3(rgb, grainDark, bottomEdge * 0.18)
+
+      const col = Math.floor(u * 6.2 + plankId * 1.3)
+      const colShade = hash01(col, plankId * 19) * 0.16 - 0.08
+      rgb = [
+        rgb[0] * (1 + colShade),
+        rgb[1] * (1 + colShade * 0.92),
+        rgb[2] * (1 + colShade * 0.78),
+      ]
+
+      const wave = Math.sin(v * 0.55 + hash01(plankId, 7) * Math.PI * 2) * 0.35
+      const grainU = u + wave
+      const streak = valueNoise(grainU * 2.8 + plankId * 4.1, v * 0.06 + 3.7)
+      const streak2 = valueNoise(grainU * 5.5 + plankId, v * 0.03 + 9.2)
+      const grainShade = (streak - 0.5) * 20 + (streak2 - 0.5) * 10
       rgb = [
         rgb[0] + grainShade,
-        rgb[1] + grainShade * 0.88,
+        rgb[1] + grainShade * 0.9,
         rgb[2] + grainShade * 0.72,
       ]
 
-      if (seamT > 0) rgb = mix3(rgb, seam, seamT * seamT)
+      const seamDist = Math.min(plankFrac, plankSpan - plankFrac)
+      if (seamDist < seamWidth) {
+        const seamT = 1 - seamDist / seamWidth
+        const seamColor = mix3(seamMid, seamDark, seamT * seamT)
+        rgb = mix3(rgb, seamColor, smoothstep(0, 1, seamT))
+      }
 
-      const knot = fbm(u * 0.35 + 11.2, v * 0.35 + plankId * 2.3, 2)
-      if (knot > 0.82) {
-        rgb = mix3(rgb, dark, ((knot - 0.82) / 0.18) * 0.55)
+      const knot = valueNoise(u * 0.28 + plankId * 5.1, v * 0.28 + 11.4)
+      if (knot > 0.86) {
+        rgb = mix3(rgb, knotDark, ((knot - 0.86) / 0.14) * 0.5)
       }
 
       const h = hash2(x, y)
-      if ((h & 255) < 5) {
-        rgb = mix3(rgb, light, 0.2 + (h & 15) / 31)
+      if ((h & 255) < 4) {
+        rgb = mix3(rgb, highlight, 0.15 + (h & 15) / 60)
       }
 
       const i = (y * size + x) * 4

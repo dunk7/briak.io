@@ -222,10 +222,10 @@ export function getRockMaterial(): THREE.MeshStandardMaterial {
     color: 0xffffff,
     map: createRockAlbedoMap(),
     normalMap: createRockNormalMap(),
-    roughness: 0.92,
+    roughness: 0.88,
     metalness: 0.04,
-    emissive: 0x14141a,
-    emissiveIntensity: 0.28,
+    emissive: 0x1c1c24,
+    emissiveIntensity: 0.36,
   })
   mat.normalScale.set(0.85, 0.85)
   sharedRockMaterial = mat

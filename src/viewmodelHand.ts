@@ -1,17 +1,55 @@
 import * as THREE from 'three'
 import type { InventoryItem } from './inventory'
+import { createHeldBowPullingItem, createHeldExtrudedItem } from './itemMeshes'
+import type { ArrowItem } from './thrownArrow'
 
 const DEG = Math.PI / 180
-const SWING_DURATION = 0.32
-const SWING_INTERVAL = 0.42
-const THROW_DURATION = 0.38
-export const SPEAR_THROW_COOLDOWN = 1
+const SWING_DURATION = 0.36
+const SWING_INTERVAL = 0.44
+const THROW_DURATION = 0.28
+export const SPEAR_THROW_COOLDOWN = 0.55
+/** Time to reach full bow draw. */
+export const BOW_DRAW_DURATION = 0.62
+export const BOW_FIRE_COOLDOWN = 0.28
+/** Floor draw (0–1) for click / short releases — low power, never full draw. */
+export const BOW_MIN_RELEASE = 0.18
+/** Hide the shared charge ring until draw is past this (avoids flash on micro-taps). */
+export const BOW_DRAW_HUD_MIN = 0.06
+/** Default / zoomed FOV while aiming with the bow (RMB). */
+export const BOW_BASE_FOV = 70
+export const BOW_ZOOM_FOV = 48
+/** How quickly FOV eases toward zoom / base (higher = snappier). */
+export const BOW_ZOOM_LERP = 14
+/**
+ * Look sensitivity at full bow zoom, relative to hip-fire.
+ * Slower than FOV-matched (~0.69) so ADS aiming feels deliberate.
+ */
+export const BOW_ZOOM_LOOK_SCALE = 0.4
 
-/** Shoulder pivot — off-screen bottom-right; swing rotates here. */
-const PIVOT_POS = new THREE.Vector3(0.92, -0.58, -0.46)
-/** Forearm offset from pivot into the visible lower-center. */
-const ARM_OFFSET = new THREE.Vector3(-0.44, 0.4, 0.06)
-const BASE_YAW = 45 * DEG
+/**
+ * Minecraft-style bow model stages while drawing:
+ * 0 = idle (no arrow), 1 = light pull, 2 = full pull.
+ */
+export function bowDrawStage(draw: number): 0 | 1 | 2 {
+  const d = Math.min(1, Math.max(0, draw))
+  if (d <= 0.02) return 0
+  if (d < 0.65) return 1
+  return 2
+}
+
+/**
+ * Shoulder pivot in camera space. Arm stays mostly vertical (low yaw);
+ * items tip right from the top of the capsule.
+ */
+const PIVOT_POS = new THREE.Vector3(0.62, -0.55, -0.78)
+/** Minecraft-like bow hold — fixed; does not slide while drawing. */
+const BOW_PIVOT_POS = new THREE.Vector3(0.38, -0.5, -0.7)
+const ARM_OFFSET = new THREE.Vector3(-0.12, 0.28, 0.02)
+const BASE_YAW = 8 * DEG
+/** Slight upward tip so the bow reads more upright in first person. */
+const BOW_HOLD_PITCH = 10 * DEG
+/** Bank the bow a bit toward the left of the screen. */
+const BOW_HOLD_ROLL = -10 * DEG
 
 const _AXIS_X = new THREE.Vector3(1, 0, 0)
 const _AXIS_Y = new THREE.Vector3(0, 1, 0)
@@ -21,231 +59,38 @@ const _qz = new THREE.Quaternion()
 const _qx = new THREE.Quaternion()
 const _swingQuat = new THREE.Quaternion()
 const _throwQuat = new THREE.Quaternion()
-/** Capsule arm — hand sits at the distal end. */
-const CAPSULE_RADIUS = 0.062
-const CAPSULE_LENGTH = 0.24
-const CAPSULE_CENTER_Y = -0.14
-const HAND_Y = CAPSULE_CENTER_Y - CAPSULE_LENGTH / 2 - CAPSULE_RADIUS + 0.01
+const _swingPos = new THREE.Vector3()
 
-/** Palm mesh is 0.068×0.048×0.075 at z=0.012 — grip on top-front. */
-const GRIP_MOUNT_POS = new THREE.Vector3(0, -0.006, 0.048)
-const GRIP_MOUNT_ROT = new THREE.Euler(-0.14, 0.06, 0.08)
+const CAPSULE_RADIUS = 0.055
+const CAPSULE_LENGTH = 0.22
+const CAPSULE_CENTER_Y = -0.1
+/**
+ * Proximal / upper end of the capsule (toward screen center), not the distal
+ * tip at the bottom of the frame.
+ */
+const GRIP_MOUNT_POS = new THREE.Vector3(
+  0,
+  CAPSULE_CENTER_Y + CAPSULE_LENGTH / 2 + CAPSULE_RADIUS * 0.35,
+  0.04,
+)
 
-/** Point tools toward the crosshair from the lower-right hand. */
-const TOOL_HELD_ROT = new THREE.Euler(0.58, -0.36, -0.16)
-const SPEAR_HELD_ROT = new THREE.Euler(0.22, -0.28, -0.1)
-const ITEM_HELD_ROT = new THREE.Euler(0.42, -0.2, -0.2)
-
-const _spearTipLocal = new THREE.Vector3(0, 0, 0.46)
-
-type HeldPose = { rotation: THREE.Euler; scale?: number }
-
-function wrapHeldItem(content: THREE.Object3D, pose: HeldPose): THREE.Object3D {
-  const root = new THREE.Group()
-  root.add(content)
-  root.rotation.copy(pose.rotation)
-  if (pose.scale !== undefined) root.scale.setScalar(pose.scale)
-  return root
-}
-
-const ITEM_COLORS: Record<InventoryItem, number> = {
-  dirt: 0x76583a,
-  wood: 0x5c3a22,
-  stone: 0x7a7a74,
-  stick: 0x8b5e34,
-  sword: 0xd0d4dc,
-  axe: 0x7a7a74,
-  shovel: 0x9a9a92,
-  pickaxe: 0x8a8580,
-  spear: 0x9a9a92,
-  crystal_berries: 0xa855f7,
-  glowing_orb: 0xff3300,
-  torch: 0xff5522,
-}
-
-function itemMaterial(color: number, opts?: { metalness?: number; roughness?: number }) {
-  return new THREE.MeshStandardMaterial({
-    color,
-    roughness: opts?.roughness ?? 0.82,
-    metalness: opts?.metalness ?? 0.04,
-    flatShading: true,
-    fog: false,
+/** Held extruded icons need depth so voxels occlude correctly (same as ground drops). */
+function markHeldItem(obj: THREE.Object3D) {
+  obj.traverse((child) => {
+    if (!(child instanceof THREE.Mesh)) return
+    child.renderOrder = 11
+    child.frustumCulled = false
+    const mats = Array.isArray(child.material) ? child.material : [child.material]
+    for (const mat of mats) {
+      mat.depthTest = true
+      mat.depthWrite = true
+      mat.fog = false
+    }
   })
-}
-
-function boxMesh(
-  w: number,
-  h: number,
-  d: number,
-  material: THREE.Material,
-  x = 0,
-  y = 0,
-  z = 0,
-): THREE.Mesh {
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material)
-  mesh.position.set(x, y, z)
-  mesh.castShadow = false
-  mesh.receiveShadow = false
-  return mesh
-}
-
-function createBlockHeldItem(item: 'dirt' | 'wood' | 'stone'): THREE.Object3D {
-  const content = new THREE.Group()
-  const s = 0.1
-  content.add(boxMesh(s, s, s, itemMaterial(ITEM_COLORS[item]), 0, s * 0.5, 0.03))
-  return wrapHeldItem(content, { rotation: ITEM_HELD_ROT })
-}
-
-function createStickHeldItem(): THREE.Object3D {
-  const content = new THREE.Group()
-  const mat = itemMaterial(ITEM_COLORS.stick)
-  content.add(boxMesh(0.032, 0.26, 0.032, mat, 0, 0.13, 0.02))
-  return wrapHeldItem(content, { rotation: ITEM_HELD_ROT })
-}
-
-function createSwordHeldItem(): THREE.Object3D {
-  const content = new THREE.Group()
-  const blade = itemMaterial(ITEM_COLORS.sword, { metalness: 0.35, roughness: 0.45 })
-  const guard = itemMaterial(0x6b5038)
-  const handle = itemMaterial(0x5c3a22)
-
-  content.add(boxMesh(0.03, 0.11, 0.032, handle, 0, 0.055, 0))
-  content.add(boxMesh(0.1, 0.026, 0.036, guard, 0, 0.12, 0.01))
-  const bladeMesh = boxMesh(0.026, 0.24, 0.048, blade, 0, 0.25, 0.06)
-  bladeMesh.rotation.x = -0.52
-  content.add(bladeMesh)
-
-  return wrapHeldItem(content, { rotation: TOOL_HELD_ROT })
-}
-
-function createAxeHeldItem(): THREE.Object3D {
-  const content = new THREE.Group()
-  const head = itemMaterial(ITEM_COLORS.axe, { metalness: 0.12, roughness: 0.68 })
-  const headDark = itemMaterial(0x686860, { metalness: 0.08, roughness: 0.72 })
-  const handle = itemMaterial(0x5c3a22)
-
-  content.add(boxMesh(0.032, 0.19, 0.032, handle, 0, 0.095, 0))
-  content.add(boxMesh(0.11, 0.046, 0.04, head, 0.04, 0.21, 0.025))
-  content.add(boxMesh(0.048, 0.048, 0.036, headDark, -0.03, 0.2, -0.01))
-
-  return wrapHeldItem(content, { rotation: TOOL_HELD_ROT })
-}
-
-function createShovelHeldItem(): THREE.Object3D {
-  const content = new THREE.Group()
-  const blade = itemMaterial(ITEM_COLORS.shovel, { metalness: 0.1, roughness: 0.65 })
-  const handle = itemMaterial(0x5c3a22)
-
-  content.add(boxMesh(0.032, 0.17, 0.032, handle, 0, 0.085, 0))
-  content.add(boxMesh(0.1, 0.038, 0.05, blade, 0, 0.2, 0.02))
-
-  return wrapHeldItem(content, { rotation: TOOL_HELD_ROT })
-}
-
-function createPickaxeHeldItem(): THREE.Object3D {
-  const content = new THREE.Group()
-  const head = itemMaterial(ITEM_COLORS.pickaxe, { metalness: 0.2, roughness: 0.52 })
-  const headDark = itemMaterial(0x686860, { metalness: 0.12, roughness: 0.62 })
-  const headLight = itemMaterial(0xd0d0c8, { metalness: 0.28, roughness: 0.38 })
-  const handle = itemMaterial(0x5c3a22)
-
-  content.add(boxMesh(0.03, 0.15, 0.03, handle, 0, 0.075, 0))
-  content.add(boxMesh(0.048, 0.036, 0.032, headDark, 0, 0.16, 0))
-
-  const leftArm = boxMesh(0.032, 0.09, 0.028, head, -0.036, 0.2, 0.01)
-  leftArm.rotation.z = 0.78
-  content.add(leftArm)
-  const leftTip = boxMesh(0.022, 0.034, 0.024, headLight, -0.068, 0.24, 0.01)
-  leftTip.rotation.z = 0.78
-  content.add(leftTip)
-
-  const rightArm = boxMesh(0.032, 0.09, 0.028, head, 0.036, 0.2, 0.01)
-  rightArm.rotation.z = -0.78
-  content.add(rightArm)
-  const rightTip = boxMesh(0.022, 0.034, 0.024, headLight, 0.068, 0.24, 0.01)
-  rightTip.rotation.z = -0.78
-  content.add(rightTip)
-
-  return wrapHeldItem(content, { rotation: TOOL_HELD_ROT })
-}
-
-function createSpearHeldItem(): THREE.Object3D {
-  const content = new THREE.Group()
-  const shaft = itemMaterial(0x5c3a22)
-  const tip = itemMaterial(ITEM_COLORS.spear, { metalness: 0.12, roughness: 0.6 })
-
-  content.add(boxMesh(0.028, 0.028, 0.36, shaft, 0, 0, 0.18))
-  content.add(boxMesh(0.042, 0.042, 0.09, tip, 0, 0, 0.405))
-
-  return wrapHeldItem(content, { rotation: SPEAR_HELD_ROT })
-}
-
-function createCrystalBerriesHeldItem(): THREE.Object3D {
-  const content = new THREE.Group()
-  const mat = itemMaterial(ITEM_COLORS.crystal_berries, { metalness: 0.18, roughness: 0.42 })
-  const gem = new THREE.Mesh(new THREE.OctahedronGeometry(0.055, 0), mat)
-  gem.rotation.z = Math.PI * 0.25
-  gem.position.set(0, 0.05, 0.04)
-  content.add(gem)
-  return wrapHeldItem(content, { rotation: ITEM_HELD_ROT })
-}
-
-function createGlowingOrbHeldItem(): THREE.Object3D {
-  const content = new THREE.Group()
-  const mat = itemMaterial(ITEM_COLORS.glowing_orb, { metalness: 0.05, roughness: 0.35 })
-  mat.emissive = new THREE.Color(0xff2200)
-  mat.emissiveIntensity = 0.85
-  const orb = new THREE.Mesh(new THREE.SphereGeometry(0.065, 12, 12), mat)
-  orb.position.set(0, 0.05, 0.04)
-  content.add(orb)
-  return wrapHeldItem(content, { rotation: ITEM_HELD_ROT })
-}
-
-function createTorchHeldItem(): THREE.Object3D {
-  const content = new THREE.Group()
-  const handle = itemMaterial(0x6b4428)
-  content.add(boxMesh(0.03, 0.17, 0.03, handle, 0, 0.085, 0))
-
-  const flameMat = new THREE.MeshBasicMaterial({
-    color: 0xff3300,
-    transparent: true,
-    opacity: 0.95,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-    toneMapped: false,
-  })
-  const flame = new THREE.Mesh(new THREE.SphereGeometry(0.04, 10, 10), flameMat)
-  flame.position.set(0, 0.2, 0)
-  content.add(flame)
-
-  return wrapHeldItem(content, { rotation: TOOL_HELD_ROT, scale: 0.95 })
 }
 
 function createHeldItemMesh(item: InventoryItem): THREE.Object3D {
-  switch (item) {
-    case 'dirt':
-    case 'wood':
-    case 'stone':
-      return createBlockHeldItem(item)
-    case 'stick':
-      return createStickHeldItem()
-    case 'sword':
-      return createSwordHeldItem()
-    case 'axe':
-      return createAxeHeldItem()
-    case 'shovel':
-      return createShovelHeldItem()
-    case 'pickaxe':
-      return createPickaxeHeldItem()
-    case 'spear':
-      return createSpearHeldItem()
-    case 'crystal_berries':
-      return createCrystalBerriesHeldItem()
-    case 'glowing_orb':
-      return createGlowingOrbHeldItem()
-    case 'torch':
-      return createTorchHeldItem()
-  }
+  return createHeldExtrudedItem(item)
 }
 
 /** 0–1 strike weight for the current swing frame (peaks on impact). */
@@ -254,7 +99,6 @@ export function swingStrikeIntensity(swingProgress: number): number {
   return f1 * f1
 }
 
-/** Overhand throw: wind back, then snap forward. */
 function applyThrowRotation(throwProgress: number, target: THREE.Object3D) {
   const t = Math.min(1, Math.max(0, throwProgress))
   const wind = Math.sin(Math.min(t * 1.6, 1) * Math.PI * 0.5)
@@ -266,34 +110,58 @@ function applyThrowRotation(throwProgress: number, target: THREE.Object3D) {
 
   _throwQuat.copy(_qy).multiply(_qz).multiply(_qx)
   target.quaternion.copy(_throwQuat)
+  target.position.set(0, 0, 0)
 }
 
-/** Vanilla first-person attack swing (Y → Z → X). */
-function applyMinecraftSwingRotation(swingProgress: number, target: THREE.Object3D) {
-  const f = Math.sin(swingProgress * swingProgress * Math.PI)
-  const f1 = Math.sin(Math.sqrt(swingProgress) * Math.PI)
+/**
+ * Forward slice: wind back, then drive into the world (-Z) while cutting left.
+ * Translation carries the strike; rotation is a light left tilt — not a big roll arc.
+ */
+function applySwingPose(swingProgress: number, target: THREE.Object3D) {
+  const p = Math.min(1, Math.max(0, swingProgress))
 
-  _qy.setFromAxisAngle(_AXIS_Y, f * -20 * DEG)
-  _qz.setFromAxisAngle(_AXIS_Z, f1 * -20 * DEG)
-  _qx.setFromAxisAngle(_AXIS_X, f1 * -80 * DEG)
+  // Wind-up first third, then commit forward.
+  const wind = Math.max(0, 1 - p / 0.28)
+  const strike = Math.min(1, Math.max(0, (p - 0.18) / 0.55))
+  const strikeEase = strike * strike * (3 - 2 * strike) // smoothstep
 
-  _swingQuat.copy(_qy).multiply(_qz).multiply(_qx)
+  // Light left tilt through the cut (not a big curving roll).
+  const roll = (-12 * wind + 42 * strikeEase) * DEG
+  const pitch = (8 * wind - 28 * strikeEase) * DEG
+
+  _qz.setFromAxisAngle(_AXIS_Z, roll)
+  _qx.setFromAxisAngle(_AXIS_X, pitch)
+  _swingQuat.copy(_qz).multiply(_qx)
   target.quaternion.copy(_swingQuat)
+
+  // Pull back on wind-up, then slice forward into the scene and left.
+  _swingPos.set(
+    0.04 * wind - 0.18 * strikeEase,
+    0.05 * wind - 0.08 * strikeEase,
+    0.06 * wind - 0.22 * strikeEase,
+  )
+  target.position.copy(_swingPos)
 }
 
-/** Minecraft-style capsule arm attached to the camera. */
+/** First-person capsule arm attached to the camera. */
 export class ViewmodelHand {
-  /** Off-screen shoulder; only the offset arm is visible. */
   readonly group = new THREE.Group()
 
   private readonly swingPivot = new THREE.Group()
   private readonly armMount = new THREE.Group()
   private readonly heldItemMount = new THREE.Group()
   private readonly heldMeshes = new Map<InventoryItem, THREE.Object3D>()
+  /** Lazy-built bow pull stage meshes keyed by `stage:arrow`. */
+  private readonly bowPullMeshes = new Map<string, THREE.Object3D>()
 
   private swingT = 0
   private swingCooldown = 0
+  /** Clicked during cooldown — fire one swing when reload finishes. */
+  private swingPending = false
   private throwT = 0
+  private bowDraw = 0
+  private nockedArrow: ArrowItem | null = null
+  private bowVisualKey = 'idle'
   private heldItem: InventoryItem | null = null
 
   constructor(camera: THREE.PerspectiveCamera) {
@@ -302,34 +170,27 @@ export class ViewmodelHand {
       roughness: 0.88,
       metalness: 0,
       fog: false,
+      depthTest: false,
+      depthWrite: false,
     })
     const capsule = new THREE.Mesh(
       new THREE.CapsuleGeometry(CAPSULE_RADIUS, CAPSULE_LENGTH, 6, 10),
       material,
     )
-    capsule.position.set(0, CAPSULE_CENTER_Y, 0.02)
-    capsule.rotation.x = 0.18
+    capsule.position.set(0, CAPSULE_CENTER_Y, 0.01)
+    capsule.rotation.x = 0.04
     capsule.castShadow = false
     capsule.receiveShadow = false
-
-    const hand = new THREE.Group()
-    hand.position.set(0, HAND_Y, 0.038)
-    const palm = new THREE.Mesh(new THREE.BoxGeometry(0.068, 0.048, 0.075), material)
-    palm.position.set(0, 0, 0.012)
-    palm.castShadow = false
-    palm.receiveShadow = false
-    hand.add(palm)
+    capsule.renderOrder = 10
+    capsule.frustumCulled = false
 
     this.heldItemMount.position.copy(GRIP_MOUNT_POS)
-    this.heldItemMount.rotation.copy(GRIP_MOUNT_ROT)
-    hand.add(this.heldItemMount)
-
     this.armMount.add(capsule)
-    this.armMount.add(hand)
+    this.armMount.add(this.heldItemMount)
     this.armMount.position.copy(ARM_OFFSET)
     this.swingPivot.add(this.armMount)
     this.group.add(this.swingPivot)
-    this.group.scale.setScalar(1.1)
+    this.group.scale.setScalar(1.12)
     this.group.position.copy(PIVOT_POS)
     this.group.rotation.order = 'YXZ'
     camera.add(this.group)
@@ -338,9 +199,18 @@ export class ViewmodelHand {
 
   setHeldItem(item: InventoryItem | null) {
     if (item === this.heldItem) return
+    if (this.heldItem === 'bow' && item !== 'bow') {
+      this.bowDraw = 0
+      this.nockedArrow = null
+      this.showBowVisual('idle')
+    }
     this.heldItem = item
+    this.applyPivotForHeldItem()
 
     for (const mesh of this.heldMeshes.values()) {
+      mesh.visible = false
+    }
+    for (const mesh of this.bowPullMeshes.values()) {
       mesh.visible = false
     }
 
@@ -349,56 +219,151 @@ export class ViewmodelHand {
     let mesh = this.heldMeshes.get(item)
     if (!mesh) {
       mesh = createHeldItemMesh(item)
+      markHeldItem(mesh)
       this.heldMeshes.set(item, mesh)
       this.heldItemMount.add(mesh)
     }
     mesh.visible = true
+    if (item === 'bow') {
+      this.bowVisualKey = 'idle'
+      this.showBowVisual('idle')
+    }
   }
 
-  private resetPose() {
+  private applyPivotForHeldItem() {
+    if (this.heldItem === 'bow') {
+      this.applyBowArmPose()
+      return
+    }
     this.group.position.copy(PIVOT_POS)
     this.group.rotation.set(0, BASE_YAW, 0, 'YXZ')
     this.swingPivot.quaternion.identity()
+    this.swingPivot.position.set(0, 0, 0)
+  }
+
+  /** Fixed Minecraft-like bow arm — stays put while drawing; slight upward tilt. */
+  private applyBowArmPose() {
+    this.group.position.copy(BOW_PIVOT_POS)
+    this.group.rotation.set(BOW_HOLD_PITCH, BASE_YAW, BOW_HOLD_ROLL, 'YXZ')
+    this.swingPivot.quaternion.identity()
+    this.swingPivot.position.set(0, 0, 0)
+  }
+
+  /** Which arrow tip to paint on pull-stage bow sprites. */
+  setNockedArrow(item: ArrowItem | null) {
+    if (item === this.nockedArrow) return
+    this.nockedArrow = item
+    if (this.heldItem === 'bow') this.refreshBowDrawVisual()
+  }
+
+  private bowPullKey(stage: 0 | 1, arrow: ArrowItem): string {
+    return `${stage}:${arrow}`
+  }
+
+  private showBowVisual(key: string) {
+    const idle = this.heldMeshes.get('bow')
+    for (const mesh of this.bowPullMeshes.values()) mesh.visible = false
+    if (key === 'idle') {
+      if (idle) idle.visible = true
+      this.bowVisualKey = 'idle'
+      return
+    }
+    if (idle) idle.visible = false
+    const pull = this.bowPullMeshes.get(key)
+    if (pull) pull.visible = true
+    this.bowVisualKey = key
+  }
+
+  private ensureBowPullMesh(stage: 0 | 1, arrow: ArrowItem): THREE.Object3D {
+    const key = this.bowPullKey(stage, arrow)
+    let mesh = this.bowPullMeshes.get(key)
+    if (!mesh) {
+      mesh = createHeldBowPullingItem(stage, arrow)
+      markHeldItem(mesh)
+      this.bowPullMeshes.set(key, mesh)
+      this.heldItemMount.add(mesh)
+      mesh.visible = false
+    }
+    return mesh
+  }
+
+  /** Swap idle ↔ pulling_0 ↔ pulling_1 extruded bow models (Minecraft-style). */
+  private refreshBowDrawVisual() {
+    if (this.heldItem !== 'bow') return
+    const stage = bowDrawStage(this.bowDraw)
+    if (stage === 0 || !this.nockedArrow) {
+      this.showBowVisual('idle')
+      return
+    }
+    const pullStage = (stage - 1) as 0 | 1
+    const key = this.bowPullKey(pullStage, this.nockedArrow)
+    this.ensureBowPullMesh(pullStage, this.nockedArrow)
+    if (this.bowVisualKey !== key) this.showBowVisual(key)
+  }
+
+  private resetPose() {
+    this.applyPivotForHeldItem()
   }
 
   whack() {
-    if (this.throwT > 0) return
+    if (this.throwT > 0 || this.bowDraw > 0) return
+    // Respect reload: buffer a click instead of restarting mid-swing / mid-cooldown.
+    if (this.swingT > 0 || this.swingCooldown > 0) {
+      this.swingPending = true
+      return
+    }
+    this.beginSwing()
+  }
+
+  private beginSwing() {
+    this.swingPending = false
     this.swingT = 1
     this.swingCooldown = SWING_INTERVAL
   }
 
-  /** Overhand spear throw; blocks swing until finished. */
   startThrow(): boolean {
-    if (this.throwT > 0) return false
+    if (this.throwT > 0 || this.bowDraw > 0) return false
     this.swingT = 0
+    this.swingPending = false
     this.swingCooldown = SPEAR_THROW_COOLDOWN
     this.throwT = 1
     return true
+  }
+
+  /** Update bow draw amount (0–1). Pass 0 to cancel / after loosing (idle model). */
+  setBowDraw(amount: number) {
+    this.bowDraw = Math.min(1, Math.max(0, amount))
+    if (this.bowDraw > 0) {
+      this.swingT = 0
+      this.swingPending = false
+      this.swingCooldown = 0
+      this.refreshBowDrawVisual()
+      this.applyBowArmPose()
+      return
+    }
+    // Shot / cancel — back to idle bow (nocked arrow gone from the sprite).
+    this.nockedArrow = null
+    this.showBowVisual('idle')
+    this.applyBowArmPose()
+  }
+
+  getBowDraw(): number {
+    return this.bowDraw
+  }
+
+  isDrawingBow(): boolean {
+    return this.bowDraw > 0
   }
 
   isThrowing(): boolean {
     return this.throwT > 0
   }
 
-  /** 0 at wind-up, ~0.42 at release, 1 at follow-through. */
   getThrowProgress(): number {
     if (this.throwT <= 0) return 1
     return 1 - this.throwT
   }
 
-  /** World position at the spear tip when the throw releases. */
-  getThrowSpawnPosition(out: THREE.Vector3): void {
-    const spear = this.heldMeshes.get('spear')
-    if (spear) {
-      out.copy(_spearTipLocal)
-      spear.localToWorld(out)
-      return
-    }
-    out.copy(_spearTipLocal)
-    this.heldItemMount.localToWorld(out)
-  }
-
-  /** 0–1 while swinging; strongest at the strike frame (use for dig hit reactions). */
   getSwingImpact(): number {
     if (this.swingT <= 0) return 0
     return swingStrikeIntensity(1 - this.swingT)
@@ -410,23 +375,44 @@ export class ViewmodelHand {
       const throwProgress = 1 - this.throwT
       this.group.rotation.y = BASE_YAW
       applyThrowRotation(throwProgress, this.swingPivot)
-      if (this.heldItem === 'spear') {
-        const mesh = this.heldMeshes.get('spear')
+      if (
+        this.heldItem === 'spear' ||
+        this.heldItem === 'iron_spear' ||
+        this.heldItem === 'gold_spear' ||
+        this.heldItem === 'diamond_spear'
+      ) {
+        const mesh = this.heldMeshes.get(this.heldItem)
         if (mesh) mesh.visible = throwProgress < 0.34
       }
       return
     }
 
-    if (this.heldItem === 'spear') {
-      const mesh = this.heldMeshes.get('spear')
+    // Bow: fixed hold pose (sprite stages change; arm does not slide).
+    if (this.heldItem === 'bow') {
+      this.applyBowArmPose()
+      return
+    }
+
+    if (
+      this.heldItem === 'spear' ||
+      this.heldItem === 'iron_spear' ||
+      this.heldItem === 'gold_spear' ||
+      this.heldItem === 'diamond_spear'
+    ) {
+      const mesh = this.heldMeshes.get(this.heldItem)
       if (mesh) mesh.visible = true
     }
 
-    if (active) {
-      this.swingCooldown -= dt
-      if (this.swingCooldown <= 0) this.whack()
-    } else {
-      this.swingCooldown = 0
+    if (active || this.swingPending || this.swingCooldown > 0) {
+      this.swingCooldown = Math.max(0, this.swingCooldown - dt)
+    }
+    // Hold-to-repeat, or a buffered click after reload — never restart mid-swing.
+    if (
+      (active || this.swingPending) &&
+      this.swingT <= 0 &&
+      this.swingCooldown <= 0
+    ) {
+      this.beginSwing()
     }
 
     if (this.swingT <= 0) {
@@ -438,6 +424,6 @@ export class ViewmodelHand {
     const swingProgress = 1 - this.swingT
 
     this.group.rotation.y = BASE_YAW
-    applyMinecraftSwingRotation(swingProgress, this.swingPivot)
+    applySwingPose(swingProgress, this.swingPivot)
   }
 }

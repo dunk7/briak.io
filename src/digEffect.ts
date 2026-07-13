@@ -276,6 +276,7 @@ export class DigBreakEffect {
       const matrixAutoUpdate = obj.matrixAutoUpdate
       let worldPivot: THREE.Vector3 | null = null
       if (!matrixAutoUpdate) {
+        obj.updateMatrix()
         obj.updateMatrixWorld(true)
         _box.setFromObject(obj)
         if (!_box.isEmpty()) worldPivot = _box.getCenter(new THREE.Vector3())

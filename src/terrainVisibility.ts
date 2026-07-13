@@ -6,7 +6,10 @@ import type { VoxelInstancer, VoxelCellRef } from './voxelInstancing'
 export const DEFAULT_VOXEL_RADIUS = 58
 export const DEFAULT_CHUNK_RADIUS = 95
 
-export type VisibilityCell = SurfaceChunkCell & VoxelCellRef
+export type VisibilityCell = SurfaceChunkCell & VoxelCellRef & {
+  _voxelVisible?: boolean
+  _surfaceVisible?: boolean
+}
 
 export type VisibilityContext = {
   cells: Map<string, VisibilityCell>
@@ -26,6 +29,8 @@ export type VisibilityContext = {
   voxelRadius: number
   /** Cells with voxel layers currently shown (for hide-when-left-range). */
   voxelVisibleSet: Set<VisibilityCell>
+  /** Kept for API compatibility; surface culling uses merged chunk meshes. */
+  surfaceVisibleSet: Set<VisibilityCell>
 }
 
 function worldToCellIndex(
@@ -37,7 +42,11 @@ function worldToCellIndex(
   return THREE.MathUtils.clamp(Math.floor((p - gridMin) / cellSize), 0, gridSpan - 1)
 }
 
-/** Distance culling for chunk meshes, source roots (raycast), and voxel instances. */
+/**
+ * Distance culling for merged chunk meshes and voxel instances.
+ * Individual `cell.surfaceRoot`s stay hidden after merge — never toggle them here
+ * or every cell's source geometry will draw on top of the merged chunks.
+ */
 export function updateTerrainVisibility(
   px: number,
   pz: number,

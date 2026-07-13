@@ -82,11 +82,12 @@ void main() {
   density = density * density;
 
   vec3 dayCol = mix(vec3(0.94, 0.96, 1.0), uSunColor, 0.14);
-  vec3 nightCol = mix(vec3(0.14, 0.18, 0.32), uSkyTint * 0.55, 0.5);
+  // Night clouds nearly vanish into the black sky.
+  vec3 nightCol = mix(vec3(0.02, 0.03, 0.05), uSkyTint, 0.35);
   vec3 col = mix(dayCol, nightCol, uNight);
 
   float dayAlpha = density * 0.78;
-  float nightAlpha = density * 0.08;
+  float nightAlpha = density * 0.02;
   float alpha = mix(dayAlpha, nightAlpha, uNight);
 
   if (alpha < 0.004) discard;
@@ -118,7 +119,8 @@ function createCloudDome(sunColor: THREE.Color, skyTint: THREE.Color): THREE.Mes
     opacity: 1,
     depthWrite: false,
     depthTest: false,
-    fog: true,
+    // Custom shader has no fog uniforms/chunks — fog:true crashes refreshFogUniforms.
+    fog: false,
     side: THREE.BackSide,
     blending: THREE.NormalBlending,
   })
@@ -392,11 +394,11 @@ export function createSkyDecor(scene: THREE.Scene): SkyDecor {
       cloudUniforms.uCameraPos.value.copy(_camPos)
       ;(cloudDome.material as THREE.ShaderMaterial).opacity = fade
 
-      const starOpacity = fade * night * (0.65 + twilight * 0.2)
+      const starOpacity = fade * night * (0.95 + twilight * 0.15)
       starUniforms.uOpacity.value = starOpacity
       starUniforms.uTime.value = elapsedSec
 
-      const moonFade = fade * THREE.MathUtils.smoothstep(night, 0.2, 0.6)
+      const moonFade = fade * THREE.MathUtils.smoothstep(night, 0.12, 0.48)
       _moonDir.copy(sunDirection).multiplyScalar(-1)
       if (_moonDir.y < 0.15) _moonDir.y = 0.15
       _moonDir.normalize()
@@ -411,7 +413,7 @@ export function createSkyDecor(scene: THREE.Scene): SkyDecor {
       discMat.opacity = moonFade
       glowMat.uniforms.uOpacity.value = moonFade
       glowMat.uniforms.uCameraPos.value.copy(cameraPosition)
-      haloMat.uniforms.uOpacity.value = 0.38 * moonFade
+      haloMat.uniforms.uOpacity.value = 0.5 * moonFade
     },
     dispose,
   }

@@ -24,6 +24,9 @@ const GROUND_ACCEL = 52
 const AIR_ACCEL = 14
 const GROUND_DRAG = 14
 const AIR_DRAG = 2
+/** Grounded with no input: kill residual horizontal speed below this (m/s). */
+const IDLE_STOP_SPEED = 0.12
+const IDLE_STOP_SPEED_SQ = IDLE_STOP_SPEED * IDLE_STOP_SPEED
 const MAX_FALL = 55
 const STEP_HEIGHT = 0.55
 const COYOTE_SEC = 0.1
@@ -33,7 +36,19 @@ const LAND_BOB = 0.06
 const SPAWN_CLEARANCE = 0.35
 // Max drop a grounded player stays glued to while walking downhill before going airborne.
 const STICK_DOWN = 0.6
+/** Idle stick distance — enough to stay planted on moderate slopes without sliding. */
+const IDLE_STICK_DOWN = 0.45
 const GROUND_PROBE_EPS = 0.06
+/**
+ * Max ground rise/run while idle before we allow sliding (≈50°).
+ * Shallower slopes plant the feet; steeper ones can still slip.
+ */
+const IDLE_MAX_SLOPE = 1.2
+const IDLE_SLOPE_SAMPLE = 0.28
+/** Max drop allowed while Shift-sneaking before the step is blocked. */
+const SNEAK_EDGE_DROP = 0.4
+/** Sneak walk speed as a fraction of walk speed. */
+const SNEAK_SPEED_RATIO = 0.35
 const RESOLVE_ITERS = 5
 const LOOK_SENSITIVITY_SCALE = 0.002
 const PI_2 = Math.PI / 2
@@ -50,6 +65,8 @@ export type PlayerInput = {
   left: boolean
   right: boolean
   sprint: boolean
+  /** Shift: slow walk + stop at ledge edges. */
+  sneak: boolean
   jump: boolean
 }
 
@@ -86,17 +103,93 @@ export class PlayerController {
   private displayBob = 0
   private wasGrounded = false
   private lookSpeed = DEFAULT_LOOK_SPEED
+  /** Extra multiplier (e.g. bow ADS); kept separate from the user look-speed setting. */
+  private lookSensitivityScale = 1
   private pendingLookX = 0
   private pendingLookY = 0
+  /** Ignore look deltas until this time (ms) after pointer lock — cursor recenter warp. */
+  private suppressLookUntil = 0
   private knockbackTimer = 0
   private hurtShakeTime = 0
   private hurtShakeSign = 1
   private readonly hurtShakeQuat = new THREE.Quaternion()
   private readonly hurtShakeEuler = new THREE.Euler(0, 0, 0, 'YXZ')
-  private readonly onLookMouseMove = (e: MouseEvent) => {
+  /** True while a requestPointerLock() promise is in flight. */
+  private lockPending = false
+  /** Ignore lock attempts until this time (ms) — Chrome Esc cooldown / failed lock. */
+  private lockCooldownUntil = 0
+  /**
+   * Chromium coalesces `mousemove` to the animation frame, which makes look
+   * feel like sparse ticks. Prefer `pointerrawupdate` when it actually delivers
+   * deltas; fall back to mousemove if raw events are absent (Firefox / quirks).
+   */
+  private readonly supportsPointerRawUpdate =
+    typeof document !== 'undefined' && 'onpointerrawupdate' in document
+  private lastRawLookMs = 0
+  /** After clicks, discard look spikes — normal aiming still works after a brief suppress. */
+  private lookSpikeGuardUntil = 0
+  /**
+   * Pixels of movementX/Y treated as a click/release warp under pointer lock.
+   * Kept low: browsers often split the warp into several mid-size deltas that
+   * still twitch the view ("up and right") after the huge spike is filtered.
+   */
+  private static readonly LOOK_SPIKE_PX = 4
+  /** Hard-suppress look this long after a click so sub-threshold residuals die. */
+  private static readonly LOOK_CLICK_SUPPRESS_MS = 50
+
+  /** First-person lie-down pose (bed sleep). */
+  private lyingDown = false
+  private readonly sleepCamFrom = new THREE.Vector3()
+  private readonly sleepCamTarget = new THREE.Vector3()
+  private readonly sleepEulerFrom = new THREE.Euler(0, 0, 0, 'YXZ')
+  private readonly sleepEulerTo = new THREE.Euler(0, 0, 0, 'YXZ')
+  private sleepBlend = 1
+  /** Base recline: nearly straight up at the sky. */
+  private static readonly SLEEP_PITCH = -1.42
+  /** How far you can glance left/right while asleep (~40°). */
+  private static readonly SLEEP_YAW_RANGE = 0.7
+  /** Pitch clamp while asleep — stay looking mostly up. */
+  private static readonly SLEEP_PITCH_MIN = -1.55
+  private static readonly SLEEP_PITCH_MAX = -0.95
+
+  private enqueueLookDelta(dx: number, dy: number) {
+    if (dx === 0 && dy === 0) return
     if (!this.controls.isLocked) return
-    this.pendingLookX += e.movementX
-    this.pendingLookY += e.movementY
+    if (performance.now() < this.suppressLookUntil) return
+    // Click/release under pointer lock can inject a huge reversed delta; drop
+    // only those outliers so the camera doesn't freeze on every attack.
+    if (
+      performance.now() < this.lookSpikeGuardUntil &&
+      (Math.abs(dx) > PlayerController.LOOK_SPIKE_PX ||
+        Math.abs(dy) > PlayerController.LOOK_SPIKE_PX)
+    ) {
+      return
+    }
+    this.pendingLookX += dx
+    this.pendingLookY += dy
+  }
+
+  private readonly onLookPointerRaw = (e: PointerEvent) => {
+    if (e.pointerType !== 'mouse') return
+    this.lastRawLookMs = performance.now()
+    this.enqueueLookDelta(e.movementX, e.movementY)
+  }
+
+  private readonly onLookMouseMove = (e: MouseEvent) => {
+    // Skip coalesced mousemove while raw updates are actively arriving.
+    if (
+      this.supportsPointerRawUpdate &&
+      performance.now() - this.lastRawLookMs < 120
+    ) {
+      return
+    }
+    this.enqueueLookDelta(e.movementX, e.movementY)
+  }
+
+  private readonly onPointerLockError = () => {
+    this.lockPending = false
+    // Chromium blocks re-lock for ~1.25s after Esc; keep retrying from spamming the console.
+    this.lockCooldownUntil = performance.now() + 1300
   }
 
   constructor(camera: THREE.PerspectiveCamera, domElement: HTMLElement) {
@@ -104,10 +197,29 @@ export class PlayerController {
     this.camera.near = 0.05
     this.camera.updateProjectionMatrix()
     this.controls = new PointerLockControls(camera, domElement)
-    // Rotation is applied in update() from accumulated deltas so look speed
-    // stays consistent when the main thread drops or coalesces mousemove events.
+    // Rotation is applied from accumulated deltas in update/flushLook so look
+    // stays consistent when the main thread drops or coalesces input events.
     this.controls.enabled = false
-    domElement.ownerDocument.addEventListener('mousemove', this.onLookMouseMove)
+    const doc = domElement.ownerDocument
+    if (this.supportsPointerRawUpdate) {
+      doc.addEventListener('pointerrawupdate', this.onLookPointerRaw as EventListener)
+    }
+    doc.addEventListener('mousemove', this.onLookMouseMove)
+    doc.addEventListener('pointerlockerror', this.onPointerLockError)
+    this.controls.addEventListener('lock', () => {
+      this.lockPending = false
+      this.lockCooldownUntil = 0
+      // Pointer lock recenters the cursor; browsers emit a large movementX/Y
+      // warp that would snap the view (e.g. closing inventory and re-locking).
+      this.pendingLookX = 0
+      this.pendingLookY = 0
+      this.suppressLookUntil = performance.now() + 80
+    })
+    this.controls.addEventListener('unlock', () => {
+      this.lockPending = false
+      this.pendingLookX = 0
+      this.pendingLookY = 0
+    })
   }
 
   setGravity(value: number) {
@@ -154,12 +266,49 @@ export class PlayerController {
     return this.eyeHeight
   }
 
+  /**
+   * Ignore look briefly (ms). Only for pointer-lock recenter warps — not clicks,
+   * which would freeze aiming on every attack.
+   */
+  suppressLook(ms = 60) {
+    this.suppressLookUntil = Math.max(this.suppressLookUntil, performance.now() + ms)
+    this.pendingLookX = 0
+    this.pendingLookY = 0
+  }
+
+  /**
+   * After a click/release under pointer lock, discard look warps.
+   * Hard-suppresses for ~1–2 frames (kills mid-size residuals), then only
+   * drops oversized deltas so aiming isn't frozen for the whole guard window.
+   */
+  guardLookSpikes(ms = 100) {
+    const now = performance.now()
+    this.lookSpikeGuardUntil = Math.max(this.lookSpikeGuardUntil, now + ms)
+    // Sub-threshold click warps still twitch the camera; blank look briefly.
+    this.suppressLookUntil = Math.max(
+      this.suppressLookUntil,
+      now + PlayerController.LOOK_CLICK_SUPPRESS_MS,
+    )
+    // The warp often lands in pending before mousedown/up runs — drop it.
+    this.pendingLookX = 0
+    this.pendingLookY = 0
+  }
+
   setLookSpeed(value: number) {
     this.lookSpeed = Math.max(0.1, Math.min(8, value))
   }
 
   getLookSpeed() {
     return this.lookSpeed
+  }
+
+  /** Temporary look multiplier (1 = normal). Used for bow zoom, etc. */
+  setLookSensitivityScale(value: number) {
+    this.lookSensitivityScale = Math.max(0.05, Math.min(2, value))
+  }
+
+  getLookSensitivityScale() {
+    return this.lookSensitivityScale
   }
 
   setCollisionWorld(world: CollisionWorld) {
@@ -170,18 +319,236 @@ export class PlayerController {
     this.terrain = collider
   }
 
+  /**
+   * Apply any pointer deltas that arrived during the frame (after physics).
+   * Long frames otherwise present last-frame look while new deltas sit queued —
+   * feels like low fps even when RAF is at 60.
+   */
+  flushLook() {
+    if (this.lyingDown) {
+      // After the lie-down settle, allow a little look-around on the mattress.
+      if (this.sleepBlend >= 1) this.consumeSleepLook()
+      else {
+        this.pendingLookX = 0
+        this.pendingLookY = 0
+      }
+      this.camera.position.copy(this.sleepCamTarget)
+      return
+    }
+    this.consumeLook()
+  }
+
+  isLyingDown() {
+    return this.lyingDown
+  }
+
+  /**
+   * Lie down for bed sleep — camera lerps onto the mattress looking up at the
+   * sky. After settling you can glance around a little until `getUp`.
+   */
+  lieDown(camTarget: THREE.Vector3, lookYaw: number) {
+    this.sleepCamFrom.copy(this.camera.position)
+    this.sleepEulerFrom.copy(this.euler)
+    this.sleepCamTarget.copy(camTarget)
+    // Reclined on your back: pitch nearly straight up, facing the foot of the bed.
+    this.sleepEulerTo.set(PlayerController.SLEEP_PITCH, lookYaw, 0)
+    this.sleepBlend = 0
+    this.lyingDown = true
+    this.velocity.set(0, 0, 0)
+    this.pendingLookX = 0
+    this.pendingLookY = 0
+    this.displayBob = 0
+    this.landBob = 0
+    this.hurtShakeTime = 0
+    // Keep the capsule under the bed so death-drops / world queries stay nearby.
+    this.object.position.set(camTarget.x, camTarget.y - 0.2, camTarget.z)
+  }
+
+  /** Advance the lie-down camera blend / limited sleep look. */
+  updateLieDown(dt: number) {
+    if (!this.lyingDown) return
+    this.sleepBlend = Math.min(1, this.sleepBlend + dt * 2.8)
+    const t = this.sleepBlend * this.sleepBlend * (3 - 2 * this.sleepBlend)
+    this.camera.position.lerpVectors(this.sleepCamFrom, this.sleepCamTarget, t)
+
+    if (this.sleepBlend < 1) {
+      this.pendingLookX = 0
+      this.pendingLookY = 0
+      this.euler.x = THREE.MathUtils.lerp(this.sleepEulerFrom.x, this.sleepEulerTo.x, t)
+      let dy = this.sleepEulerTo.y - this.sleepEulerFrom.y
+      while (dy > Math.PI) dy -= Math.PI * 2
+      while (dy < -Math.PI) dy += Math.PI * 2
+      this.euler.y = this.sleepEulerFrom.y + dy * t
+      this.euler.z = 0
+      this.camera.quaternion.setFromEuler(this.euler)
+      this.camera.matrixWorldNeedsUpdate = true
+      return
+    }
+
+    this.camera.position.copy(this.sleepCamTarget)
+    this.consumeSleepLook()
+  }
+
+  /** Limited mouse-look while asleep — stay reclined looking mostly upward. */
+  private consumeSleepLook() {
+    if (!this.controls.isLocked) {
+      this.pendingLookX = 0
+      this.pendingLookY = 0
+      this.camera.quaternion.setFromEuler(this.euler)
+      this.camera.matrixWorldNeedsUpdate = true
+      return
+    }
+    if (performance.now() < this.suppressLookUntil) {
+      this.pendingLookX = 0
+      this.pendingLookY = 0
+      this.camera.quaternion.setFromEuler(this.euler)
+      this.camera.matrixWorldNeedsUpdate = true
+      return
+    }
+    if (this.pendingLookX !== 0 || this.pendingLookY !== 0) {
+      if (
+        performance.now() < this.lookSpikeGuardUntil &&
+        (Math.abs(this.pendingLookX) > PlayerController.LOOK_SPIKE_PX ||
+          Math.abs(this.pendingLookY) > PlayerController.LOOK_SPIKE_PX)
+      ) {
+        this.pendingLookX = 0
+        this.pendingLookY = 0
+      } else {
+        const scale =
+          LOOK_SENSITIVITY_SCALE * this.lookSpeed * this.lookSensitivityScale * 0.65
+        this.euler.y -= this.pendingLookX * scale
+        this.euler.x -= this.pendingLookY * scale
+        this.pendingLookX = 0
+        this.pendingLookY = 0
+      }
+    }
+
+    this.euler.x = THREE.MathUtils.clamp(
+      this.euler.x,
+      PlayerController.SLEEP_PITCH_MIN,
+      PlayerController.SLEEP_PITCH_MAX,
+    )
+    let yawDelta = this.euler.y - this.sleepEulerTo.y
+    while (yawDelta > Math.PI) yawDelta -= Math.PI * 2
+    while (yawDelta < -Math.PI) yawDelta += Math.PI * 2
+    yawDelta = THREE.MathUtils.clamp(
+      yawDelta,
+      -PlayerController.SLEEP_YAW_RANGE,
+      PlayerController.SLEEP_YAW_RANGE,
+    )
+    this.euler.y = this.sleepEulerTo.y + yawDelta
+    this.euler.z = 0
+    this.camera.quaternion.setFromEuler(this.euler)
+    this.camera.matrixWorldNeedsUpdate = true
+  }
+
+  /** Stand up beside the bed (or at fallback) and clear the sleep pose. */
+  getUp(x: number, z: number, fallbackY: number) {
+    const wakeYaw = this.euler.y
+    this.lyingDown = false
+    this.sleepBlend = 1
+    this.pendingLookX = 0
+    this.pendingLookY = 0
+    this.spawnAt(x, z, fallbackY)
+    this.euler.set(-0.12, wakeYaw, 0)
+    this.camera.quaternion.setFromEuler(this.euler)
+    this.syncCamera(false, false, 1 / 60)
+  }
+
+  /** Drain pending look into the camera. Safe to call multiple times per frame. */
+  private consumeLook() {
+    if (!this.controls.isLocked) {
+      this.pendingLookX = 0
+      this.pendingLookY = 0
+      return
+    }
+    if (performance.now() < this.suppressLookUntil) {
+      this.pendingLookX = 0
+      this.pendingLookY = 0
+      return
+    }
+    if (this.pendingLookX === 0 && this.pendingLookY === 0) return
+    // Multi-event click warps can arrive as several sub-threshold deltas; if the
+    // frame total is still a spike while guarded, drop the batch.
+    if (
+      performance.now() < this.lookSpikeGuardUntil &&
+      (Math.abs(this.pendingLookX) > PlayerController.LOOK_SPIKE_PX ||
+        Math.abs(this.pendingLookY) > PlayerController.LOOK_SPIKE_PX)
+    ) {
+      this.pendingLookX = 0
+      this.pendingLookY = 0
+      return
+    }
+    this.applyLookDelta(this.pendingLookX, this.pendingLookY)
+    this.pendingLookX = 0
+    this.pendingLookY = 0
+  }
+
   isLocked() {
     return this.controls.isLocked
   }
 
+  /**
+   * Request pointer lock. Falls back if `unadjustedMovement` is unsupported,
+   * swallows promise rejections, and rate-limits retries so Esc-cooldown /
+   * held WASD don't flood the console.
+   */
   lock() {
-    this.controls.lock(true)
-    this.euler.setFromQuaternion(this.camera.quaternion, 'YXZ')
+    if (this.controls.isLocked || this.lockPending) return
+    if (performance.now() < this.lockCooldownUntil) return
+
+    const el = this.controls.domElement
+    if (!el) return
+
+    this.lockPending = true
+    // Keep euler as the authoritative look — camera.quaternion may include
+    // transient hurt-shake offset, which must not bake into yaw/pitch.
+    this.camera.quaternion.setFromEuler(this.euler)
+    this.pendingLookX = 0
+    this.pendingLookY = 0
+
+    const request = (unadjusted: boolean) => {
+      let result: Promise<void> | void
+      try {
+        result = unadjusted
+          ? el.requestPointerLock({ unadjustedMovement: true })
+          : el.requestPointerLock()
+      } catch {
+        if (unadjusted) {
+          request(false)
+          return
+        }
+        this.lockPending = false
+        this.lockCooldownUntil = performance.now() + 1300
+        return
+      }
+
+      if (result && typeof (result as Promise<void>).then === 'function') {
+        ;(result as Promise<void>).then(
+          () => {
+            this.lockPending = false
+          },
+          () => {
+            // Raw-input lock unsupported or Esc cooldown — retry plain, then back off.
+            if (unadjusted) {
+              request(false)
+              return
+            }
+            this.lockPending = false
+            this.lockCooldownUntil = performance.now() + 1300
+          },
+        )
+      } else {
+        this.lockPending = false
+      }
+    }
+
+    request(true)
   }
 
   private applyLookDelta(dx: number, dy: number) {
     if (dx === 0 && dy === 0) return
-    const scale = LOOK_SENSITIVITY_SCALE * this.lookSpeed
+    const scale = LOOK_SENSITIVITY_SCALE * this.lookSpeed * this.lookSensitivityScale
     this.euler.y -= dx * scale
     this.euler.x -= dy * scale
     this.euler.x = Math.max(
@@ -189,6 +556,9 @@ export class PlayerController {
       Math.min(PI_2 - this.controls.minPolarAngle, this.euler.x),
     )
     this.camera.quaternion.setFromEuler(this.euler)
+    // setFromEuler syncs camera.rotation via onChange but does not mark the
+    // world matrix dirty by itself in all paths — force a recompose before render.
+    this.camera.matrixWorldNeedsUpdate = true
   }
 
   // --- Box broadphase ------------------------------------------------------
@@ -208,7 +578,11 @@ export class PlayerController {
   }
 
   /** Push the capsule out of all nearby terrain triangles and voxel/prop boxes. */
-  private resolveCapsule(iterations = RESOLVE_ITERS) {
+  private resolveCapsule(
+    iterations = RESOLVE_ITERS,
+    lockVertical = false,
+    lockHorizontal = false,
+  ) {
     const terrain = this.terrain
     const world = this.world
     if (!terrain || !world) {
@@ -221,7 +595,71 @@ export class PlayerController {
       world.boxes,
       this.nearbyBoxIndices(),
       iterations,
+      true,
+      lockVertical,
+      lockHorizontal,
     )
+  }
+
+  /**
+   * Approximate ground steepness under the feet (rise/run). Returns 0 on flat /
+   * unknown ground. Used to decide whether idle standing should plant or slide.
+   */
+  private estimateGroundSlope(): number {
+    const pos = this.object.position
+    const center = this.probeGround(IDLE_STICK_DOWN + 0.2)
+    if (center === null) return 0
+    const s = IDLE_SLOPE_SAMPLE
+    const samples = [
+      this.probeGroundAt(pos.x + s, pos.z, center),
+      this.probeGroundAt(pos.x - s, pos.z, center),
+      this.probeGroundAt(pos.x, pos.z + s, center),
+      this.probeGroundAt(pos.x, pos.z - s, center),
+    ]
+    let maxRise = 0
+    for (let i = 0; i < samples.length; i++) {
+      const y = samples[i]
+      if (y === null) continue
+      maxRise = Math.max(maxRise, Math.abs(y - center))
+    }
+    return maxRise / s
+  }
+
+  private probeGroundAt(x: number, z: number, nearY: number): number | null {
+    const maxDrop = IDLE_STICK_DOWN + 0.35
+    let best: number | null = null
+    const terrain = this.terrain
+    if (terrain) {
+      const ty = terrain.raycastDownY(x, z, nearY + GROUND_PROBE_EPS, maxDrop + 0.3)
+      if (
+        ty !== null &&
+        ty <= nearY + GROUND_PROBE_EPS + 0.15 &&
+        ty >= nearY - maxDrop
+      ) {
+        best = ty
+      }
+    }
+    const world = this.world
+    if (world) {
+      const indices = world.queryNear(
+        x,
+        z,
+        PLAYER_RADIUS + 0.3,
+        nearY - maxDrop - 0.3,
+        nearY + GROUND_PROBE_EPS + 0.2,
+        true,
+      )
+      const boxes = world.boxes
+      for (let i = 0; i < indices.length; i++) {
+        const box = boxes[indices[i]!]!
+        if (!xzOverlaps(x, z, PLAYER_RADIUS, box)) continue
+        const top = box.max.y
+        if (top > nearY + GROUND_PROBE_EPS + 0.15) continue
+        if (top < nearY - maxDrop) continue
+        if (best === null || top > best) best = top
+      }
+    }
+    return best
   }
 
   /**
@@ -294,20 +732,33 @@ export class PlayerController {
     z: number,
     feetY: number,
     stepHeight = STEP_HEIGHT,
+    recoverBelow = 1.85,
   ): number | null {
-    const recoverBelow = 1.85
     const maxAbove = stepHeight + 0.05
     const minBelow = feetY - stepHeight - recoverBelow
 
     let best: number | null = null
     const terrain = this.terrain
     if (terrain) {
-      const ty = terrain.raycastDownY(x, z, feetY + 1.5, stepHeight + 3)
+      const ty = terrain.raycastDownY(
+        x,
+        z,
+        feetY + 1.5,
+        stepHeight + recoverBelow + 2,
+      )
       if (ty !== null && ty <= feetY + maxAbove && ty >= minBelow) best = ty
     }
     const world = this.world
     if (world) {
-      const bw = world.findGroundTop(x, feetY, z, PLAYER_RADIUS, stepHeight)
+      const bw = world.findGroundTop(
+        x,
+        feetY,
+        z,
+        PLAYER_RADIUS,
+        stepHeight,
+        false,
+        recoverBelow,
+      )
       if (bw !== null && bw <= feetY + maxAbove && bw >= minBelow) {
         if (best === null) {
           best = bw
@@ -353,17 +804,22 @@ export class PlayerController {
   }
 
   update(dt: number, input: PlayerInput) {
-    if (this.controls.isLocked) {
-      this.applyLookDelta(this.pendingLookX, this.pendingLookY)
+    if (this.lyingDown) {
+      this.updateLieDown(dt)
+      return
     }
-    this.pendingLookX = 0
-    this.pendingLookY = 0
+    this.consumeLook()
 
     if (input.jump && !this.jumpKeyPrev) this.jumpQueued = true
     if (!input.jump) this.jumpQueued = false
     this.jumpKeyPrev = input.jump
 
-    const speed = input.sprint ? this.runSpeed : this.walkSpeed
+    const sneak = input.sneak && this.grounded
+    const speed = sneak
+      ? this.walkSpeed * SNEAK_SPEED_RATIO
+      : input.sprint
+        ? this.runSpeed
+        : this.walkSpeed
 
     this.controls.getDirection(this.lookFlat)
     this.lookFlat.y = 0
@@ -408,6 +864,7 @@ export class PlayerController {
 
     if (
       this.jumpQueued &&
+      !input.sneak &&
       (this.grounded || this.coyoteTimer > 0) &&
       this.jumpSpeed > 0
     ) {
@@ -435,7 +892,19 @@ export class PlayerController {
     if (this.grounded && this.velocity.y < 0) this.velocity.y = 0
     this.velocity.y = Math.max(this.velocity.y, -MAX_FALL)
 
-    this.moveAndCollide(dt)
+    const wantsMove = this.wishVel.lengthSq() > 0.01
+    this.moveAndCollide(dt, wantsMove, sneak)
+
+    if (
+      this.grounded &&
+      !wantsMove &&
+      this.knockbackTimer <= 0 &&
+      this.velocity.x * this.velocity.x + this.velocity.z * this.velocity.z <
+        IDLE_STOP_SPEED_SQ
+    ) {
+      this.velocity.x = 0
+      this.velocity.z = 0
+    }
 
     const moving =
       this.grounded &&
@@ -456,27 +925,84 @@ export class PlayerController {
     this.syncCamera(moving, input.sprint, dt)
   }
 
-  private moveAndCollide(dt: number) {
+  private moveAndCollide(dt: number, wantsMove: boolean, sneak: boolean) {
     const wasGrounded = this.grounded
     this.grounded = false
 
-    this.moveHorizontal(this.velocity.x * dt, this.velocity.z * dt, wasGrounded)
+    this.moveHorizontal(this.velocity.x * dt, this.velocity.z * dt, wasGrounded, sneak)
     this.moveVertical(this.velocity.y * dt)
 
     if (this.velocity.y <= 1e-4) {
-      this.snapToGround(wasGrounded)
+      this.snapToGround(wasGrounded, wantsMove)
     }
 
-    // Final cleanup pass to clear any residual penetration after the moves.
-    const hit = this.resolveCapsule(RESOLVE_ITERS)
-    if (hit.grounded && this.velocity.y <= 0) {
+    // Final cleanup: when idle on a walkable slope, freeze feet so contact
+    // normals can't shove us downhill. Steep ground still resolves and can slide.
+    // Never plant while wedged inside a solid — lockHorizontal would turn lateral
+    // depenetration into lift and leave you stuck.
+    const idleOnGround = wasGrounded && !wantsMove && this.knockbackTimer <= 0
+    const wedged = this.capsulePenetratesBoxes()
+    const plantIdle =
+      !wedged && idleOnGround && this.estimateGroundSlope() <= IDLE_MAX_SLOPE
+    let hit = this.resolveCapsule(
+      RESOLVE_ITERS,
+      /* lockVertical */ plantIdle || idleOnGround,
+      /* lockHorizontal */ plantIdle,
+    )
+    if (wedged || this.capsulePenetratesBoxes()) {
+      hit = this.resolveCapsule(14, false, false)
+    }
+    if ((hit.grounded || plantIdle) && this.velocity.y <= 0) {
       this.grounded = true
       this.velocity.y = 0
     }
     if (hit.ceiling && this.velocity.y > 0) this.velocity.y = 0
+    if (plantIdle) {
+      this.velocity.x = 0
+      this.velocity.z = 0
+    }
   }
 
-  private moveHorizontal(dx: number, dz: number, wasGrounded: boolean) {
+  /**
+   * True when the capsule AABB meaningfully overlaps a solid box (not just
+   * resting on a top face). Used to disable idle planting / eject when stuck.
+   */
+  private capsulePenetratesBoxes(): boolean {
+    const world = this.world
+    if (!world) return false
+    const p = this.object.position
+    const indices = this.nearbyBoxIndices()
+    // Shrink slightly so standing on a top face / brushing a wall doesn't count.
+    const skin = PLAYER_RADIUS * 0.4
+    const minX = p.x - PLAYER_RADIUS + skin
+    const maxX = p.x + PLAYER_RADIUS - skin
+    const minY = p.y + skin
+    const maxY = p.y + PLAYER_HEIGHT - skin
+    const minZ = p.z - PLAYER_RADIUS + skin
+    const maxZ = p.z + PLAYER_RADIUS - skin
+    for (let n = 0; n < indices.length; n++) {
+      const box = world.boxes[indices[n]!]
+      if (!box) continue
+      if (
+        maxX > box.min.x &&
+        minX < box.max.x &&
+        maxY > box.min.y &&
+        minY < box.max.y &&
+        maxZ > box.min.z &&
+        minZ < box.max.z
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private moveHorizontal(
+    dx: number,
+    dz: number,
+    wasGrounded: boolean,
+    sneak: boolean,
+  ) {
     const len = Math.sqrt(dx * dx + dz * dz)
     if (len < 1e-9) return
     const steps = Math.min(MAX_MOVE_SUBSTEPS, Math.max(1, Math.ceil(len / MOVE_SUBSTEP)))
@@ -490,7 +1016,17 @@ export class PlayerController {
       const beforeY = pos.y
       pos.x += sx
       pos.z += sz
-      this.resolveCapsule(4)
+      // Lock Y so slope normals don't shove the capsule downhill while moving on XZ.
+      this.resolveCapsule(4, true)
+
+      // Shift-sneak: refuse steps that would walk off a ledge.
+      if (sneak && wasGrounded && !this.hasSneakSupport(beforeY)) {
+        pos.x = beforeX
+        pos.z = beforeZ
+        this.velocity.x = 0
+        this.velocity.z = 0
+        continue
+      }
 
       const achievedX = pos.x - beforeX
       const achievedZ = pos.z - beforeZ
@@ -503,6 +1039,13 @@ export class PlayerController {
         }
       }
     }
+  }
+
+  /** True if feet still have ground within the sneak edge-drop tolerance. */
+  private hasSneakSupport(fromY: number): boolean {
+    const floor = this.probeGround(SNEAK_EDGE_DROP + 0.15)
+    if (floor === null) return false
+    return fromY - floor <= SNEAK_EDGE_DROP
   }
 
   /** Raise the capsule by STEP_HEIGHT, advance, then settle back down onto the ledge. */
@@ -562,20 +1105,31 @@ export class PlayerController {
     }
   }
 
-  private snapToGround(wasGrounded: boolean) {
-    const maxDrop = wasGrounded ? STEP_HEIGHT + STICK_DOWN : GROUND_PROBE_EPS
+  private snapToGround(wasGrounded: boolean, wantsMove: boolean) {
+    const maxDrop = wasGrounded
+      ? wantsMove
+        ? STEP_HEIGHT + STICK_DOWN
+        : IDLE_STICK_DOWN
+      : GROUND_PROBE_EPS
     const floor = this.probeGround(maxDrop)
     if (floor === null) return
     const pos = this.object.position
     const drop = pos.y - floor
     if (drop > maxDrop || drop < -GROUND_PROBE_EPS) return
     pos.y = floor
-    this.resolveCapsule(3)
+    // Idle: freeze feet after snap so slopes don't shove us. Moving: lock Y so
+    // slope normals don't convert walk intent into downhill shove.
+    const plant = !wantsMove && wasGrounded
+    this.resolveCapsule(3, wantsMove || plant, plant)
     if (this.velocity.y < 0) this.velocity.y = 0
     this.grounded = true
   }
 
   syncCamera(moving?: boolean, sprint?: boolean, dt = 1 / 60) {
+    if (this.lyingDown) {
+      this.updateLieDown(0)
+      return
+    }
     const m =
       moving ??
       (this.grounded &&

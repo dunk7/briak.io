@@ -31,7 +31,7 @@ function getTuftGeometry(): THREE.BufferGeometry {
   const colors: number[] = []
   const indices: number[] = []
 
-  const baseCol = new THREE.Color(0x2f5a22)
+  const baseCol = new THREE.Color(0x3a6a28)
   const tipCol = new THREE.Color(0x84d05c)
   const c = new THREE.Color()
 
@@ -74,10 +74,10 @@ function getBladeMaterial(): THREE.MeshStandardMaterial {
     color: 0xffffff,
     vertexColors: true,
     side: THREE.DoubleSide,
-    roughness: 0.88,
+    roughness: 0.82,
     metalness: 0,
-    emissive: 0x0c2208,
-    emissiveIntensity: 0.25,
+    emissive: 0x142e0c,
+    emissiveIntensity: 0.22,
   })
 
   mat.onBeforeCompile = (shader) => {

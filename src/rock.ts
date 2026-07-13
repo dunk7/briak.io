@@ -4,6 +4,10 @@ import type { CollisionWorld } from './collisionWorld'
 import { cellWorldOrigin, type TerrainGrid } from './voxelPlacement'
 import { assignBoxProjectedUVs, getRockMaterial } from './rockTexture'
 import { sampleMeshGroundY } from './terrainGroundRay'
+import {
+  freezeSubtreeMatrices,
+  thawSubtreeMatrices,
+} from './surfacePieceLoader'
 
 /** World units covered by one stone-texture tile across a rock surface. */
 const ROCK_TEXTURE_UNITS_PER_TILE = 0.7
@@ -236,6 +240,9 @@ export function updateRocksPhysics(
     // Resting rocks are inert until terrain changes under them (see wakeRocks).
     if (rock.userData[ROCK_SETTLED_KEY] === true) continue
 
+    // Falling rocks need live matrices; they may have been frozen at spawn.
+    if (!rock.matrixAutoUpdate) thawSubtreeMatrices(rock)
+
     const bottom = rockBottomY(rock)
     const groundY = resolveRockSupportY(
       rock.position.x,
@@ -257,6 +264,8 @@ export function updateRocksPhysics(
       }
       delete rock.userData[ROCK_FALL_VY_KEY]
       rock.userData[ROCK_SETTLED_KEY] = true
+      rock.updateMatrixWorld(true)
+      freezeSubtreeMatrices(rock)
       continue
     }
 
@@ -284,6 +293,7 @@ export function updateRocksPhysics(
 export function wakeRocks(rocks: readonly THREE.Group[]): void {
   for (const rock of rocks) {
     rock.userData[ROCK_SETTLED_KEY] = false
+    thawSubtreeMatrices(rock)
   }
 }
 

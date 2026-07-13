@@ -53,6 +53,20 @@ const _dir = new THREE.Vector3()
 const _invMat = new THREE.Matrix4()
 const _meshBox = new THREE.Box3()
 const _capsuleBox = new THREE.Box3()
+const _xzSphereCenter = new THREE.Vector3()
+
+/** True when a vertical ray at (x,z) can hit this mesh's bounding sphere. */
+function meshMayHitVerticalRay(mesh: THREE.Mesh, x: number, z: number, pad = 0.75): boolean {
+  const geo = mesh.geometry
+  if (!geo.boundingSphere) geo.computeBoundingSphere()
+  const bs = geo.boundingSphere
+  if (!bs) return true
+  _xzSphereCenter.copy(bs.center).applyMatrix4(mesh.matrixWorld)
+  const dx = _xzSphereCenter.x - x
+  const dz = _xzSphereCenter.z - z
+  const r = bs.radius * Math.max(mesh.scale.x, mesh.scale.z) + pad
+  return dx * dx + dz * dz <= r * r
+}
 
 export type CapsuleHit = {
   /** True when geometry pushed the capsule up enough to be considered a floor. */
@@ -77,6 +91,12 @@ export type CapsuleHit = {
 export class CapsuleCollider {
   private chunkRoot: THREE.Object3D | null = null
   private surfaceRoot: THREE.Object3D | null = null
+  /**
+   * When true, collide with distance-culled (invisible) chunk meshes.
+   * Ground probes already hit those meshes for enemies/props; capsule collision
+   * must match or pursuers fall through terrain outside the player's chunk radius.
+   */
+  collideInvisibleChunks = false
 
   setTargets(chunkRoot: THREE.Object3D, surfaceRoot?: THREE.Object3D) {
     this.chunkRoot = chunkRoot
@@ -99,7 +119,8 @@ export class CapsuleCollider {
       const children = this.chunkRoot.children
       for (let i = 0; i < children.length; i++) {
         const mesh = children[i] as THREE.Mesh
-        if (!mesh.visible) continue
+        if (!mesh.visible || !(mesh instanceof THREE.Mesh)) continue
+        if (!meshMayHitVerticalRay(mesh, x, z)) continue
         _raycaster.intersectObject(mesh, false, _rayHits)
       }
     }
@@ -108,6 +129,7 @@ export class CapsuleCollider {
       for (let i = 0; i < children.length; i++) {
         const child = children[i]!
         if (!child.visible || child === this.chunkRoot) continue
+        if (child instanceof THREE.Mesh && !meshMayHitVerticalRay(child, x, z)) continue
         _raycaster.intersectObject(child, true, _rayHits)
       }
     }
@@ -136,7 +158,8 @@ export class CapsuleCollider {
       const children = this.chunkRoot.children
       for (let i = 0; i < children.length; i++) {
         const mesh = children[i] as THREE.Mesh
-        if (!mesh.visible) continue
+        if (!mesh.visible || !(mesh instanceof THREE.Mesh)) continue
+        if (!meshMayHitVerticalRay(mesh, x, z)) continue
         _raycaster.intersectObject(mesh, false, _rayHits)
       }
     }
@@ -145,6 +168,7 @@ export class CapsuleCollider {
       for (let i = 0; i < children.length; i++) {
         const child = children[i]!
         if (!child.visible || child === this.chunkRoot) continue
+        if (child instanceof THREE.Mesh && !meshMayHitVerticalRay(child, x, z)) continue
         _raycaster.intersectObject(child, true, _rayHits)
       }
     }
@@ -169,12 +193,24 @@ export class CapsuleCollider {
     boxes: readonly CollisionBox[],
     boxIndices: readonly number[],
     iterations = 5,
+    collideTerrain = true,
+    lockVertical = false,
+    /** Keep feet XZ fixed (stand planted; depenetrate by lifting instead of sliding). */
+    lockHorizontal = false,
   ): CapsuleHit {
     let pushUpTotal = 0
     let pushDownTotal = 0
     let hitAny = false
+    const lockFeetX = feet.x
+    const lockFeetY = feet.y
+    const lockFeetZ = feet.z
 
     for (let iter = 0; iter < iterations; iter++) {
+      if (lockVertical) feet.y = lockFeetY
+      if (lockHorizontal) {
+        feet.x = lockFeetX
+        feet.z = lockFeetZ
+      }
       // Rebuild the vertical segment from the (possibly moved) feet each iteration.
       _segment.start.set(feet.x, feet.y + radius, feet.z)
       _segment.end.set(feet.x, feet.y + height - radius, feet.z)
@@ -183,13 +219,27 @@ export class CapsuleCollider {
       const beforeY = feet.y
       const beforeZ = feet.z
 
-      this.collideTerrain(_segment, radius)
+      if (collideTerrain) this.collideTerrain(_segment, radius)
       this.collideBoxes(_segment, radius, boxes, boxIndices)
 
       // The segment moved; map it back to a feet position (segment start is feet+radius).
-      const newX = _segment.start.x
-      const newY = _segment.start.y - radius
-      const newZ = _segment.start.z
+      const rawX = _segment.start.x
+      const rawY = _segment.start.y - radius
+      const rawZ = _segment.start.z
+      let newX = rawX
+      let newY = rawY
+      let newZ = rawZ
+      if (lockHorizontal) {
+        const rdx = rawX - lockFeetX
+        const rdz = rawZ - lockFeetZ
+        const rejected = Math.sqrt(rdx * rdx + rdz * rdz)
+        newX = lockFeetX
+        newZ = lockFeetZ
+        // Lateral depenetration on slopes becomes lift so we stay planted without
+        // tunneling into the surface.
+        if (!lockVertical && rejected > 0) newY = rawY + rejected
+      }
+      if (lockVertical) newY = lockFeetY
 
       const dx = newX - beforeX
       const dy = newY - beforeY
@@ -198,8 +248,10 @@ export class CapsuleCollider {
       feet.y = newY
       feet.z = newZ
 
-      if (dy > 0) pushUpTotal += dy
-      else if (dy < 0) pushDownTotal += -dy
+      if (!lockVertical) {
+        if (dy > 0) pushUpTotal += dy
+        else if (dy < 0) pushDownTotal += -dy
+      }
 
       const moved = dx * dx + dy * dy + dz * dz
       if (moved > 1e-12) hitAny = true
@@ -207,7 +259,7 @@ export class CapsuleCollider {
     }
 
     return {
-      grounded: pushUpTotal > 1e-4,
+      grounded: pushUpTotal > 1e-4 || (lockHorizontal && hitAny),
       pushUp: pushUpTotal,
       ceiling: pushDownTotal > 1e-4,
       hit: hitAny,
@@ -221,30 +273,40 @@ export class CapsuleCollider {
     _capsuleBox.min.addScalar(-radius)
     _capsuleBox.max.addScalar(radius)
 
+    const includeHiddenChunks = this.collideInvisibleChunks
     if (this.chunkRoot) {
       const children = this.chunkRoot.children
       for (let i = 0; i < children.length; i++) {
         const mesh = children[i] as THREE.Mesh
-        if (!mesh.visible) continue
-        this.collideMesh(mesh, segment, radius)
+        if (!includeHiddenChunks && !mesh.visible) continue
+        this.collideMesh(mesh, segment, radius, includeHiddenChunks)
       }
     }
     if (this.surfaceRoot) {
+      // Surface-cell GLTFs stay hidden after merge — never collide them, even when
+      // collideInvisibleChunks is on. Traversing hundreds of dig-source meshes
+      // per capsule substep is what melted FPS during night fights.
       const children = this.surfaceRoot.children
       for (let i = 0; i < children.length; i++) {
         const child = children[i]!
         if (!child.visible || child === this.chunkRoot) continue
         child.traverse((node) => {
           if ((node as THREE.Mesh).isMesh) {
-            this.collideMesh(node as THREE.Mesh, segment, radius)
+            this.collideMesh(node as THREE.Mesh, segment, radius, false)
           }
         })
       }
     }
   }
 
-  private collideMesh(mesh: THREE.Mesh, segment: THREE.Line3, radius: number) {
-    if (!mesh?.visible || !(mesh as THREE.Mesh).isMesh) return
+  private collideMesh(
+    mesh: THREE.Mesh,
+    segment: THREE.Line3,
+    radius: number,
+    allowInvisible = false,
+  ) {
+    if (!(mesh as THREE.Mesh).isMesh) return
+    if (!allowInvisible && !mesh.visible) return
     const geo = mesh.geometry as GeometryWithTree
 
     // Cheap broadphase: skip meshes whose world bounds miss the capsule.

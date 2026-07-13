@@ -4,6 +4,11 @@ import { VOXEL_FACE_OVERLAP } from './voxelPlacement'
 export type CollisionBox = {
   min: THREE.Vector3
   max: THREE.Vector3
+  /**
+   * When false, arrows/spears ignore this AABB (mesh raycasts handle trees/rocks).
+   * Walkable prop decks stay solid for the player. Default / undefined = solid.
+   */
+  projectileSolid?: boolean
 }
 
 const _box3 = new THREE.Box3()
@@ -77,6 +82,82 @@ export function feetOverBoxXz(
     feetZ > box.min.z + inset &&
     feetZ < box.max.z - inset
   )
+}
+
+/**
+ * Closest ray–AABB hit along a segment. Writes into `outPoint` / returns distance,
+ * or null when nothing is hit within `maxDist`.
+ */
+export function raycastBoxes(
+  originX: number,
+  originY: number,
+  originZ: number,
+  dirX: number,
+  dirY: number,
+  dirZ: number,
+  maxDist: number,
+  boxes: readonly CollisionBox[],
+  indices: readonly number[],
+  outPoint: THREE.Vector3,
+): number | null {
+  let bestT: number | null = null
+  for (let i = 0; i < indices.length; i++) {
+    const box = boxes[indices[i]!]
+    if (!box) continue
+    // Slab method — tEnter/tExit along the ray for each axis.
+    let tMin = 0
+    let tMax = maxDist
+    const ox = originX
+    const oy = originY
+    const oz = originZ
+    const axes: [number, number, number, number][] = [
+      [dirX, ox, box.min.x, box.max.x],
+      [dirY, oy, box.min.y, box.max.y],
+      [dirZ, oz, box.min.z, box.max.z],
+    ]
+    let miss = false
+    for (let a = 0; a < 3; a++) {
+      const [d, o, bMin, bMax] = axes[a]!
+      if (Math.abs(d) < 1e-12) {
+        if (o < bMin || o > bMax) {
+          miss = true
+          break
+        }
+        continue
+      }
+      const inv = 1 / d
+      let t0 = (bMin - o) * inv
+      let t1 = (bMax - o) * inv
+      if (t0 > t1) {
+        const tmp = t0
+        t0 = t1
+        t1 = tmp
+      }
+      if (t0 > tMin) tMin = t0
+      if (t1 < tMax) tMax = t1
+      if (tMin > tMax) {
+        miss = true
+        break
+      }
+    }
+    if (miss) continue
+    if (tMin < 0) {
+      // Origin inside the box — treat as an immediate hit at the exit face.
+      if (tMax < 0 || tMax > maxDist) continue
+      if (bestT === null || tMax < bestT) {
+        bestT = tMax
+      }
+      continue
+    }
+    if (bestT === null || tMin < bestT) bestT = tMin
+  }
+  if (bestT === null) return null
+  outPoint.set(
+    originX + dirX * bestT,
+    originY + dirY * bestT,
+    originZ + dirZ * bestT,
+  )
+  return bestT
 }
 
 export function findGroundTopInBoxes(
@@ -353,7 +434,10 @@ const _boxPool: CollisionBox[] = []
 
 export function acquireCollisionBox(): CollisionBox {
   const box = _boxPool.pop()
-  if (box) return box
+  if (box) {
+    box.projectileSolid = undefined
+    return box
+  }
   return { min: new THREE.Vector3(), max: new THREE.Vector3() }
 }
 
@@ -397,17 +481,172 @@ export function setBoxFromMesh(box: CollisionBox, mesh: THREE.Mesh, skin = 0) {
   box.max.copy(_box3.max).addScalar(-skin)
 }
 
-/** One AABB per mesh under a loaded object (e.g. trees). */
+/** Crystal berries are visual only — never solid. */
+function meshSkipsPropCollision(mesh: THREE.Mesh): boolean {
+  return mesh.userData.crystalBerry === true
+}
+
+export type AppendBoxesOptions = {
+  /**
+   * False for trees/rocks: player can still walk on prop AABBs, but projectiles
+   * must hit the real mesh (canopy decks stick out into empty air).
+   */
+  projectileSolid?: boolean
+}
+
+/**
+ * One AABB per solid mesh under a loaded object (trees, rocks, …).
+ * Trunks use a slim lower-half footprint; foliage becomes a thin top deck so you
+ * can walk on canopies without sealing gaps between trunks at ground level.
+ */
 export function appendBoxesFromObject(
   root: THREE.Object3D,
   out: CollisionBox[],
   skin = 0,
+  opts?: AppendBoxesOptions,
 ) {
+  const projectileSolid = opts?.projectileSolid
   root.updateWorldMatrix(true, true)
   root.traverse((child) => {
     if (!(child as THREE.Mesh).isMesh) return
+    const mesh = child as THREE.Mesh
+    if (meshSkipsPropCollision(mesh)) return
     const box = acquireCollisionBox()
-    setBoxFromMesh(box, child as THREE.Mesh, skin)
+    if (mesh.userData.treeFoliage === true) {
+      setBoxFromFoliageMesh(box, mesh, skin)
+    } else if (mesh.userData.treeFoliage === false) {
+      setBoxFromTrunkMesh(box, mesh, skin)
+    } else {
+      setBoxFromMesh(box, mesh, skin)
+    }
+    if (projectileSolid === false) box.projectileSolid = false
     out.push(box)
   })
+}
+
+const _trunkLocal = new THREE.Vector3()
+const _trunkWorld = new THREE.Vector3()
+
+/**
+ * Trunk collision from real vertex positions: full height, but XZ footprint from
+ * the lower half only so a flared/irregular trunk doesn't block gaps at head height.
+ */
+function setBoxFromTrunkMesh(box: CollisionBox, mesh: THREE.Mesh, skin = 0) {
+  const geom = mesh.geometry
+  const pos = geom.getAttribute('position') as THREE.BufferAttribute | undefined
+  if (!pos || pos.count === 0) {
+    setBoxFromMesh(box, mesh, skin)
+    return
+  }
+
+  mesh.updateWorldMatrix(true, false)
+  const matrixWorld = mesh.matrixWorld
+
+  let localMinY = Infinity
+  let localMaxY = -Infinity
+  for (let i = 0; i < pos.count; i++) {
+    const y = pos.getY(i)
+    if (y < localMinY) localMinY = y
+    if (y > localMaxY) localMaxY = y
+  }
+  const yRange = localMaxY - localMinY || 1
+  // Lower ~55% of the trunk defines the walkable XZ radius.
+  const xzMaxLocalY = localMinY + yRange * 0.55
+
+  let minX = Infinity
+  let minY = Infinity
+  let minZ = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  let maxZ = -Infinity
+
+  for (let i = 0; i < pos.count; i++) {
+    _trunkLocal.fromBufferAttribute(pos, i)
+    _trunkWorld.copy(_trunkLocal).applyMatrix4(matrixWorld)
+    if (_trunkWorld.y < minY) minY = _trunkWorld.y
+    if (_trunkWorld.y > maxY) maxY = _trunkWorld.y
+    if (_trunkLocal.y > xzMaxLocalY) continue
+    if (_trunkWorld.x < minX) minX = _trunkWorld.x
+    if (_trunkWorld.x > maxX) maxX = _trunkWorld.x
+    if (_trunkWorld.z < minZ) minZ = _trunkWorld.z
+    if (_trunkWorld.z > maxZ) maxZ = _trunkWorld.z
+  }
+
+  if (!Number.isFinite(minX)) {
+    setBoxFromMesh(box, mesh, skin)
+    return
+  }
+
+  box.min.set(minX + skin, minY + skin, minZ + skin)
+  box.max.set(maxX - skin, maxY - skin, maxZ - skin)
+}
+
+/** Minimum canopy-deck thickness in world units (after scale). */
+const FOLIAGE_DECK_MIN_THICKNESS = 0.35
+/** Prefer this fraction of the foliage blob height for the walkable slab. */
+const FOLIAGE_DECK_HEIGHT_FRAC = 0.28
+/**
+ * XZ footprint comes from vertices above this fraction of local height so the
+ * deck is wide enough to walk, without using the full lower canopy equator.
+ */
+const FOLIAGE_DECK_XZ_MIN_FRAC = 0.4
+
+/**
+ * Thin walkable platform near the top of a foliage blob. Full foliage AABBs
+ * seal gaps between trunks; a top-only deck lets you land and walk on canopies.
+ */
+function setBoxFromFoliageMesh(box: CollisionBox, mesh: THREE.Mesh, skin = 0) {
+  const geom = mesh.geometry
+  const pos = geom.getAttribute('position') as THREE.BufferAttribute | undefined
+  if (!pos || pos.count === 0) {
+    setBoxFromMesh(box, mesh, skin)
+    return
+  }
+
+  mesh.updateWorldMatrix(true, false)
+  const matrixWorld = mesh.matrixWorld
+
+  let localMinY = Infinity
+  let localMaxY = -Infinity
+  for (let i = 0; i < pos.count; i++) {
+    const y = pos.getY(i)
+    if (y < localMinY) localMinY = y
+    if (y > localMaxY) localMaxY = y
+  }
+  const yRange = localMaxY - localMinY || 1
+  const xzMinLocalY = localMinY + yRange * FOLIAGE_DECK_XZ_MIN_FRAC
+
+  let minX = Infinity
+  let minZ = Infinity
+  let maxX = -Infinity
+  let maxZ = -Infinity
+  let worldMaxY = -Infinity
+  let worldMinY = Infinity
+
+  for (let i = 0; i < pos.count; i++) {
+    _trunkLocal.fromBufferAttribute(pos, i)
+    _trunkWorld.copy(_trunkLocal).applyMatrix4(matrixWorld)
+    if (_trunkWorld.y > worldMaxY) worldMaxY = _trunkWorld.y
+    if (_trunkWorld.y < worldMinY) worldMinY = _trunkWorld.y
+    if (_trunkLocal.y < xzMinLocalY) continue
+    if (_trunkWorld.x < minX) minX = _trunkWorld.x
+    if (_trunkWorld.x > maxX) maxX = _trunkWorld.x
+    if (_trunkWorld.z < minZ) minZ = _trunkWorld.z
+    if (_trunkWorld.z > maxZ) maxZ = _trunkWorld.z
+  }
+
+  if (!Number.isFinite(minX) || !Number.isFinite(worldMaxY)) {
+    setBoxFromMesh(box, mesh, skin)
+    return
+  }
+
+  const blobHeight = Math.max(0, worldMaxY - worldMinY)
+  const thickness = Math.max(
+    FOLIAGE_DECK_MIN_THICKNESS,
+    blobHeight * FOLIAGE_DECK_HEIGHT_FRAC,
+  )
+  const deckMinY = worldMaxY - thickness
+
+  box.min.set(minX + skin, deckMinY + skin, minZ + skin)
+  box.max.set(maxX - skin, worldMaxY - skin, maxZ - skin)
 }

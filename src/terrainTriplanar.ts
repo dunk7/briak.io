@@ -33,9 +33,17 @@ export function applyTerrainTriplanar(
       'varying vec3 vTriPos;\nvarying vec3 vTriNormal;\nuniform float uTriScale;\n' +
       shader.fragmentShader
         .replace(
+          '#include <normal_fragment_maps>',
+          `#include <normal_fragment_maps>
+          // Soften lighting normals so cell-border creases don't read as voxel outlines.
+          normal = normalize( mix( normal, normalize( vec3( normal.x, max( normal.y, 0.0 ) + 0.35, normal.z ) ), 0.42 ) );`,
+        )
+        .replace(
           '#include <map_fragment>',
           `#ifdef USE_MAP
-            vec3 triW = pow( abs( normalize( vTriNormal ) ), vec3( 4.0 ) );
+            // Soft triplanar blend (low power) — high power draws axis-flip lines on curves.
+            vec3 nTri = normalize( vTriNormal );
+            vec3 triW = pow( abs( nTri ), vec3( 2.5 ) );
             triW /= ( triW.x + triW.y + triW.z );
             vec4 triX = texture2D( map, vTriPos.zy * uTriScale );
             vec4 triY = texture2D( map, vTriPos.xz * uTriScale );
@@ -48,7 +56,8 @@ export function applyTerrainTriplanar(
           '#include <roughnessmap_fragment>',
           `float roughnessFactor = roughness;
           #ifdef USE_ROUGHNESSMAP
-            vec3 rW = pow( abs( normalize( vTriNormal ) ), vec3( 4.0 ) );
+            vec3 nRough = normalize( vTriNormal );
+            vec3 rW = pow( abs( nRough ), vec3( 2.5 ) );
             rW /= ( rW.x + rW.y + rW.z );
             float rX = texture2D( roughnessMap, vTriPos.zy * uTriScale ).g;
             float rY = texture2D( roughnessMap, vTriPos.xz * uTriScale ).g;
@@ -60,7 +69,7 @@ export function applyTerrainTriplanar(
 
   // Keep textured/flat (and roughness) variants in separate program slots.
   material.customProgramCacheKey = () =>
-    'terrain-triplanar:' +
+    'terrain-triplanar-v2:' +
     (material.map ? 'm' : '') +
     (material.roughnessMap ? 'r' : '')
   material.needsUpdate = true
