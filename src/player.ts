@@ -110,6 +110,8 @@ export class PlayerController {
   /** Ignore look deltas until this time (ms) after pointer lock — cursor recenter warp. */
   private suppressLookUntil = 0
   private knockbackTimer = 0
+  /** When true, knockback holds full 3D launch velocity with no air drag. */
+  private launchFlight = false
   private hurtShakeTime = 0
   private hurtShakeSign = 1
   private readonly hurtShakeQuat = new THREE.Quaternion()
@@ -118,6 +120,11 @@ export class PlayerController {
   private lockPending = false
   /** Ignore lock attempts until this time (ms) — Chrome Esc cooldown / failed lock. */
   private lockCooldownUntil = 0
+  /**
+   * Mobile / touch play session without pointer lock. Look + actions use the
+   * same isLocked() gate as desktop pointer-lock play.
+   */
+  private touchPlaying = false
   /**
    * Chromium coalesces `mousemove` to the animation frame, which makes look
    * feel like sparse ticks. Prefer `pointerrawupdate` when it actually delivers
@@ -154,7 +161,7 @@ export class PlayerController {
 
   private enqueueLookDelta(dx: number, dy: number) {
     if (dx === 0 && dy === 0) return
-    if (!this.controls.isLocked) return
+    if (!this.isLocked()) return
     if (performance.now() < this.suppressLookUntil) return
     // Click/release under pointer lock can inject a huge reversed delta; drop
     // only those outliers so the camera doesn't freeze on every attack.
@@ -167,6 +174,11 @@ export class PlayerController {
     }
     this.pendingLookX += dx
     this.pendingLookY += dy
+  }
+
+  /** Touch look pad / external look input (bypasses mouse-only pointerraw filter). */
+  addLookDelta(dx: number, dy: number) {
+    this.enqueueLookDelta(dx, dy)
   }
 
   private readonly onLookPointerRaw = (e: PointerEvent) => {
@@ -391,7 +403,7 @@ export class PlayerController {
 
   /** Limited mouse-look while asleep — stay reclined looking mostly upward. */
   private consumeSleepLook() {
-    if (!this.controls.isLocked) {
+    if (!this.isLocked()) {
       this.pendingLookX = 0
       this.pendingLookY = 0
       this.camera.quaternion.setFromEuler(this.euler)
@@ -457,7 +469,7 @@ export class PlayerController {
 
   /** Drain pending look into the camera. Safe to call multiple times per frame. */
   private consumeLook() {
-    if (!this.controls.isLocked) {
+    if (!this.isLocked()) {
       this.pendingLookX = 0
       this.pendingLookY = 0
       return
@@ -485,15 +497,38 @@ export class PlayerController {
   }
 
   isLocked() {
-    return this.controls.isLocked
+    return this.controls.isLocked || this.touchPlaying
+  }
+
+  isTouchPlaying() {
+    return this.touchPlaying
+  }
+
+  /**
+   * Enter / leave mobile play without pointer lock. Desktop code should keep
+   * using lock() / controls.unlock().
+   */
+  setTouchPlaying(active: boolean) {
+    if (this.touchPlaying === active) return
+    this.touchPlaying = active
+    this.pendingLookX = 0
+    this.pendingLookY = 0
+    if (active) {
+      this.camera.quaternion.setFromEuler(this.euler)
+      this.lockPending = false
+      this.lockCooldownUntil = 0
+      this.suppressLookUntil = performance.now() + 40
+    }
   }
 
   /**
    * Request pointer lock. Falls back if `unadjustedMovement` is unsupported,
    * swallows promise rejections, and rate-limits retries so Esc-cooldown /
    * held WASD don't flood the console.
+   * On touch-primary devices use setTouchPlaying() instead.
    */
   lock() {
+    if (this.touchPlaying) return
     if (this.controls.isLocked || this.lockPending) return
     if (performance.now() < this.lockCooldownUntil) return
 
@@ -779,7 +814,20 @@ export class PlayerController {
     }
     this.velocity.y = Math.max(this.velocity.y, lift)
     this.grounded = false
+    this.launchFlight = false
     this.knockbackTimer = KNOCKBACK_CONTROL_SEC
+  }
+
+  /**
+   * Fling the player with a full 3D velocity (e.g. catapult scoop).
+   * Holds movement override longer and skips air drag so the arc matches a rock.
+   */
+  applyLaunch(vx: number, vy: number, vz: number, controlSec = 2.4) {
+    this.velocity.set(vx, vy, vz)
+    this.grounded = false
+    this.coyoteTimer = 0
+    this.launchFlight = true
+    this.knockbackTimer = Math.max(controlSec, 0.05)
   }
 
   /** Quick decaying camera wobble when taking damage (Minecraft-style). */
@@ -842,11 +890,14 @@ export class PlayerController {
 
     this.knockbackTimer = Math.max(0, this.knockbackTimer - dt)
     if (this.knockbackTimer > 0) {
-      this.horizontal.set(this.velocity.x, 0, this.velocity.z)
-      this.horizontal.multiplyScalar(Math.exp(-AIR_DRAG * 0.4 * dt))
-      this.velocity.x = this.horizontal.x
-      this.velocity.z = this.horizontal.z
+      if (!this.launchFlight) {
+        this.horizontal.set(this.velocity.x, 0, this.velocity.z)
+        this.horizontal.multiplyScalar(Math.exp(-AIR_DRAG * 0.4 * dt))
+        this.velocity.x = this.horizontal.x
+        this.velocity.z = this.horizontal.z
+      }
     } else {
+      this.launchFlight = false
       const accel = this.grounded ? GROUND_ACCEL : AIR_ACCEL
       const drag = this.grounded ? GROUND_DRAG : AIR_DRAG
       this.horizontal.set(this.velocity.x, 0, this.velocity.z)
@@ -878,6 +929,7 @@ export class PlayerController {
     if (this.grounded) {
       this.jetpackFuel = this.jetpackMaxSec
     } else if (
+      !this.launchFlight &&
       input.jump &&
       this.jetpackMaxSec > 0 &&
       this.jetpackFuel > 0
@@ -894,6 +946,11 @@ export class PlayerController {
 
     const wantsMove = this.wishVel.lengthSq() > 0.01
     this.moveAndCollide(dt, wantsMove, sneak)
+
+    if (this.grounded && this.launchFlight) {
+      this.launchFlight = false
+      this.knockbackTimer = 0
+    }
 
     if (
       this.grounded &&

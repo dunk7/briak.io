@@ -20,7 +20,7 @@ import {
 import { DigBreakEffect, type DigBreakOptions } from './digEffect'
 import { DigBlockOutline } from './digBlockOutline'
 import { createDigCrackStageTextures, DigCrackOverlay } from './digCrackOverlay'
-import { Inventory } from './inventory'
+import { Inventory, TOOL_MAX_DURABILITY } from './inventory'
 import { applySurfaceCapMaterials } from './surfaceCapMaterials'
 import {
   findRockPlacements,
@@ -28,7 +28,7 @@ import {
   placeRocks,
   resolveRockGroundY,
   updateRocksPhysics,
-  wakeRocks,
+  wakeRocksNear,
   type RockGroundTargets,
   type RockSpawnOptions,
 } from './rock'
@@ -75,6 +75,7 @@ import {
   createEnemy,
   despawnExpiredEnemies,
   despawnOrphanEnemies,
+  despawnStuckEnemies,
   cullExcessEnemies,
   damageEnemy,
   applyEnemyLightHeight,
@@ -84,7 +85,7 @@ import {
   enemyCrawlSpeedFromSlider,
   enemyLightHeightOffsetFromSlider,
   enemySpawnIntervalFromSlider,
-  ENEMY_BIG_SPAWN_CHANCE,
+  rollEnemySpawnTier,
   ENEMY_MAX_ALIVE,
   ENEMY_KNOCKBACK_LIFT,
   ENEMY_KNOCKBACK_SPEED,
@@ -109,6 +110,26 @@ import { EnemyOrbDrops } from './enemyOrbDrops'
 import { CrystalBerryDrops } from './crystalBerryDrops'
 import { GroundItems } from './groundItems'
 import {
+  clearSpiders,
+  createSpiderNestBeacon,
+  damageSpider,
+  spiderFromIntersection,
+  spiderNestWorldFromSlider,
+  spiderNestRadiusFromSlider,
+  syncSpiderHealthBars,
+  tickSpiderNestSpawns,
+  updateSpiderNestBeacon,
+  updateSpiders,
+  SPIDER_HIT_KNOCKBACK_SPEED,
+  SPIDER_MAX_ALIVE,
+  SPIDER_NEST_ACTIVATION_RANGE,
+  SPIDER_NEST_CENTER_X,
+  SPIDER_NEST_CENTER_Z,
+  SPIDER_SPAWN_INTERVAL,
+  type SpiderDeathContext,
+  type SpiderInstance,
+} from './roboticSpider'
+import {
   applyGraphicsQuality,
   type AdaptiveResolutionPolicy,
   graphicsLightScale,
@@ -126,6 +147,7 @@ import {
   PLAYER_RADIUS,
   type PlayerInput,
 } from './player'
+import { TouchControls } from './touchControls'
 import { CapsuleCollider, registerBVHExtensions } from './meshCollider'
 import {
   BOW_BASE_FOV,
@@ -162,13 +184,22 @@ import {
   type ThrownArrow,
 } from './thrownArrow'
 import {
-  flushPendingSurfaceSources,
+  clearThrownOrbs,
+  hasOrbBlasts,
+  initOrbBlastLightPool,
+  setOrbBlastLightsEnabled,
+  spawnThrownOrb,
+  updateThrownOrbs,
+  type ThrownOrb,
+  type ThrownOrbKind,
+} from './thrownOrb'
+import {
   freezeSubtreeMatrices,
   loadSurfaceCell,
   refreshFrozenMatrixWorld,
   ensureMatrixWorld,
   runLoadPool,
-  sortSurfaceCellsBySpawn,
+  sortSurfaceCellsByDistance,
   SURFACE_LOAD_CONCURRENCY,
   tagSurfaceLayerMeshes,
 } from './surfacePieceLoader'
@@ -177,6 +208,7 @@ import {
   cellHasSurfaceLayer,
   clearSurfaceLayer,
   layerIndexAtY,
+  layerYRange,
   refineVoxelPlacement,
   type OreType,
   type TerrainGrid,
@@ -185,7 +217,7 @@ import {
 import { createRockAlbedoMap } from './rockTexture'
 import { createIronAlbedoMap, IRON_DARK, IRON_MID } from './ironTexture'
 import { createGoldAlbedoMap, GOLD_DARK, GOLD_MID } from './goldTexture'
-import { createDiamondAlbedoMap, DIAMOND_DARK, DIAMOND_MID } from './diamondTexture'
+import { createDiamondAlbedoMap, DIAMOND_MID } from './diamondTexture'
 import { createWoodPlankAlbedoMap, WOOD_MID } from './woodTexture'
 import {
   BlockBuilder,
@@ -203,6 +235,25 @@ import {
 import { PlacedTorchManager } from './placedTorches'
 import { PlacedChestManager } from './placedChests'
 import { PlacedBedManager } from './placedBeds'
+import {
+  PlacedBallistaManager,
+  type BallistaEjectRequest,
+  type BallistaFireRequest,
+} from './placedBallistas'
+import {
+  PlacedCatapultManager,
+  type CatapultEjectRequest,
+  type CatapultFireRequest,
+} from './placedCatapults'
+import {
+  clearThrownCatapultRocks,
+  hasCatapultRockBlasts,
+  initCatapultRockBlastLights,
+  setCatapultRockBlastLightsEnabled,
+  spawnThrownCatapultRock,
+  updateThrownCatapultRocks,
+  type ThrownCatapultRock,
+} from './thrownCatapultRock'
 import {
   isSaplingItem,
   PlantedSaplingManager,
@@ -262,8 +313,6 @@ type Cell = {
   diamondOreLayerMask?: number
   instanceIndex: number
   surfaceRoot?: THREE.Object3D
-  /** Unprocessed GLTF clone for re-splitting grass vs dirt when slope slider changes. */
-  surfaceSource?: THREE.Object3D
   bounds?: { min: number[]; max: number[] }
   capTopY?: number
   voxelBaseY?: number
@@ -333,8 +382,12 @@ let visibilityInterval = 0.2
 const DIG_REACH = 7
 /** Must stand this close to open a chest (meters). Dig reach is longer. */
 const CHEST_OPEN_REACH = 2.75
+/** Catapults are large — allow opening from farther than a chest. */
+const CATAPULT_OPEN_REACH = 4.25
 /** Auto-close when you walk a bit past open reach. */
 const CHEST_OPEN_HOLD_REACH = 3.5
+/** Auto-close distance while a catapult hopper is open. */
+const CATAPULT_OPEN_HOLD_REACH = 5.25
 /** Must stand this close to sleep in a bed (meters). */
 const BED_SLEEP_REACH = 2.75
 /** Total time lying in bed before waking (seconds). */
@@ -351,6 +404,8 @@ const TREE_DIG_TIME_BASE = 2.1
 const TORCH_DIG_TIME_BASE = 0.55
 const CHEST_DIG_TIME_BASE = 1.1
 const BED_DIG_TIME_BASE = 1.1
+const BALLISTA_DIG_TIME_BASE = 1.35
+const CATAPULT_DIG_TIME_BASE = 1.5
 const STONE_PER_ROCK = 3
 const WOOD_PER_TREE = 5
 const LEAVES_PER_SNIP = 1
@@ -395,35 +450,18 @@ function cellToCollision(cell: Cell, layerMask = cell.layerMask): TerrainCellCol
   }
 }
 
-function closestCellAtPoint(
-  point: THREE.Vector3,
-  candidates: Cell[],
-  maxDistSq: number,
-): Cell | null {
-  let best: Cell | null = null
-  let bestD = maxDistSq
-  for (const cell of candidates) {
-    if (!cell.surfaceRoot) continue
-    const dx = cell.centerX - point.x
-    const dz = cell.centerZ - point.z
-    const d = dx * dx + dz * dz
-    if (d < bestD) {
-      bestD = d
-      best = cell
-    }
-  }
-  return best
-}
-
-/** Pick the surface cell under a chunk-mesh hit (grid footprint first, then nearest center). */
+/**
+ * Pick the surface cell under a chunk-mesh hit by XZ footprint only.
+ * Do not fall back to "nearest center" — that mined neighboring columns through walls.
+ */
 function cellFromChunkSurfaceHit(
   point: THREE.Vector3,
   chunkCells: Cell[],
   cellSize: number,
 ): Cell | null {
-  const half = cellSize * 0.51
+  const half = cellSize * 0.5 + 1e-3
   for (const cell of chunkCells) {
-    if (!cell.surfaceRoot) continue
+    if ((cell.surfaceLayerMask ?? 0) === 0 && !cell.surfaceRoot) continue
     if (
       Math.abs(cell.centerX - point.x) <= half &&
       Math.abs(cell.centerZ - point.z) <= half
@@ -431,7 +469,7 @@ function cellFromChunkSurfaceHit(
       return cell
     }
   }
-  return closestCellAtPoint(point, chunkCells, cellSize * cellSize * 2.25)
+  return null
 }
 
 const SUN_DISTANCE = 55
@@ -459,16 +497,50 @@ async function main() {
   const digProgressFill = document.getElementById('dig-progress-fill')!
   const loadingOverlay = document.getElementById('loading-overlay')!
   const loadingLabel = loadingOverlay.querySelector('.loading-label')
+  const loadingBar = loadingOverlay.querySelector('.loading-bar')
+  const loadingBarFill = loadingOverlay.querySelector('.loading-bar-fill') as HTMLElement | null
+  const loadingPct = loadingOverlay.querySelector('.loading-pct')
+
+  /** Boot stages: setup → surface GLBs → chunk merge → props → FPS settle. */
+  const LOAD_W_SETUP = 0.03
+  const LOAD_W_SURFACE = 0.72
+  const LOAD_W_BUILD = 0.17
+  const LOAD_W_PROPS = 0.05
+  const LOAD_W_SETTLE = 0.03
+  const BOOT_FLUSH_MS = 20
+
+  let loadingProgress = 0
 
   const setLoadingLabel = (label: string) => {
     if (loadingLabel) loadingLabel.textContent = label
+    info.textContent = label
+  }
+
+  const setLoadingProgress = (p: number, label?: string) => {
+    loadingProgress = Math.max(0, Math.min(1, p))
+    const pct = Math.round(loadingProgress * 100)
+    if (label) setLoadingLabel(label)
+    if (loadingBarFill) loadingBarFill.style.width = `${pct}%`
+    if (loadingBar) loadingBar.setAttribute('aria-valuenow', String(pct))
+    if (loadingPct) loadingPct.textContent = `${pct}%`
+    digProgressFill.style.setProperty('--dig-deg', `${loadingProgress * 360}deg`)
+  }
+
+  const formatEta = (done: number, total: number, startedAt: number) => {
+    if (done < 3 || total <= 0) return ''
+    const elapsed = performance.now() - startedAt
+    const rate = done / Math.max(elapsed, 1)
+    const remainMs = (total - done) / rate
+    if (!Number.isFinite(remainMs) || remainMs < 400) return ''
+    const sec = Math.max(1, Math.ceil(remainMs / 1000))
+    return ` · ~${sec}s`
   }
 
   const showLoadingOverlay = (label = 'Loading…') => {
     document.body.classList.add('world-loading')
     loadingOverlay.hidden = false
     loadingOverlay.setAttribute('aria-busy', 'true')
-    setLoadingLabel(label)
+    setLoadingProgress(0, label)
   }
 
   const hideLoadingOverlay = () => {
@@ -479,6 +551,7 @@ async function main() {
   }
 
   showLoadingOverlay('Loading…')
+  setLoadingProgress(0.01, 'Loading world…')
 
   const metaRes = await fetch('/assets/terrain/surface_pieces/terrain_meta.json')
   const meta: TerrainMeta = await metaRes.json()
@@ -578,6 +651,7 @@ async function main() {
   const sunDirection = sunDirectionFromAngles(0, 0)
 
   const player = new PlayerController(camera, renderer.domElement)
+  const touchControls = new TouchControls(document.getElementById('controls')!)
 
   // No envMap — hemi + ambient are the only fill for shadowed PBR faces.
   // Keep these strong enough that ground never reads as pitch black in daylight.
@@ -673,6 +747,14 @@ async function main() {
     'enemy-light-height-slider',
   ) as HTMLInputElement
   const enemyLightHeightValue = document.getElementById('enemy-light-height-value')!
+  const spiderNestXSlider = document.getElementById('spider-nest-x-slider') as HTMLInputElement
+  const spiderNestXValue = document.getElementById('spider-nest-x-value')!
+  const spiderNestZSlider = document.getElementById('spider-nest-z-slider') as HTMLInputElement
+  const spiderNestZValue = document.getElementById('spider-nest-z-value')!
+  const spiderNestRadiusSlider = document.getElementById(
+    'spider-nest-radius-slider',
+  ) as HTMLInputElement
+  const spiderNestRadiusValue = document.getElementById('spider-nest-radius-value')!
 
   const tuneSliders: TuneSliderElements = {
     gravity: gravitySlider,
@@ -697,6 +779,9 @@ async function main() {
     enemySpawnRate: enemySpawnRateSlider,
     enemySpeed: enemySpeedSlider,
     enemyLightHeight: enemyLightHeightSlider,
+    spiderNestOffsetX: spiderNestXSlider,
+    spiderNestOffsetZ: spiderNestZSlider,
+    spiderNestRadius: spiderNestRadiusSlider,
   }
   applyTuneFromStorage(tuneSliders)
   bindTunePersistence(tuneSliders)
@@ -781,20 +866,21 @@ async function main() {
   applyTerrainTriplanar(grassMaterial, triplanarScale)
   const stoneBreakMaterial = createTerrainMaterial(0x8a8580, undefined, 0x1a1816)
   const woodBreakMaterial = createTerrainMaterial(0x5c3a22, undefined, 0x1a0f08)
+  // Keep ore break debris matte — high metalness + no envMap reads as black glass.
   const ironBreakMaterial = createTerrainMaterial(IRON_MID, undefined, IRON_DARK, {
-    roughness: 0.28,
-    metalness: 0.7,
-    emissiveIntensity: 0.12,
+    roughness: 0.55,
+    metalness: 0.22,
+    emissiveIntensity: 0.28,
   })
   const goldBreakMaterial = createTerrainMaterial(GOLD_MID, undefined, GOLD_DARK, {
-    roughness: 0.24,
-    metalness: 0.75,
-    emissiveIntensity: 0.14,
+    roughness: 0.5,
+    metalness: 0.25,
+    emissiveIntensity: 0.32,
   })
-  const diamondBreakMaterial = createTerrainMaterial(DIAMOND_MID, undefined, DIAMOND_DARK, {
-    roughness: 0.1,
-    metalness: 0.35,
-    emissiveIntensity: 0.22,
+  const diamondBreakMaterial = createTerrainMaterial(DIAMOND_MID, undefined, 0x1a9890, {
+    roughness: 0.42,
+    metalness: 0.1,
+    emissiveIntensity: 0.45,
   })
   const treeBreakMaterial = new THREE.MeshStandardMaterial({
     color: 0xffffff,
@@ -811,28 +897,32 @@ async function main() {
   applyTerrainTriplanar(stoneBlockMaterial, triplanarScale)
   let ironMap = createIronAlbedoMap()
   ironMap.repeat.set(DIRT_TEXTURE_REPEAT, DIRT_TEXTURE_REPEAT)
+  // Matte ores: no envMap, so high metalness crushed faces to black underground.
   const ironMaterial = createTerrainMaterial(IRON_MID, ironMap, IRON_DARK, {
-    roughness: 0.28,
-    metalness: 0.72,
-    emissiveIntensity: 0.1,
+    roughness: 0.55,
+    metalness: 0.22,
+    emissiveIntensity: 0.28,
   })
+  ironMaterial.userData.terrainEmissiveBase = 0.28
   applyTerrainTriplanar(ironMaterial, triplanarScale)
   let goldMap = createGoldAlbedoMap()
   goldMap.repeat.set(DIRT_TEXTURE_REPEAT, DIRT_TEXTURE_REPEAT)
   const goldMaterial = createTerrainMaterial(GOLD_MID, goldMap, GOLD_DARK, {
-    roughness: 0.24,
-    metalness: 0.78,
-    emissiveIntensity: 0.12,
+    roughness: 0.5,
+    metalness: 0.25,
+    emissiveIntensity: 0.32,
   })
+  goldMaterial.userData.terrainEmissiveBase = 0.32
   applyTerrainTriplanar(goldMaterial, triplanarScale)
   let diamondMap = createDiamondAlbedoMap()
   // One Minecraft-style framed face per voxel (not the finer dirt tiling).
   diamondMap.repeat.set(1, 1)
-  const diamondMaterial = createTerrainMaterial(DIAMOND_MID, diamondMap, DIAMOND_DARK, {
-    roughness: 0.1,
-    metalness: 0.35,
-    emissiveIntensity: 0.2,
+  const diamondMaterial = createTerrainMaterial(DIAMOND_MID, diamondMap, 0x1a9890, {
+    roughness: 0.42,
+    metalness: 0.1,
+    emissiveIntensity: 0.45,
   })
+  diamondMaterial.userData.terrainEmissiveBase = 0.45
   applyTerrainTriplanar(diamondMaterial, 1 / voxelSize)
   const woodMap = createWoodPlankAlbedoMap()
   woodMap.repeat.set(DIRT_TEXTURE_REPEAT, DIRT_TEXTURE_REPEAT)
@@ -913,6 +1003,8 @@ async function main() {
 
   let grassBladesEnabled = false
   let grassBladeDensity = 0
+  /** Skip expensive blade scatter until terrain + props finish booting. */
+  let grassBladesBootReady = false
   let grassBladeCullRadius = 0
 
   // Quality-driven cull radii live here; syncGraphics overwrites them.
@@ -1082,6 +1174,16 @@ async function main() {
       mat.emissiveIntensity = base * terrainMatte
       mat.roughness = THREE.MathUtils.lerp(0.9, 0.86, night)
     }
+    // Ores keep a higher self-glow floor underground so veins stay readable
+    // when global fill is crushed for torch gameplay.
+    const oreCaveMul = THREE.MathUtils.lerp(1, 0.62, cave.dim)
+    const oreMatte = THREE.MathUtils.lerp(1, 1.55, night) * oreCaveMul
+    for (const mat of [ironMaterial, goldMaterial, diamondMaterial]) {
+      const base =
+        (mat.userData.terrainEmissiveBase as number | undefined) ?? mat.emissiveIntensity
+      mat.userData.terrainEmissiveBase = base
+      mat.emissiveIntensity = base * oreMatte
+    }
   }
   applyDayNight(DAY_START_ELAPSED_SEC, 0)
 
@@ -1214,18 +1316,14 @@ async function main() {
   const rockTemplatesPromise = loadRockModels()
   const enemyTemplatePromise = loadEnemyTemplate()
 
-  info.textContent = 'Loading nearby terrain…'
-  setLoadingLabel('Loading nearby terrain…')
+  info.textContent = 'Loading terrain…'
+  setLoadingProgress(LOAD_W_SETUP, 'Loading terrain…')
 
   const gltfLoader = new GLTFLoader()
   const allSurfaceMetas = Object.values(meta.surface_pieces.cells).filter(
     (m) => (m.surface_layer_mask ?? 0) !== 0 || (m.tri_count ?? 0) > 0,
   )
-  const { priority: priorityMetas, deferred: deferredMetas } = sortSurfaceCellsBySpawn(
-    allSurfaceMetas,
-    spawnX,
-    spawnZ,
-  )
+  const sortedSurfaceMetas = sortSurfaceCellsByDistance(allSurfaceMetas, spawnX, spawnZ)
 
   const surfaceLoadCtx = {
     gltfLoader,
@@ -1241,26 +1339,44 @@ async function main() {
     tagWithCellKey,
   }
 
-  const loadSurfaceBatch = (metas: CellMeta[]) =>
-    runLoadPool(metas, SURFACE_LOAD_CONCURRENCY, (cellMeta) =>
-      loadSurfaceCell(cellMeta, surfaceLoadCtx),
+  const loadSurfaceBatch = (
+    metas: CellMeta[],
+    onProgress?: (done: number, total: number) => void,
+  ) =>
+    runLoadPool(
+      metas,
+      SURFACE_LOAD_CONCURRENCY,
+      (cellMeta) => loadSurfaceCell(cellMeta, surfaceLoadCtx),
+      onProgress,
     )
 
-  setLoadingLabel('Loading nearby terrain…')
-  await loadSurfaceBatch(priorityMetas)
-  surfaceChunks.flushDirty()
-  syncVoxelPlacement()
+  const surfaceLoadStartedAt = performance.now()
+  await loadSurfaceBatch(sortedSurfaceMetas, (done, total) => {
+    const t = total > 0 ? done / total : 1
+    const eta = formatEta(done, total, surfaceLoadStartedAt)
+    setLoadingProgress(
+      LOAD_W_SETUP + t * LOAD_W_SURFACE,
+      `Loading terrain… ${done}/${total}${eta}`,
+    )
+  })
+  setLoadingProgress(LOAD_W_SETUP + LOAD_W_SURFACE, 'Building terrain…')
+  const buildStartedAt = performance.now()
+  await surfaceChunks.flushDirtyChunkedAsync(BOOT_FLUSH_MS, (done, total) => {
+    const t = total > 0 ? done / total : 1
+    const eta = formatEta(done, total, buildStartedAt)
+    setLoadingProgress(
+      LOAD_W_SETUP + LOAD_W_SURFACE + t * LOAD_W_BUILD,
+      `Building terrain… ${done}/${total}${eta}`,
+    )
+  })
+  const loadedSurfaces = sortedSurfaceMetas
+    .map((m) => cells.get(cellKey(m.ix, m.iy)))
+    .filter((c): c is Cell => c?.surfaceRoot !== undefined)
+  syncVoxelPlacement(loadedSurfaces)
 
   player.spawnAt(spawnX, spawnZ, spawnFallbackY)
   player.syncCamera()
-
-  const hasDistantTerrain = deferredMetas.length > 0
-  if (hasDistantTerrain) {
-    setLoadingLabel('Loading…')
-  } else {
-    hideLoadingOverlay()
-    if (!player.isLocked()) info.textContent = ''
-  }
+  setLoadingProgress(LOAD_W_SETUP + LOAD_W_SURFACE + LOAD_W_BUILD, 'Preparing world…')
 
   const GRASS_SLOPE_DEBOUNCE_MS = 250
   const GRASS_SLOPE_FRAME_BUDGET_MS = 8
@@ -1275,12 +1391,15 @@ async function main() {
   }
 
   const refreshOneSurfaceCell = (cell: Cell, topSlopeThreshold: number) => {
-    if (!cell.surfaceSource || !cell.surfaceRoot) return
+    if (!cell.surfaceRoot) return
 
-    cell.surfaceRoot.parent?.remove(cell.surfaceRoot)
-    disposeSurfaceGeometries(cell.surfaceRoot)
+    const previous = cell.surfaceRoot
+    // Clone the live root (materials re-applied below). Avoids keeping a second
+    // pristine copy of every surface GLB in memory for the whole session.
+    const root = previous.clone()
+    previous.parent?.remove(previous)
+    disposeSurfaceGeometries(previous)
 
-    const root = cell.surfaceSource.clone()
     tagSurfaceLayerMeshes(root)
     applySurfaceCapMaterials(
       root,
@@ -1304,7 +1423,6 @@ async function main() {
 
   const refreshSurfaceGrassSlope = () => {
     const gen = ++grassSlopeRefreshGen
-    flushPendingSurfaceSources()
     const topSlopeThreshold = topSlopeThresholdFromSlider(
       Number(grassGreenSlopeSlider.value),
     )
@@ -1313,7 +1431,7 @@ async function main() {
 
     const pending: Cell[] = []
     for (const cell of cells.values()) {
-      if (cell.surfaceSource && cell.surfaceRoot) pending.push(cell)
+      if (cell.surfaceRoot) pending.push(cell)
     }
 
     let index = 0
@@ -1365,14 +1483,23 @@ async function main() {
 
   const enemiesGroup = new THREE.Group()
   scene.add(enemiesGroup)
+  const spidersGroup = new THREE.Group()
+  scene.add(spidersGroup)
+  const spiderNestBeacon = createSpiderNestBeacon(scene)
   const projectilesGroup = new THREE.Group()
   scene.add(projectilesGroup)
   const thrownSpears: ThrownSpear[] = []
   const thrownArrows: ThrownArrow[] = []
+  const thrownOrbs: ThrownOrb[] = []
   let spearThrowCooldown = 0
   let spearThrowPending = false
   let spearThrowHeld = false
   const SPEAR_THROW_RELEASE = 0.4
+  let orbThrowCooldown = 0
+  let orbThrowPending = false
+  let orbThrowHeld = false
+  let pendingOrbKind: ThrownOrbKind = 'damage'
+  const ORB_THROW_RELEASE = 0.4
   let scissorsSnipHeld = false
   let scissorsSnipTimer = 0
   let bowDrawHeld = false
@@ -1381,6 +1508,8 @@ async function main() {
   let bowZoomHeld = false
   let bowFov = BOW_BASE_FOV
   const enemies: EnemyInstance[] = []
+  const spiders: SpiderInstance[] = []
+  const spiderSpawnTimer = { value: 0 }
   let enemyTemplate: Awaited<ReturnType<typeof loadEnemyTemplate>> | undefined
   let enemySpawnTimer = 0
   let nightActive = false
@@ -1395,7 +1524,14 @@ async function main() {
   let placedTorches!: PlacedTorchManager
   let placedChests!: PlacedChestManager
   let placedBeds!: PlacedBedManager
+  let placedBallistas!: PlacedBallistaManager
+  let placedCatapults!: PlacedCatapultManager
   let lastEnemyLightNight = -1
+  const ballistaFires: BallistaFireRequest[] = []
+  const ballistaEjects: BallistaEjectRequest[] = []
+  const catapultFires: CatapultFireRequest[] = []
+  const catapultEjects: CatapultEjectRequest[] = []
+  const thrownCatapultRocks: ThrownCatapultRock[] = []
 
   const enemyCountHud = document.getElementById('enemy-count-hud')!
   const enemyCountValue = document.getElementById('enemy-count-value')!
@@ -1451,6 +1587,10 @@ async function main() {
   }
 
   const refreshGrassBlades = () => {
+    if (!grassBladesBootReady) {
+      surfaceChunks.setGrassBlades(false, 0, 0)
+      return
+    }
     surfaceChunks.setGrassBlades(
       grassBladesEnabled,
       grassBladeDensity,
@@ -1492,6 +1632,8 @@ async function main() {
     setBerryGlowEnabled(glows, treesGroup)
     setEnemyPointLightsQualityEnabled(glows)
     placedTorches?.setPointLightsEnabled(glows)
+    setOrbBlastLightsEnabled(glows)
+    setCatapultRockBlastLightsEnabled(glows)
     lastEnemyLightNight = -1
     {
       const night = nightStrength(cycleFactor(worldTimeSec))
@@ -1646,6 +1788,46 @@ async function main() {
     }
   }
 
+  const getSpiderDeathContext = (): SpiderDeathContext => ({
+    parent: spidersGroup,
+    spiders,
+    onChipDrop: (x, y, z) => {
+      groundItems.spawnAt(
+        'computer_chip',
+        1,
+        new THREE.Vector3(x, y, z),
+        new THREE.Vector3(
+          (Math.random() - 0.5) * 2.4,
+          2.4 + Math.random() * 1.6,
+          (Math.random() - 0.5) * 2.4,
+        ),
+        0.85,
+      )
+    },
+  })
+
+  const getSpiderNestParams = () => {
+    const sx = Number(spiderNestXSlider.value)
+    const sz = Number(spiderNestZSlider.value)
+    // Slider steps can't hit every world meter exactly — snap the saved defaults.
+    return {
+      centerX: sx === 19 ? SPIDER_NEST_CENTER_X : spiderNestWorldFromSlider(sx),
+      centerZ: sz === 41 ? SPIDER_NEST_CENTER_Z : spiderNestWorldFromSlider(sz),
+      radius: spiderNestRadiusFromSlider(Number(spiderNestRadiusSlider.value)),
+    }
+  }
+
+  const refreshSpiderNestBeacon = () => {
+    const nest = getSpiderNestParams()
+    updateSpiderNestBeacon(
+      spiderNestBeacon,
+      nest,
+      rockGround,
+      collisionWorld,
+      player.object.position.y,
+    )
+  }
+
   const spawnEnemyNearby = () => {
     if (!enemyTemplate) {
       info.textContent = 'Enemy not loaded yet'
@@ -1659,7 +1841,7 @@ async function main() {
       const z = p.z + Math.sin(angle) * dist
       const gy = resolveEnemyGroundY(x, z, rockGround, collisionWorld, p.y)
       if (gy === null) continue
-      const isBig = Math.random() < ENEMY_BIG_SPAWN_CHANCE
+      const tier = rollEnemySpawnTier()
       const enemy = createEnemy(
         enemyTemplate,
         x,
@@ -1667,7 +1849,7 @@ async function main() {
         z,
         enemiesGroup,
         enemiesGroup,
-        { big: isBig },
+        { tier },
       )
       applyEnemyLightHeight(enemy.visual, enemyLightHeightOffset())
       if (enemy.innerLight) {
@@ -1678,7 +1860,12 @@ async function main() {
       }
       enemies.push(enemy)
       syncEnemyCountHud()
-      info.textContent = isBig ? 'Spawned big enemy' : 'Spawned enemy'
+      info.textContent =
+        tier === 'huge'
+          ? 'Spawned huge enemy'
+          : tier === 'big'
+            ? 'Spawned big enemy'
+            : 'Spawned enemy'
       return
     }
     info.textContent = 'No ground nearby to spawn'
@@ -1709,6 +1896,17 @@ async function main() {
     const lightY = enemyLightHeightOffset()
     enemyLightHeightValue.textContent =
       (lightY >= 0 ? '+' : '') + lightY.toFixed(2)
+  }
+
+  const syncSpiderNestTuneLabels = () => {
+    const nest = getSpiderNestParams()
+    spiderNestXValue.textContent = nest.centerX.toFixed(0)
+    spiderNestZValue.textContent = nest.centerZ.toFixed(0)
+    spiderNestRadiusValue.textContent = `${nest.radius.toFixed(1)}m`
+    spiderNestXSlider.title = `Nest world X ${nest.centerX.toFixed(1)}. Spawns every ${SPIDER_SPAWN_INTERVAL}s when within ${SPIDER_NEST_ACTIVATION_RANGE}m, max ${SPIDER_MAX_ALIVE}.`
+    spiderNestZSlider.title = `Nest world Z ${nest.centerZ.toFixed(1)}.`
+    spiderNestRadiusSlider.title = `Spawn circle radius ${nest.radius.toFixed(1)}m — spiders appear randomly inside the glowing ring.`
+    refreshSpiderNestBeacon()
   }
 
   const syncRockTuneLabels = () => {
@@ -1794,14 +1992,21 @@ async function main() {
     applyEnemyLightHeightAll()
     syncEnemyTuneLabels()
   })
+  spiderNestXSlider.addEventListener('input', syncSpiderNestTuneLabels)
+  spiderNestZSlider.addEventListener('input', syncSpiderNestTuneLabels)
+  spiderNestRadiusSlider.addEventListener('input', syncSpiderNestTuneLabels)
   syncTreeTuneLabels()
   syncRockTuneLabels()
   syncEnemyTuneLabels()
+  syncSpiderNestTuneLabels()
 
-  /** Finish models + distant terrain; overlay stays up until this completes. */
-  const startDistantTerrainLoad = async () => {
+  /** Finish models + props after terrain is fully built (still under the loading overlay). */
+  const finishWorldPropsLoad = async () => {
     try {
-      if (hasDistantTerrain) showLoadingOverlay('Loading…')
+      setLoadingProgress(
+        LOAD_W_SETUP + LOAD_W_SURFACE + LOAD_W_BUILD + LOAD_W_PROPS * 0.2,
+        'Loading models…',
+      )
       const [trees, berries, rocks, enemyTpl] = await Promise.all([
         treeTemplatePromise,
         treeBerriesTemplatePromise,
@@ -1816,26 +2021,24 @@ async function main() {
       prewarmEnemyVisualPool(enemyTpl)
       enemyOrbDrops.prewarm(4)
       applyEnemyLightHeightAll()
+      setLoadingProgress(
+        LOAD_W_SETUP + LOAD_W_SURFACE + LOAD_W_BUILD + LOAD_W_PROPS * 0.55,
+        'Placing trees & rocks…',
+      )
       respawnTrees()
       respawnRocks()
-
-      if (hasDistantTerrain) {
-        setLoadingLabel('Loading…')
-        await loadSurfaceBatch(deferredMetas)
-        surfaceChunks.flushDirty()
-        const loaded = deferredMetas
-          .map((m) => cells.get(cellKey(m.ix, m.iy)))
-          .filter((c): c is Cell => c?.surfaceRoot !== undefined)
-        syncVoxelPlacement(loaded)
-        respawnTrees()
-        respawnRocks()
-        refreshGrassBlades()
-      }
+      grassBladesBootReady = true
+      refreshGrassBlades()
+      setLoadingProgress(
+        LOAD_W_SETUP + LOAD_W_SURFACE + LOAD_W_BUILD + LOAD_W_PROPS,
+        'Warming up…',
+      )
     } catch (err) {
-      console.error('Distant terrain load failed', err)
-    } finally {
-      hideLoadingOverlay()
-      if (!player.isLocked()) info.textContent = ''
+      console.error('World props load failed', err)
+      setLoadingProgress(
+        LOAD_W_SETUP + LOAD_W_SURFACE + LOAD_W_BUILD + LOAD_W_PROPS,
+        'Warming up…',
+      )
     }
   }
 
@@ -1843,9 +2046,9 @@ async function main() {
   enemyOrbDrops.setInventory(inventory)
   crystalBerryDrops.setInventory(inventory)
   groundItems.setInventory(inventory)
-  inventory.setOnDropCursor((item, count) => {
+  inventory.setOnDropCursor((item, count, durability) => {
     camera.getWorldDirection(_dropForward)
-    groundItems.spawnFromPlayer(item, count, player.object.position, _dropForward)
+    groundItems.spawnFromPlayer(item, count, player.object.position, _dropForward, durability)
   })
 
   const dropInventoryOnDeath = () => {
@@ -1901,9 +2104,15 @@ async function main() {
   scene.add(placedChests.group)
   placedBeds = new PlacedBedManager()
   scene.add(placedBeds.group)
+  placedBallistas = new PlacedBallistaManager()
+  scene.add(placedBallistas.group)
+  placedCatapults = new PlacedCatapultManager()
+  scene.add(placedCatapults.group)
   // Fixed berry lights from day one — planting must not change NUM_POINT_LIGHTS
   // while Medium+ is active. Potato/Low hide the pools via syncGraphics.
   initBerryGlowLightPool(scene)
+  initOrbBlastLightPool(scene)
+  initCatapultRockBlastLights(scene)
   {
     const glows = pointGlowsEnabledFromT(
       qualityTFromSlider(Number(graphicsSlider.value)),
@@ -1911,6 +2120,8 @@ async function main() {
     setBerryGlowEnabled(glows, treesGroup)
     setEnemyPointLightsQualityEnabled(glows)
     placedTorches.setPointLightsEnabled(glows)
+    setOrbBlastLightsEnabled(glows)
+    setCatapultRockBlastLightsEnabled(glows)
   }
   const plantedSaplings = new PlantedSaplingManager()
   scene.add(plantedSaplings.ghost)
@@ -1921,6 +2132,10 @@ async function main() {
   const _chestNormal = new THREE.Vector3()
   const _bedPos = new THREE.Vector3()
   const _bedNormal = new THREE.Vector3()
+  const _ballistaPos = new THREE.Vector3()
+  const _ballistaNormal = new THREE.Vector3()
+  const _catapultPos = new THREE.Vector3()
+  const _catapultNormal = new THREE.Vector3()
   const _saplingPos = new THREE.Vector3()
   const _saplingNormal = new THREE.Vector3()
   const _buildNormal = new THREE.Vector3()
@@ -2057,6 +2272,7 @@ async function main() {
   }
 
   let pendingSpearItem: 'spear' | 'iron_spear' | 'gold_spear' | 'diamond_spear' = 'spear'
+  let pendingSpearDurability = TOOL_MAX_DURABILITY
 
   function isSpearItem(
     item: string | null,
@@ -2073,10 +2289,12 @@ async function main() {
     const held = inventory.getHeldItem()
     if (!player.isLocked() || !isSpearItem(held)) return
     if (spearThrowCooldown > 0 || spearThrowPending || viewmodelHand.isThrowing()) return
+    const durability = inventory.getHeldDurability() ?? TOOL_MAX_DURABILITY
     if (!inventory.consumeSelected(1)) return
     if (!viewmodelHand.startThrow()) return
 
     pendingSpearItem = held
+    pendingSpearDurability = durability
     spearThrowPending = true
     spearThrowCooldown = SPEAR_THROW_COOLDOWN
     info.textContent = 'Spear thrown — walk up to pick it up'
@@ -2096,8 +2314,42 @@ async function main() {
       _digRayDir,
       thrownSpears,
       pendingSpearItem,
+      pendingSpearDurability,
     )
     spearThrowPending = false
+  }
+
+  function throwableOrbKind(
+    item: ReturnType<typeof inventory.getHeldItem>,
+  ): ThrownOrbKind | null {
+    if (item === 'glowing_orb') return 'damage'
+    if (item === 'crystal_berries') return 'heal'
+    return null
+  }
+
+  function tryThrowOrb() {
+    const kind = throwableOrbKind(inventory.getHeldItem())
+    if (!player.isLocked() || !kind) return
+    if (orbThrowCooldown > 0 || orbThrowPending || viewmodelHand.isThrowing()) return
+    if (!inventory.consumeSelected(1)) return
+    if (!viewmodelHand.startThrow()) return
+
+    pendingOrbKind = kind
+    orbThrowPending = true
+    orbThrowCooldown = SPEAR_THROW_COOLDOWN
+    info.textContent = kind === 'heal' ? 'Heal fireball thrown' : 'Fireball thrown'
+  }
+
+  function releasePendingOrbThrow() {
+    if (!orbThrowPending) return
+    const progress = viewmodelHand.getThrowProgress()
+    if (progress < ORB_THROW_RELEASE && viewmodelHand.isThrowing()) return
+
+    raycaster.setFromCamera(_screenCenter, camera)
+    _digRayDir.copy(raycaster.ray.direction)
+    _digRayOrigin.copy(camera.position).addScaledVector(_digRayDir, DIG_RAY_ORIGIN_OFFSET)
+    spawnThrownOrb(projectilesGroup, _digRayOrigin, _digRayDir, thrownOrbs, pendingOrbKind)
+    orbThrowPending = false
   }
 
   function clearBowAimHud() {
@@ -2150,7 +2402,11 @@ async function main() {
       speed,
     )
     bowFireCooldown = BOW_FIRE_COOLDOWN
-    info.textContent = draw >= 0.95 ? 'Full draw!' : 'Arrow fired'
+    if (inventory.damageHeldTool(1)) {
+      info.textContent = 'Your bow broke'
+    } else {
+      info.textContent = draw >= 0.95 ? 'Full draw!' : 'Arrow fired'
+    }
   }
 
   function beginBowDraw() {
@@ -2232,7 +2488,11 @@ async function main() {
     const prop = findMineableFromHit(hit)
     if (!prop || prop.kind !== 'tree') return
     inventory.add('leaves', LEAVES_PER_SNIP)
-    info.textContent = 'Snipped a leaf (+1 leaf)'
+    if (inventory.damageHeldTool(1)) {
+      info.textContent = 'Your scissors broke'
+    } else {
+      info.textContent = 'Snipped a leaf (+1 leaf)'
+    }
   }
 
   function tryPlaceTorch() {
@@ -2287,24 +2547,166 @@ async function main() {
     const hit = pickHit()
     if (!hit) return false
     const chestId = placedChests.findIdFromObject(hit.object)
-    if (!chestId) return false
-    const chest = placedChests.get(chestId)
-    if (!chest) return false
-    // Require standing next to the chest — dig reach alone is ~3 build blocks.
-    if (
-      chest.group.position.distanceToSquared(player.object.position) >
-      CHEST_OPEN_REACH * CHEST_OPEN_REACH
-    ) {
-      info.textContent = 'Move closer to open the chest'
+    if (chestId) {
+      const chest = placedChests.get(chestId)
+      if (!chest) return false
+      // Require standing next to the chest — dig reach alone is ~3 build blocks.
+      if (
+        chest.group.position.distanceToSquared(player.object.position) >
+        CHEST_OPEN_REACH * CHEST_OPEN_REACH
+      ) {
+        info.textContent = 'Move closer to open the chest'
+        return true
+      }
+      inventory.noteLockedBeforePanel(true)
+      inventory.openContainer(
+        { id: chest.id, title: 'Chest', slots: chest.slots },
+        onInventoryLock,
+      )
+      info.textContent = 'Opened chest'
       return true
+    }
+
+    const ballistaId = placedBallistas.findIdFromObject(hit.object)
+    if (ballistaId) {
+      const ballista = placedBallistas.get(ballistaId)
+      if (!ballista) return false
+      if (
+        ballista.group.position.distanceToSquared(player.object.position) >
+        CHEST_OPEN_REACH * CHEST_OPEN_REACH
+      ) {
+        info.textContent = 'Move closer to open the ballista'
+        return true
+      }
+      const controls = {
+        fireRate: ballista.fireRate,
+        targetPriority: ballista.targetPriority,
+        targetPlayer: ballista.targetPlayer,
+        setFireRate: (rate: typeof ballista.fireRate) => {
+          ballista.fireRate = rate
+          controls.fireRate = rate
+        },
+        setTargetPriority: (priority: typeof ballista.targetPriority) => {
+          ballista.targetPriority = priority
+          controls.targetPriority = priority
+        },
+        setTargetPlayer: (enabled: boolean) => {
+          ballista.targetPlayer = enabled
+          controls.targetPlayer = enabled
+        },
+      }
+      inventory.noteLockedBeforePanel(true)
+      inventory.openContainer(
+        {
+          id: ballista.id,
+          title: 'Ballista',
+          slots: ballista.slots,
+          ballista: controls,
+        },
+        onInventoryLock,
+      )
+      info.textContent = 'Opened ballista'
+      return true
+    }
+
+    const catapultId = placedCatapults.findIdFromObject(hit.object)
+    if (!catapultId) return false
+    const catapult = placedCatapults.get(catapultId)
+    if (!catapult) return false
+    if (
+      catapult.group.position.distanceToSquared(player.object.position) >
+      CATAPULT_OPEN_REACH * CATAPULT_OPEN_REACH
+    ) {
+      info.textContent = 'Move closer to open the catapult'
+      return true
+    }
+    const controls = {
+      fireRate: catapult.fireRate,
+      targetPriority: catapult.targetPriority,
+      targetPlayer: catapult.targetPlayer,
+      setFireRate: (rate: typeof catapult.fireRate) => {
+        catapult.fireRate = rate
+        controls.fireRate = rate
+      },
+      setTargetPriority: (priority: typeof catapult.targetPriority) => {
+        catapult.targetPriority = priority
+        controls.targetPriority = priority
+      },
+      setTargetPlayer: (enabled: boolean) => {
+        catapult.targetPlayer = enabled
+        controls.targetPlayer = enabled
+      },
     }
     inventory.noteLockedBeforePanel(true)
     inventory.openContainer(
-      { id: chest.id, title: 'Chest', slots: chest.slots },
+      {
+        id: catapult.id,
+        title: 'Catapult',
+        slots: catapult.slots,
+        ballista: controls,
+      },
       onInventoryLock,
     )
-    info.textContent = 'Opened chest'
+    info.textContent = 'Opened catapult — load stone, iron, gold, or diamond'
     return true
+  }
+
+  function tryPlaceCatapult() {
+    if (!player.isLocked() || inventory.getHeldItem() !== 'catapult') return
+    if (inventory.getSelectedCount() <= 0) {
+      info.textContent = 'Out of catapults'
+      return
+    }
+    const hit = pickBuildHit()
+    if (
+      !hit ||
+      !placedCatapults.placementFromHit(hit, _digRayDir, _catapultPos, _catapultNormal)
+    ) {
+      return
+    }
+    const p = player.object.position
+    if (
+      !placedCatapults.isPlacementValid(_catapultPos, p, PLAYER_RADIUS, PLAYER_HEIGHT)
+    ) {
+      return
+    }
+    if (!inventory.consumeSelected(1)) return
+    const yaw = placedCatapults.facingYawFromPlayer(_catapultPos, p)
+    const catapult = placedCatapults.place(_catapultPos, yaw)
+    placedCatapults.worldBox(catapult, _buildBox)
+    collisionWorld.setBuildBox(catapult.collisionKey, _buildBox.min, _buildBox.max)
+    requestShadowUpdate()
+    forceBuildPreview = true
+    info.textContent = 'Placed catapult'
+  }
+
+  function tryPlaceBallista() {
+    if (!player.isLocked() || inventory.getHeldItem() !== 'ballista') return
+    if (inventory.getSelectedCount() <= 0) {
+      info.textContent = 'Out of ballistas'
+      return
+    }
+    const hit = pickBuildHit()
+    if (
+      !hit ||
+      !placedBallistas.placementFromHit(hit, _digRayDir, _ballistaPos, _ballistaNormal)
+    ) {
+      return
+    }
+    const p = player.object.position
+    if (
+      !placedBallistas.isPlacementValid(_ballistaPos, p, PLAYER_RADIUS, PLAYER_HEIGHT)
+    ) {
+      return
+    }
+    if (!inventory.consumeSelected(1)) return
+    const yaw = placedBallistas.facingYawFromPlayer(_ballistaPos, p)
+    const ballista = placedBallistas.place(_ballistaPos, yaw)
+    placedBallistas.worldBox(ballista, _buildBox)
+    collisionWorld.setBuildBox(ballista.collisionKey, _buildBox.min, _buildBox.max)
+    requestShadowUpdate()
+    forceBuildPreview = true
+    info.textContent = 'Placed ballista'
   }
 
   function tryPlaceBed() {
@@ -2486,6 +2888,52 @@ async function main() {
     placedBeds.setGhost(_bedPos, yaw, valid)
   }
 
+  function updateBallistaPreview() {
+    if (!player.isLocked() || inventory.getHeldItem() !== 'ballista') {
+      placedBallistas.setGhost(null, null, false)
+      placedCatapults.setGhost(null, null, false)
+      return
+    }
+    const hit = pickBuildHit()
+    if (
+      !hit ||
+      !placedBallistas.placementFromHit(hit, _digRayDir, _ballistaPos, _ballistaNormal)
+    ) {
+      placedBallistas.setGhost(null, null, false)
+      placedCatapults.setGhost(null, null, false)
+      return
+    }
+    const p = player.object.position
+    const valid =
+      inventory.getSelectedCount() > 0 &&
+      placedBallistas.isPlacementValid(_ballistaPos, p, PLAYER_RADIUS, PLAYER_HEIGHT)
+    const yaw = placedBallistas.facingYawFromPlayer(_ballistaPos, p)
+    placedBallistas.setGhost(_ballistaPos, yaw, valid)
+    placedCatapults.setGhost(null, null, false)
+  }
+
+  function updateCatapultPreview() {
+    if (!player.isLocked() || inventory.getHeldItem() !== 'catapult') {
+      placedCatapults.setGhost(null, null, false)
+      return
+    }
+    const hit = pickBuildHit()
+    if (
+      !hit ||
+      !placedCatapults.placementFromHit(hit, _digRayDir, _catapultPos, _catapultNormal)
+    ) {
+      placedCatapults.setGhost(null, null, false)
+      return
+    }
+    const p = player.object.position
+    const valid =
+      inventory.getSelectedCount() > 0 &&
+      placedCatapults.isPlacementValid(_catapultPos, p, PLAYER_RADIUS, PLAYER_HEIGHT)
+    const yaw = placedCatapults.facingYawFromPlayer(_catapultPos, p)
+    placedCatapults.setGhost(_catapultPos, yaw, valid)
+    placedBallistas.setGhost(null, null, false)
+  }
+
   function updateSaplingPreview() {
     const held = inventory.getHeldItem()
     if (!player.isLocked() || !isSaplingItem(held)) {
@@ -2602,7 +3050,17 @@ async function main() {
   type DigTarget = {
     id: string
     cell?: Cell
-    kind: 'surface' | 'voxel' | 'rock' | 'tree' | 'block' | 'torch' | 'chest' | 'bed'
+    kind:
+      | 'surface'
+      | 'voxel'
+      | 'rock'
+      | 'tree'
+      | 'block'
+      | 'torch'
+      | 'chest'
+      | 'bed'
+      | 'ballista'
+      | 'catapult'
     layer?: number
     visualRoot: THREE.Object3D
     propRef?: THREE.Group
@@ -2611,6 +3069,8 @@ async function main() {
     torchId?: string
     chestId?: string
     bedId?: string
+    ballistaId?: string
+    catapultId?: string
     isIronOre?: boolean
     oreType?: OreType | null
   }
@@ -2682,8 +3142,8 @@ async function main() {
   let digPickHasQuat = false
   let digPickTimer = 0
   let cachedDigHit: THREE.Intersection | null = null
-  const DIG_PICK_HEARTBEAT = 0.1
-  const DIG_PICK_ROT_EPS = 0.012 // ~0.7°
+  const DIG_PICK_HEARTBEAT = 0.18
+  const DIG_PICK_ROT_EPS = 0.018 // ~1°
 
   function setSurfaceDigPreview(cell: Cell | null) {
     if (surfaceDigPreviewCell?.key === cell?.key) return
@@ -2695,12 +3155,18 @@ async function main() {
       })
     }
     surfaceDigPreviewCell = cell
-    // Keep the cell in the merged chunk while digging — peeling it out leaves a dark gap.
-    if (!cell) surfaceChunks.setDigPreviewCell(null)
+    // Peel this cell out of the merged chunk so we dig the live surfaceRoot
+    // instead of a ghost copy that survives until a deferred remesh.
+    surfaceChunks.setDigPreviewCell(cell)
     if (cell?.surfaceRoot) {
       cell.surfaceRoot.visible = true
       cell.surfaceRoot.traverse((child) => {
-        if (child instanceof THREE.Mesh) child.renderOrder = 2
+        if (!(child instanceof THREE.Mesh)) return
+        child.renderOrder = 2
+        const layer = child.userData.surfaceLayer as number | undefined
+        if (layer !== undefined) {
+          child.visible = cellHasSurfaceLayer(cell, layer)
+        }
       })
       refreshFrozenMatrixWorld(cell.surfaceRoot)
     }
@@ -2713,8 +3179,77 @@ async function main() {
   let lastForwardTapMs = 0
   let sprintActive = false
 
+  function enterPlayingUi() {
+    document.body.classList.add('playing')
+    info.textContent = ''
+    renderer.domElement.style.cursor = touchControls.enabled ? 'default' : 'none'
+    if (touchControls.enabled) touchControls.setOverlayVisible(true)
+  }
+
+  function pausePlayingUi() {
+    document.body.classList.remove('playing')
+    document.body.classList.remove('reloading')
+    digMouseDown = false
+    secondaryMouseDown = false
+    spearThrowHeld = false
+    orbThrowHeld = false
+    scissorsSnipHeld = false
+    scissorsSnipTimer = 0
+    bowZoomHeld = false
+    cancelBowDraw()
+    clearDigState()
+    if (Math.abs(camera.fov - BOW_BASE_FOV) > 0.001) {
+      bowFov = BOW_BASE_FOV
+      camera.fov = BOW_BASE_FOV
+      camera.updateProjectionMatrix()
+    }
+    player.setLookSensitivityScale(1)
+    spearThrowPending = false
+    orbThrowPending = false
+    clearThrownSpears(thrownSpears, projectilesGroup)
+    clearThrownArrows(thrownArrows, projectilesGroup)
+    clearThrownOrbs(thrownOrbs, projectilesGroup)
+    clearThrownCatapultRocks(thrownCatapultRocks, projectilesGroup)
+    blockBuilder.setGhost(null)
+    placedTorches.setGhost(null, null, false)
+    placedChests.setGhost(null, null, false)
+    placedBeds.setGhost(null, null, false)
+    placedBallistas.setGhost(null, null, false)
+    placedCatapults.setGhost(null, null, false)
+    plantedSaplings.setGhost(null, null, false)
+    info.textContent = ''
+    renderer.domElement.style.cursor = 'crosshair'
+    if (touchControls.enabled) touchControls.setOverlayVisible(false)
+  }
+
+  function beginPlay() {
+    if (touchControls.enabled) {
+      if (player.isTouchPlaying()) return
+      player.setTouchPlaying(true)
+      enterPlayingUi()
+      return
+    }
+    player.lock()
+  }
+
+  function endPlay() {
+    if (touchControls.enabled || player.isTouchPlaying()) {
+      player.setTouchPlaying(false)
+      pausePlayingUi()
+      return
+    }
+    player.controls.unlock()
+  }
+
   window.addEventListener('keydown', (e) => {
     if (e.repeat) return
+    if ((e.ctrlKey || e.metaKey) && e.code === 'KeyR') {
+      e.preventDefault()
+      if (confirm('Reload the page? Any unsaved progress may be lost.')) {
+        location.reload()
+      }
+      return
+    }
     if (e.code === 'KeyE') {
       e.preventDefault()
       if (!inventory.isPanelOpen()) inventory.noteLockedBeforePanel(player.isLocked())
@@ -2746,6 +3281,7 @@ async function main() {
     ) {
       e.preventDefault()
       clearEnemies(enemies, enemiesGroup)
+      clearSpiders(spiders, spidersGroup)
       syncEnemyCountHud()
       info.textContent = 'Cleared all enemies'
       return
@@ -2779,7 +3315,7 @@ async function main() {
         'ArrowLeft',
         'ArrowRight',
       ])
-      if (startKeys.has(e.code)) player.lock()
+      if (startKeys.has(e.code)) beginPlay()
     }
     if (e.code.startsWith('Digit') && e.code !== 'Digit0') {
       const n = Number(e.code.slice(5))
@@ -2825,32 +3361,43 @@ async function main() {
       sprintActive = false
       return
     }
-    input.forward = keys.has('KeyW') || keys.has('ArrowUp')
-    input.backward = keys.has('KeyS') || keys.has('ArrowDown')
-    input.left = keys.has('KeyA') || keys.has('ArrowLeft')
-    input.right = keys.has('KeyD') || keys.has('ArrowRight')
-    input.sneak = keys.has('ShiftLeft') || keys.has('ShiftRight')
-    // Sprint from double-tap W; sneak (Shift) cancels it.
+    const touch = touchControls.enabled ? touchControls.readMove() : null
+    input.forward = keys.has('KeyW') || keys.has('ArrowUp') || !!touch?.forward
+    input.backward = keys.has('KeyS') || keys.has('ArrowDown') || !!touch?.backward
+    input.left = keys.has('KeyA') || keys.has('ArrowLeft') || !!touch?.left
+    input.right = keys.has('KeyD') || keys.has('ArrowRight') || !!touch?.right
+    input.sneak =
+      keys.has('ShiftLeft') || keys.has('ShiftRight') || !!touch?.sneak
+    // Sprint from double-tap W or pushing the stick far; sneak cancels it.
     if (!input.forward || input.sneak) sprintActive = false
-    input.sprint = sprintActive && input.forward && !input.sneak
-    input.jump = keys.has('Space')
+    input.sprint =
+      (sprintActive && input.forward && !input.sneak) || !!touch?.sprint
+    input.jump = keys.has('Space') || !!touch?.jump
   }
 
   let secondaryMouseDown = false
 
   function primaryHeld() {
-    return digMouseDown || keys.has('KeyN')
+    return (
+      digMouseDown ||
+      keys.has('KeyN') ||
+      (touchControls.enabled && touchControls.isPrimaryHeld())
+    )
   }
 
   function secondaryHeld() {
-    return secondaryMouseDown || keys.has('KeyM')
+    return (
+      secondaryMouseDown ||
+      keys.has('KeyM') ||
+      (touchControls.enabled && touchControls.isSecondaryHeld())
+    )
   }
 
-  /** Left-click / N: lock, dig, or draw bow. */
-  function onPrimaryPress(source: 'mouse' | 'key') {
+  /** Left-click / N / touch Atk: lock, dig, or draw bow. */
+  function onPrimaryPress(source: 'mouse' | 'key' | 'touch') {
     if (inventory.isPanelOpen() || sleeping) return
     if (!player.isLocked()) {
-      player.lock()
+      beginPlay()
       return
     }
     // Dig / bow / attack: same pointer-lock look warp as RMB.
@@ -2859,21 +3406,26 @@ async function main() {
       beginBowDraw()
       return
     }
-    if (source === 'mouse') digMouseDown = true
+    if (inventory.getHeldItem() === 'crystal_berries') {
+      viewmodelHand.whack()
+      tryEatCrystalBerries()
+      return
+    }
+    if (source === 'mouse' || source === 'touch') digMouseDown = true
     viewmodelHand.whack()
   }
 
-  function onPrimaryRelease(source: 'mouse' | 'key') {
-    if (source === 'mouse') digMouseDown = false
+  function onPrimaryRelease(source: 'mouse' | 'key' | 'touch') {
+    if (source === 'mouse' || source === 'touch') digMouseDown = false
     if (primaryHeld()) return
     if (bowDrawHeld) tryReleaseBow()
     else if (player.isLocked()) player.guardLookSpikes(120)
   }
 
-  /** Right-click / M: sleep, open chest, bow zoom, throw spear, or place/use held item. */
-  function onSecondaryPress(source: 'mouse' | 'key') {
+  /** Right-click / M / touch Use: sleep, open chest, bow zoom, throw, or place. */
+  function onSecondaryPress(source: 'mouse' | 'key' | 'touch') {
     if (inventory.isPanelOpen() || !player.isLocked() || sleeping) return
-    if (source === 'mouse') secondaryMouseDown = true
+    if (source === 'mouse' || source === 'touch') secondaryMouseDown = true
     // Pointer-lock click warps inject huge movementY — guard before any action.
     player.guardLookSpikes(120)
     if (trySleepAtCrosshair()) {
@@ -2887,9 +3439,12 @@ async function main() {
     } else if (isSpearItem(inventory.getHeldItem()) && inventory.getSelectedCount() > 0) {
       spearThrowHeld = true
       tryThrowSpear()
-    } else if (inventory.getHeldItem() === 'crystal_berries') {
-      viewmodelHand.whack()
-      tryEatCrystalBerries()
+    } else if (
+      throwableOrbKind(inventory.getHeldItem()) &&
+      inventory.getSelectedCount() > 0
+    ) {
+      orbThrowHeld = true
+      tryThrowOrb()
     } else if (inventory.getHeldItem() === 'scissors') {
       scissorsSnipHeld = true
       scissorsSnipTimer = 0
@@ -2907,18 +3462,25 @@ async function main() {
     } else if (inventory.getHeldItem() === 'bed') {
       viewmodelHand.whack()
       tryPlaceBed()
+    } else if (inventory.getHeldItem() === 'ballista') {
+      viewmodelHand.whack()
+      tryPlaceBallista()
+    } else if (inventory.getHeldItem() === 'catapult') {
+      viewmodelHand.whack()
+      tryPlaceCatapult()
     } else {
       viewmodelHand.whack()
       tryPlaceBlock()
     }
   }
 
-  function onSecondaryRelease(source: 'mouse' | 'key') {
-    if (source === 'mouse') secondaryMouseDown = false
+  function onSecondaryRelease(source: 'mouse' | 'key' | 'touch') {
+    if (source === 'mouse' || source === 'touch') secondaryMouseDown = false
     if (secondaryHeld()) return
     // RMB release also injects a look warp under pointer lock.
     if (player.isLocked()) player.guardLookSpikes(120)
     spearThrowHeld = false
+    orbThrowHeld = false
     scissorsSnipHeld = false
     scissorsSnipTimer = 0
     bowZoomHeld = false
@@ -2927,6 +3489,11 @@ async function main() {
   renderer.domElement.tabIndex = 0
   renderer.domElement.addEventListener('mousedown', (e) => {
     if (inventory.isPanelOpen()) return
+    // Touch devices use the on-screen stick / look pad / action buttons.
+    if (touchControls.enabled) {
+      beginPlay()
+      return
+    }
     renderer.domElement.focus()
     if (e.button === 2) {
       onSecondaryPress('mouse')
@@ -2943,6 +3510,7 @@ async function main() {
     digMouseDown = false
     secondaryMouseDown = false
     spearThrowHeld = false
+    orbThrowHeld = false
     scissorsSnipHeld = false
     scissorsSnipTimer = 0
     bowZoomHeld = false
@@ -2969,37 +3537,32 @@ async function main() {
   )
 
   player.controls.addEventListener('lock', () => {
-    document.body.classList.add('playing')
-    info.textContent = ''
-    renderer.domElement.style.cursor = 'none'
+    enterPlayingUi()
   })
 
   player.controls.addEventListener('unlock', () => {
-    document.body.classList.remove('playing')
-    document.body.classList.remove('reloading')
-    digMouseDown = false
-    secondaryMouseDown = false
-    spearThrowHeld = false
-    scissorsSnipHeld = false
-    scissorsSnipTimer = 0
-    bowZoomHeld = false
-    cancelBowDraw()
-    clearDigState()
-    if (Math.abs(camera.fov - BOW_BASE_FOV) > 0.001) {
-      bowFov = BOW_BASE_FOV
-      camera.fov = BOW_BASE_FOV
-      camera.updateProjectionMatrix()
-    }
-    player.setLookSensitivityScale(1)
-    clearThrownSpears(thrownSpears, projectilesGroup)
-    clearThrownArrows(thrownArrows, projectilesGroup)
-    blockBuilder.setGhost(null)
-    placedTorches.setGhost(null, null, false)
-    placedChests.setGhost(null, null, false)
-    placedBeds.setGhost(null, null, false)
-    plantedSaplings.setGhost(null, null, false)
-    info.textContent = ''
-    renderer.domElement.style.cursor = 'crosshair'
+    // Touch play does not use pointer lock; ignore spurious unlock events.
+    if (player.isTouchPlaying()) return
+    pausePlayingUi()
+  })
+
+  touchControls.mount({
+    onPrimaryPress: () => onPrimaryPress('touch'),
+    onPrimaryRelease: () => onPrimaryRelease('touch'),
+    onSecondaryPress: () => onSecondaryPress('touch'),
+    onSecondaryRelease: () => onSecondaryRelease('touch'),
+    onToggleInventory: () => {
+      if (!inventory.isPanelOpen()) inventory.noteLockedBeforePanel(player.isLocked())
+      inventory.togglePanel(onInventoryLock)
+    },
+    onHotbarCycle: (dir) => {
+      if (!player.isLocked() || inventory.isPanelOpen()) return
+      inventory.cycle(dir)
+    },
+    onLookDelta: (dx, dy) => player.addLookDelta(dx, dy),
+    onBeginPlay: () => beginPlay(),
+    isPlaying: () => player.isLocked(),
+    isInventoryOpen: () => inventory.isPanelOpen(),
   })
 
   const raycaster = new THREE.Raycaster()
@@ -3182,6 +3745,11 @@ async function main() {
     return getCellFromObject(hit.object)
   }
 
+  /**
+   * Resolve which surface layer a hit belongs to. Strict: no fallback to other
+   * layers — guessing mined invisible / behind-block pieces after remesh lag
+   * left ghost triangles in the merged chunk mesh.
+   */
   function surfaceLayerFromHit(cell: Cell, hit: THREE.Intersection): number | null {
     let current: THREE.Object3D | null = hit.object
     while (current) {
@@ -3189,18 +3757,14 @@ async function main() {
       if (tagged !== undefined && cellHasSurfaceLayer(cell, tagged)) return tagged
       current = current.parent
     }
-    const guessed = layerIndexAtY(cell, hit.point.y, voxelSize, voxelLayers)
-    if (cellHasSurfaceLayer(cell, guessed)) return guessed
-    for (const delta of [-1, 1, -2, 2, -3, 3]) {
-      const layer = guessed + delta
-      if (layer < 0 || layer >= voxelLayers) continue
-      if (cellHasSurfaceLayer(cell, layer)) return layer
-    }
-    // Fallback: topmost remaining surface layer.
-    for (let layer = 0; layer < voxelLayers; layer++) {
-      if (cellHasSurfaceLayer(cell, layer)) return layer
-    }
-    return null
+    // Merged chunk meshes lose per-layer tags — map hit Y onto the grid band.
+    const layer = layerIndexAtY(cell, hit.point.y, voxelSize, voxelLayers)
+    if (!cellHasSurfaceLayer(cell, layer)) return null
+    const { y0, y1 } = layerYRange(cell, layer, voxelSize)
+    const y = hit.point.y
+    // Allow a tiny tolerance for verts snapped onto the shared layer plane.
+    if (y < y0 - 0.08 || y > y1 + 0.08) return null
+    return layer
   }
 
   function hideSurfaceLayerMeshes(cell: Cell, layer: number) {
@@ -3216,18 +3780,29 @@ async function main() {
     disposeSurfaceGeometries(cell.surfaceRoot)
     cell.surfaceRoot.parent?.remove(cell.surfaceRoot)
     cell.surfaceRoot = undefined
-    if (cell.surfaceSource) {
-      disposeSurfaceGeometries(cell.surfaceSource)
-      cell.surfaceSource = undefined
-    }
   }
 
   function completeDig(target: DigTarget) {
-    // Terrain (or a prop) is about to change; let resting rocks re-check support.
-    wakeRocks(placedRocks)
+    // Only wake rocks near terrain digs — waking the whole map made every rock
+    // raycast terrain and hitch for ~100ms on each break.
+    if (target.kind === 'surface' || target.kind === 'voxel') {
+      const digCell = target.cell
+      if (digCell) {
+        wakeRocksNear(placedRocks, digCell.centerX, digCell.centerZ, cellSize * 2.5)
+      }
+    }
+
+    const wearTool = () => {
+      if (inventory.damageHeldTool(1)) {
+        info.textContent = 'Your tool broke'
+      }
+    }
 
     if (target.kind === 'rock' || target.kind === 'tree') {
-      if (target.propRef) removeMineableProp(target.propRef, target.kind)
+      if (target.propRef) {
+        removeMineableProp(target.propRef, target.kind)
+        wearTool()
+      }
       return
     }
 
@@ -3237,6 +3812,7 @@ async function main() {
       removePlacedBlock(target.blockKey, true)
       if (removed) {
         info.textContent = `Mined ${removed.type} block (+1 ${removed.type})`
+        wearTool()
       }
       return
     }
@@ -3245,6 +3821,7 @@ async function main() {
       if (target.torchId && placedTorches.remove(target.torchId)) {
         inventory.add('torch', 1)
         info.textContent = 'Mined torch (+1 torch)'
+        wearTool()
       }
       return
     }
@@ -3260,11 +3837,21 @@ async function main() {
       collisionWorld.removeBuildBox(removed.collisionKey)
       const contents = placedChests.takeAllStacks(removed)
       inventory.add('chest', 1)
-      const overflow: { item: typeof contents[number]['item']; count: number }[] = []
+      const overflow: {
+        item: (typeof contents)[number]['item']
+        count: number
+        durability?: number
+      }[] = []
       for (const stack of contents) {
-        const stored = inventory.add(stack.item, stack.count)
+        const stored = inventory.add(stack.item, stack.count, stack.durability)
         const left = stack.count - stored
-        if (left > 0) overflow.push({ item: stack.item, count: left })
+        if (left > 0) {
+          overflow.push({
+            item: stack.item,
+            count: left,
+            durability: stack.durability,
+          })
+        }
       }
       if (overflow.length > 0) {
         camera.getWorldDirection(_dropForward)
@@ -3277,6 +3864,7 @@ async function main() {
             stack.count,
             removed.group.position,
             _dropForward,
+            stack.durability,
           )
         }
       }
@@ -3285,6 +3873,7 @@ async function main() {
         contents.length > 0
           ? `Mined chest (+1 chest) — emptied contents`
           : 'Mined chest (+1 chest)'
+      wearTool()
       return
     }
 
@@ -3296,6 +3885,107 @@ async function main() {
       inventory.add('bed', 1)
       requestShadowUpdate()
       info.textContent = 'Mined bed (+1 bed)'
+      wearTool()
+      return
+    }
+
+    if (target.kind === 'ballista') {
+      if (!target.ballistaId) return
+      if (inventory.getOpenContainerId() === target.ballistaId) {
+        inventory.closePanel(onInventoryLock)
+      }
+      const removed = placedBallistas.remove(target.ballistaId)
+      if (!removed) return
+      collisionWorld.removeBuildBox(removed.collisionKey)
+      const contents = placedBallistas.takeAllStacks(removed)
+      inventory.add('ballista', 1)
+      const overflow: {
+        item: (typeof contents)[number]['item']
+        count: number
+        durability?: number
+      }[] = []
+      for (const stack of contents) {
+        const stored = inventory.add(stack.item, stack.count, stack.durability)
+        const left = stack.count - stored
+        if (left > 0) {
+          overflow.push({
+            item: stack.item,
+            count: left,
+            durability: stack.durability,
+          })
+        }
+      }
+      if (overflow.length > 0) {
+        camera.getWorldDirection(_dropForward)
+        _dropForward.y = 0
+        if (_dropForward.lengthSq() < 1e-6) _dropForward.set(0, 0, -1)
+        else _dropForward.normalize()
+        for (const stack of overflow) {
+          groundItems.spawnFromPlayer(
+            stack.item,
+            stack.count,
+            removed.group.position,
+            _dropForward,
+            stack.durability,
+          )
+        }
+      }
+      requestShadowUpdate()
+      info.textContent =
+        contents.length > 0
+          ? `Mined ballista (+1 ballista) — emptied hopper`
+          : 'Mined ballista (+1 ballista)'
+      wearTool()
+      return
+    }
+
+    if (target.kind === 'catapult') {
+      if (!target.catapultId) return
+      if (inventory.getOpenContainerId() === target.catapultId) {
+        inventory.closePanel(onInventoryLock)
+      }
+      const removed = placedCatapults.remove(target.catapultId)
+      if (!removed) return
+      collisionWorld.removeBuildBox(removed.collisionKey)
+      const contents = placedCatapults.takeAllStacks(removed)
+      inventory.add('catapult', 1)
+      const overflow: {
+        item: (typeof contents)[number]['item']
+        count: number
+        durability?: number
+      }[] = []
+      for (const stack of contents) {
+        const stored = inventory.add(stack.item, stack.count, stack.durability)
+        const left = stack.count - stored
+        if (left > 0) {
+          overflow.push({
+            item: stack.item,
+            count: left,
+            durability: stack.durability,
+          })
+        }
+      }
+      if (overflow.length > 0) {
+        camera.getWorldDirection(_dropForward)
+        _dropForward.y = 0
+        if (_dropForward.lengthSq() < 1e-6) _dropForward.set(0, 0, -1)
+        else _dropForward.normalize()
+        for (const stack of overflow) {
+          groundItems.spawnFromPlayer(
+            stack.item,
+            stack.count,
+            removed.group.position,
+            _dropForward,
+            stack.durability,
+          )
+        }
+      }
+      requestShadowUpdate()
+      info.textContent =
+        contents.length > 0
+          ? `Mined catapult (+1 catapult) — emptied hopper`
+          : 'Mined catapult (+1 catapult)'
+      wearTool()
       return
     }
 
@@ -3303,14 +3993,18 @@ async function main() {
     if (!cell) return
 
     if (target.kind === 'surface') {
-      setSurfaceDigPreview(null)
       const layer = target.layer
       if (layer === undefined || !cellHasSurfaceLayer(cell, layer)) return
+      // Clear the layer BEFORE tearing down dig preview / remeshing. Preview
+      // unpeel rebuilds the chunk — doing that first baked the dug piece back in.
       clearSurfaceLayer(cell, layer)
       hideSurfaceLayerMeshes(cell, layer)
       disposeEmptySurfaceRoot(cell)
+      setSurfaceDigPreview(null)
       patchCellCollision(cell)
-      surfaceChunks.rebuildForCell(cell)
+      // Deferred remesh — pickHit already skips stale surface layers, and
+      // sync rebuildChunk was the main dig hitch (especially while jumping).
+      surfaceChunks.markDirtyForCell(cell)
       refreshEnemiesAfterTerrainDig(
         enemies,
         cell,
@@ -3322,6 +4016,7 @@ async function main() {
       )
       inventory.add('dirt', DIRT_PER_DIG)
       info.textContent = `Mined dirt (+${DIRT_PER_DIG} dirt)`
+      wearTool()
       return
     }
 
@@ -3336,7 +4031,10 @@ async function main() {
     dropArrowsFromVoxel(cell.key, layer, thrownArrows)
     voxelInstancer.hideLayer(cell, layer, voxelSize)
     patchCellCollision(cell)
-    surfaceChunks.rebuildForCell(cell)
+    // Only remesh when this column still has a surface cap (Y-clip may change).
+    if (cell.surfaceRoot && (cell.surfaceLayerMask ?? 0) !== 0) {
+      surfaceChunks.markDirtyForCell(cell)
+    }
     refreshEnemiesAfterTerrainDig(
       enemies,
       cell,
@@ -3352,6 +4050,7 @@ async function main() {
       const yieldCount = oreYield(minedOre)
       inventory.add(item, yieldCount)
       info.textContent = `Mined ${item} (+${yieldCount} ${item})`
+      wearTool()
       return
     }
 
@@ -3362,6 +4061,7 @@ async function main() {
       remaining > 0 || cell.surfaceLayerMask !== 0
         ? `Mined dirt (+${DIRT_PER_DIG} dirt)`
         : `Mined dirt (+${DIRT_PER_DIG} dirt) — column fully excavated`
+    wearTool()
   }
 
   function pickHit(forBuild = false): THREE.Intersection | null {
@@ -3415,6 +4115,12 @@ async function main() {
       if (placedBeds.count > 0) {
         placedBeds.intersectMeshes(raycaster, _pickHits)
       }
+      if (placedBallistas.count > 0) {
+        placedBallistas.intersectMeshes(raycaster, _pickHits)
+      }
+      if (placedCatapults.count > 0) {
+        placedCatapults.intersectMeshes(raycaster, _pickHits)
+      }
       // Dig/melee reach is short — skip far props/enemies in the pick raycast.
       const pickR = DIG_REACH + 2.5
       const pickRSq = pickR * pickR
@@ -3440,6 +4146,9 @@ async function main() {
     }
     if (_pickHits.length === 0) return null
 
+    // Nearest-first so we never dig / place through a closer blocker.
+    _pickHits.sort((a, b) => a.distance - b.distance)
+
     let best: THREE.Intersection | null = null
     let bestBuildBlock: THREE.Intersection | null = null
     for (const hit of _pickHits) {
@@ -3463,15 +4172,31 @@ async function main() {
           if (!cell || !voxelInstancer.hasLayer(cell, layer)) continue
         }
       }
-      if (!best || dist < digHitDistanceFromCamera(best)) best = hit
-      if (
-        blockBuilder.isBlockMesh(hit.object) &&
-        (!bestBuildBlock || dist < digHitDistanceFromCamera(bestBuildBlock))
-      ) {
-        bestBuildBlock = hit
+
+      // Skip stale merged-surface tris (layer already dug, remesh pending) so we
+      // don't mine "invisible" pieces or tunnel through to blocks behind them.
+      const terrainCell = getCellFromHit(hit)
+      if (terrainCell && isSurfaceDigHit(hit, terrainCell)) {
+        if (surfaceLayerFromHit(terrainCell, hit) === null) continue
       }
+
+      if (forBuild) {
+        if (!best) best = hit
+        if (
+          blockBuilder.isBlockMesh(hit.object) &&
+          (!bestBuildBlock || dist < digHitDistanceFromCamera(bestBuildBlock))
+        ) {
+          bestBuildBlock = hit
+        }
+        // Keep scanning near-equal block hits for the preference rule below.
+        if (best && dist > digHitDistanceFromCamera(best) + 0.05) break
+        continue
+      }
+
+      // Dig: first live hit wins. Enemies cancel dig in updateDig; props/blocks/terrain dig.
+      return hit
     }
-    if (bestBuildBlock) {
+    if (forBuild && bestBuildBlock) {
       if (!best) return bestBuildBlock
       const blockDist = digHitDistanceFromCamera(bestBuildBlock)
       const bestDist = digHitDistanceFromCamera(best)
@@ -3540,22 +4265,23 @@ async function main() {
     const reloading =
       player.isLocked() &&
       !panelOpen &&
-      spearThrowCooldown > 0 &&
+      (spearThrowCooldown > 0 || orbThrowCooldown > 0) &&
       !diggingActive
     if (!reloading) {
       document.body.classList.remove('reloading')
       return
     }
-    const progress = 1 - spearThrowCooldown / SPEAR_THROW_COOLDOWN
+    const cooldown = Math.max(spearThrowCooldown, orbThrowCooldown)
+    const progress = 1 - cooldown / SPEAR_THROW_COOLDOWN
     document.body.classList.add('reloading')
     digProgressFill.style.setProperty('--dig-deg', `${progress * 360}deg`)
   }
 
   onInventoryLock = (locked: boolean) => {
     if (locked) {
-      player.lock()
+      beginPlay()
     } else {
-      player.controls.unlock()
+      endPlay()
       digMouseDown = false
       secondaryMouseDown = false
       clearDigState()
@@ -3563,6 +4289,8 @@ async function main() {
       placedTorches.setGhost(null, null, false)
       placedChests.setGhost(null, null, false)
       placedBeds.setGhost(null, null, false)
+      placedBallistas.setGhost(null, null, false)
+      placedCatapults.setGhost(null, null, false)
       plantedSaplings.setGhost(null, null, false)
     }
   }
@@ -3654,7 +4382,8 @@ async function main() {
     }
 
     if (target.kind === 'surface' && cell.surfaceRoot && target.layer !== undefined) {
-      setSurfaceDigPreview(cell)
+      // Do not peel/remesh for dig preview — that sync rebuild lagged dig+jump.
+      // Ghost re-digs are already blocked by surfaceLayerFromHit / layer masks.
       const layer = target.layer
       const excludeBottomFace =
         layer < voxelLayers - 1 &&
@@ -3670,7 +4399,6 @@ async function main() {
         )
         return
       }
-      setSurfaceDigPreview(null)
     }
     if (target.visualRoot) {
       digBreakFx.startFromObject(
@@ -3718,6 +4446,32 @@ async function main() {
           kind: 'bed',
           bedId,
           visualRoot: bed.group,
+        }
+      }
+    }
+
+    const ballistaId = placedBallistas.findIdFromObject(hit.object)
+    if (ballistaId) {
+      const ballista = placedBallistas.get(ballistaId)
+      if (ballista) {
+        return {
+          id: `ballista:${ballistaId}`,
+          kind: 'ballista',
+          ballistaId,
+          visualRoot: ballista.group,
+        }
+      }
+    }
+
+    const catapultId = placedCatapults.findIdFromObject(hit.object)
+    if (catapultId) {
+      const catapult = placedCatapults.get(catapultId)
+      if (catapult) {
+        return {
+          id: `catapult:${catapultId}`,
+          kind: 'catapult',
+          catapultId,
+          visualRoot: catapult.group,
         }
       }
     }
@@ -3793,6 +4547,18 @@ async function main() {
     if (target.kind === 'bed') {
       return target.bedId !== undefined && placedBeds.get(target.bedId) !== undefined
     }
+    if (target.kind === 'ballista') {
+      return (
+        target.ballistaId !== undefined &&
+        placedBallistas.get(target.ballistaId) !== undefined
+      )
+    }
+    if (target.kind === 'catapult') {
+      return (
+        target.catapultId !== undefined &&
+        placedCatapults.get(target.catapultId) !== undefined
+      )
+    }
     if (target.kind === 'block') {
       return target.blockKey !== undefined && blockBuilder.has(target.blockKey)
     }
@@ -3818,6 +4584,7 @@ async function main() {
   const _meleeFwd = new THREE.Vector3()
   const _meleeTo = new THREE.Vector3()
   const _meleeHits: EnemyInstance[] = []
+  const _meleeSpiderHits: SpiderInstance[] = []
 
   function tryMeleeEnemyHit() {
     const impact = viewmodelHand.getSwingImpact()
@@ -3842,6 +4609,7 @@ async function main() {
 
     const eye = camera.position
     _meleeHits.length = 0
+    _meleeSpiderHits.length = 0
     for (const enemy of enemies) {
       const ep = enemy.root.position
       const dx = ep.x - eye.x
@@ -3856,13 +4624,40 @@ async function main() {
       if (facing < facingMin) continue
       _meleeHits.push(enemy)
     }
-    if (_meleeHits.length === 0) return
+    for (const spider of spiders) {
+      const ep = spider.root.position
+      const dx = ep.x - eye.x
+      const dz = ep.z - eye.z
+      const dist = Math.hypot(dx, dz)
+      const bodyR = Math.max(spider.colHalfX, spider.colHalfZ)
+      if (dist - bodyR > reach) continue
+      _meleeTo.set(dx, 0, dz)
+      if (dist > 1e-4) _meleeTo.multiplyScalar(1 / dist)
+      if (_meleeTo.dot(_meleeFwd) < facingMin) continue
+      _meleeSpiderHits.push(spider)
+    }
+    if (_meleeHits.length === 0 && _meleeSpiderHits.length === 0) return
 
     meleeHitThisSwing = true
     const p = player.object.position
     for (const enemy of _meleeHits) {
       const knock = meleeKnockbackForEnemy(held, enemy)
       damageEnemy(enemy, dmg, enemiesGroup, enemies, p.x, p.z, knock, getEnemyDeathContext())
+    }
+    for (const spider of _meleeSpiderHits) {
+      damageSpider(
+        spider,
+        dmg,
+        spidersGroup,
+        spiders,
+        p.x,
+        p.z,
+        SPIDER_HIT_KNOCKBACK_SPEED,
+        getSpiderDeathContext(),
+      )
+    }
+    if (inventory.damageHeldTool(1)) {
+      info.textContent = 'Your tool broke'
     }
   }
 
@@ -3893,20 +4688,22 @@ async function main() {
 
     let target = digTarget
     if (hit) {
-      if (enemyFromIntersection(hit, enemies)) {
+      if (enemyFromIntersection(hit, enemies) || spiderFromIntersection(hit, spiders)) {
         target = null
         digTarget = null
         digProgress = 0
         return
       }
       const picked = digTargetFromHit(hit)
-      // Axe: trees, chests, beds, and rocks — skip dig overlay on dirt/ore behind them.
+      // Axe: trees, chests, beds, ballistas, and rocks — skip dig overlay on dirt/ore behind them.
       if (
         picked &&
         inventory.isAxeEquipped() &&
         picked.kind !== 'tree' &&
         picked.kind !== 'chest' &&
         picked.kind !== 'bed' &&
+        picked.kind !== 'ballista' &&
+        picked.kind !== 'catapult' &&
         picked.kind !== 'rock'
       ) {
         if (target) clearDigState()
@@ -3919,15 +4716,14 @@ async function main() {
           digTarget = picked
           digProgress = 0
         }
-      } else if (target && digTargetStillValid(target)) {
-        // Ray grazed non-mineable geometry (e.g. bedrock); keep the active target.
       } else {
-        target = null
-        digTarget = null
-        digProgress = 0
+        // Closest live hit isn't diggable — don't keep mining something behind it.
+        if (target) clearDigState()
+        return
       }
-    } else if (target && !digTargetStillValid(target)) {
-      clearDigState()
+    } else {
+      // Lost aim (sky / out of reach) — stop; don't finish a dig you can't see.
+      if (target) clearDigState()
       return
     }
 
@@ -3937,6 +4733,8 @@ async function main() {
       target.kind !== 'tree' &&
       target.kind !== 'chest' &&
       target.kind !== 'bed' &&
+      target.kind !== 'ballista' &&
+      target.kind !== 'catapult' &&
       target.kind !== 'rock'
     ) {
       clearDigState()
@@ -3963,10 +4761,14 @@ async function main() {
                 ? CHEST_DIG_TIME_BASE
                 : target.kind === 'bed'
                   ? BED_DIG_TIME_BASE
-                  : target.kind === 'rock'
-                    ? ROCK_DIG_TIME_BASE
-                    : TREE_DIG_TIME_BASE *
-                      (target.propRef ? treeGrowthFraction(target.propRef) : 1)
+                  : target.kind === 'ballista'
+                    ? BALLISTA_DIG_TIME_BASE
+                    : target.kind === 'catapult'
+                      ? CATAPULT_DIG_TIME_BASE
+                      : target.kind === 'rock'
+                      ? ROCK_DIG_TIME_BASE
+                      : TREE_DIG_TIME_BASE *
+                        (target.propRef ? treeGrowthFraction(target.propRef) : 1)
     const digTime =
       digTimeBase /
       (getDigSpeed() *
@@ -3991,29 +4793,29 @@ async function main() {
             target.blockType === 'wood' ||
             target.kind === 'torch' ||
             target.kind === 'chest' ||
-            target.kind === 'bed'
+            target.kind === 'bed' ||
+            target.kind === 'ballista' ||
+            target.kind === 'catapult'
           ? 'wood'
           : 'dirt'
     digCrackOverlay.setStyle(crackStyle)
-    if (sampleDigBreakWorldBox(target, _boundsBox)) {
-      // Curved props (rocks/trees/surface caps) get a crack that hugs their
-      // real geometry; voxels are true boxes so the box decal is exact.
+    // One bounds sample per frame — used to be 2–3× setFromObject/box updates.
+    const hasBreakBox = sampleDigBreakWorldBox(target, _boundsBox)
+    if (hasBreakBox) {
+      // Surface/voxels are layer AABBs; conforming overlay is for curved props only.
       const conform =
         target.kind !== 'voxel' &&
         target.kind !== 'block' &&
+        target.kind !== 'surface' &&
         target.visualRoot !== undefined
       if (conform) {
         digCrackOverlay.setFromObject(target.visualRoot, _boundsBox, digProgress)
       } else {
         digCrackOverlay.setFromBox(_boundsBox, digProgress)
       }
-    } else {
-      digCrackOverlay.clear()
-    }
-
-    if (sampleDigBreakWorldBox(target, _boundsBox)) {
       digBlockOutline.setFromBox(_boundsBox)
     } else {
+      digCrackOverlay.clear()
       digBlockOutline.clear()
     }
 
@@ -4023,7 +4825,7 @@ async function main() {
     }
 
     if (digProgress >= 1) {
-      if (sampleDigBreakWorldBox(target, _boundsBox)) {
+      if (hasBreakBox) {
         digBreakFx.refreshBreakBox(_boundsBox)
       }
       digBreakFx.releaseHidden()
@@ -4042,7 +4844,9 @@ async function main() {
                   ? treeBreakMaterial
                   : target.blockType === 'wood' ||
                       target.kind === 'chest' ||
-                      target.kind === 'bed'
+                      target.kind === 'bed' ||
+                      target.kind === 'ballista' ||
+                      target.kind === 'catapult'
                     ? woodBreakMaterial
                     : dirtMaterial
       digBreakFx.finish(finishMat)
@@ -4051,7 +4855,11 @@ async function main() {
   }
 
   function isDigging() {
-    return digMouseDown || keys.has('KeyN')
+    return (
+      digMouseDown ||
+      keys.has('KeyN') ||
+      (touchControls.enabled && touchControls.isPrimaryHeld())
+    )
   }
 
   function updateSunShadow() {
@@ -4172,6 +4980,51 @@ async function main() {
 
   let wallFramePrev = performance.now()
 
+  /** Hold the overlay until frame times recover after the heavy boot hitch. */
+  const waitForStableFps = () => {
+    const GOOD_MS = 22
+    const NEED_STREAK = 45
+    const TIMEOUT_MS = 12000
+    const startedAt = performance.now()
+    let streak = 0
+    let settleProgress = 0
+    // Ignore the first few frames — they often include post-load GC/compile spikes.
+    let ignore = 8
+
+    return new Promise<void>((resolve) => {
+      const tick = () => {
+        const elapsed = performance.now() - startedAt
+        if (ignore > 0) {
+          ignore--
+          frameMsPeak = 0
+          requestAnimationFrame(tick)
+          return
+        }
+        // Gate on smoothed frame time; peak is reset so one old hitch doesn't stick.
+        const good = frameMs <= GOOD_MS
+        frameMsPeak = 0
+        if (good) streak++
+        else streak = Math.max(0, streak - 3)
+        settleProgress = Math.max(settleProgress, streak / NEED_STREAK)
+        setLoadingProgress(
+          LOAD_W_SETUP +
+            LOAD_W_SURFACE +
+            LOAD_W_BUILD +
+            LOAD_W_PROPS +
+            settleProgress * LOAD_W_SETTLE,
+          'Warming up…',
+        )
+        if (streak >= NEED_STREAK || elapsed >= TIMEOUT_MS) {
+          setLoadingProgress(1, 'Ready')
+          resolve()
+          return
+        }
+        requestAnimationFrame(tick)
+      }
+      requestAnimationFrame(tick)
+    })
+  }
+
   function animate() {
     requestAnimationFrame(animate)
     const wallNow = performance.now()
@@ -4187,7 +5040,10 @@ async function main() {
     frameMsPeak = Math.max(frameMsPeak, rawMs)
     adaptTimer += dt
     adaptCooldown = Math.max(0, adaptCooldown - dt)
-    if (adaptTimer >= ADAPT_INTERVAL && adaptCooldown <= 0) {
+    // Don't drop render scale during boot settle — we gate on full-quality FPS.
+    if (document.body.classList.contains('world-loading')) {
+      adaptTimer = 0
+    } else if (adaptTimer >= ADAPT_INTERVAL && adaptCooldown <= 0) {
       adaptTimer = 0
       if (!adaptiveResolution.enabled) {
         if (adaptivePixelScale !== 1) {
@@ -4296,7 +5152,7 @@ async function main() {
             spot.y,
           )
           if (gy !== null) {
-            const isBig = Math.random() < ENEMY_BIG_SPAWN_CHANCE
+            const tier = rollEnemySpawnTier()
             const enemy = createEnemy(
               enemyTemplate,
               spot.x,
@@ -4304,7 +5160,7 @@ async function main() {
               spot.z,
               enemiesGroup,
               enemiesGroup,
-              { big: isBig },
+              { tier },
             )
             applyEnemyLightHeight(enemy.visual, enemyLightHeightOffset())
             if (enemy.innerLight) {
@@ -4314,6 +5170,36 @@ async function main() {
           }
         }
       }
+    }
+
+    if (playerHealth > 0 && !playerDead) {
+      const nest = getSpiderNestParams()
+      updateSpiderNestBeacon(
+        spiderNestBeacon,
+        nest,
+        rockGround,
+        collisionWorld,
+        player.object.position.y,
+      )
+      tickSpiderNestSpawns(
+        spiders,
+        nest,
+        player.object.position,
+        spidersGroup,
+        spidersGroup,
+        rockGround,
+        collisionWorld,
+        spiderSpawnTimer,
+        dt,
+      )
+    } else {
+      updateSpiderNestBeacon(
+        spiderNestBeacon,
+        getSpiderNestParams(),
+        rockGround,
+        collisionWorld,
+        player.object.position.y,
+      )
     }
 
     enemyOrbDrops.update(dt, player.object.position)
@@ -4342,6 +5228,7 @@ async function main() {
       )
       profEnd('enemies')
       despawnOrphanEnemies(enemies, enemiesGroup, rockGround, collisionWorld, dt)
+      despawnStuckEnemies(enemies, enemiesGroup, player.object.position, dt)
       if (damage > 0 && playerHealth > 0 && !playerDead) {
         playerHealth = Math.max(0, playerHealth - damage)
         syncHealthHud()
@@ -4353,6 +5240,24 @@ async function main() {
         if (playerHealth <= 0) beginPlayerDeath()
       }
       syncEnemyHealthBars(enemies, camera)
+    }
+
+    if (spiders.length > 0) {
+      const spiderResult = updateSpiders(
+        spiders,
+        player.object.position,
+        rockGround,
+        dt,
+        collisionWorld,
+      )
+      if (spiderResult.damage > 0 && playerHealth > 0 && !playerDead) {
+        playerHealth = Math.max(0, playerHealth - spiderResult.damage)
+        syncHealthHud()
+        player.applyHurtCameraShake()
+        player.syncCamera()
+        if (playerHealth <= 0) beginPlayerDeath()
+      }
+      syncSpiderHealthBars(spiders, camera)
     }
 
     if (renderer.shadowMap.enabled) {
@@ -4392,10 +5297,14 @@ async function main() {
     const openChestId = inventory.getOpenContainerId()
     if (openChestId) {
       const openChest = placedChests.get(openChestId)
+      const openBallista = placedBallistas.get(openChestId)
+      const openCatapult = placedCatapults.get(openChestId)
+      const openContainer = openChest ?? openBallista ?? openCatapult
+      const holdReach = openCatapult ? CATAPULT_OPEN_HOLD_REACH : CHEST_OPEN_HOLD_REACH
       if (
-        !openChest ||
-        openChest.group.position.distanceToSquared(player.object.position) >
-          CHEST_OPEN_HOLD_REACH * CHEST_OPEN_HOLD_REACH
+        !openContainer ||
+        openContainer.group.position.distanceToSquared(player.object.position) >
+          holdReach * holdReach
       ) {
         inventory.closePanel(onInventoryLock)
       }
@@ -4423,6 +5332,7 @@ async function main() {
       isDigging() && !holdingBow && player.isLocked() && !panelOpen
     const digging = swinging && !holdingSwordOrSpear
     if (spearThrowCooldown > 0) spearThrowCooldown = Math.max(0, spearThrowCooldown - dt)
+    if (orbThrowCooldown > 0) orbThrowCooldown = Math.max(0, orbThrowCooldown - dt)
     if (
       spearThrowHeld &&
       player.isLocked() &&
@@ -4433,6 +5343,17 @@ async function main() {
       tryThrowSpear()
     } else if (!isSpearItem(inventory.getHeldItem())) {
       spearThrowHeld = false
+    }
+    if (
+      orbThrowHeld &&
+      player.isLocked() &&
+      !panelOpen &&
+      throwableOrbKind(inventory.getHeldItem()) &&
+      inventory.getSelectedCount() > 0
+    ) {
+      tryThrowOrb()
+    } else if (!throwableOrbKind(inventory.getHeldItem())) {
+      orbThrowHeld = false
     }
     if (
       scissorsSnipHeld &&
@@ -4452,6 +5373,7 @@ async function main() {
     }
     viewmodelHand.update(dt, swinging && !viewmodelHand.isThrowing() && !drawingBow)
     releasePendingSpearThrow()
+    releasePendingOrbThrow()
     if (player.isLocked() && !panelOpen && !drawingBow) {
       tryMeleeEnemyHit()
     } else if (lastMeleeSwingImpact > 0 || meleeHitThisSwing) {
@@ -4493,6 +5415,9 @@ async function main() {
           deathCtx: getEnemyDeathContext(),
           collisionWorld,
           capsuleCollider,
+          spiders,
+          spidersGroup,
+          spiderDeathCtx: getSpiderDeathContext(),
         },
       )
       if (spearsPicked > 0 && player.isLocked()) {
@@ -4535,6 +5460,70 @@ async function main() {
           deathCtx: getEnemyDeathContext(),
           collisionWorld,
           capsuleCollider,
+          spiders,
+          spidersGroup,
+          spiderDeathCtx: getSpiderDeathContext(),
+          onHeal: (amount) => {
+            if (playerHealth <= 0 || playerDead) return
+            const before = playerHealth
+            playerHealth = Math.min(PLAYER_MAX_HEALTH, playerHealth + amount)
+            if (playerHealth > before) {
+              syncHealthHud()
+              info.textContent = `+${Math.ceil(playerHealth - before)} health`
+            }
+          },
+          onPlayerDamage: (amount) => {
+            if (amount <= 0 || playerHealth <= 0 || playerDead) return
+            playerHealth = Math.max(0, playerHealth - amount)
+            syncHealthHud()
+            player.applyHurtCameraShake()
+            player.syncCamera()
+            if (playerHealth <= 0) beginPlayerDeath()
+          },
+        },
+      )
+      if (arrowsPicked > 0 && player.isLocked()) {
+        info.textContent =
+          arrowsPicked === 1 ? 'Picked up arrow' : `Picked up ${arrowsPicked} arrows`
+      }
+    }
+    if (thrownOrbs.length > 0 || hasOrbBlasts()) {
+      updateThrownOrbs(
+        dt,
+        thrownOrbs,
+        projectilesGroup,
+        enemies,
+        enemiesGroup,
+        raycaster,
+        {
+          groundTargets: rockGround,
+          trees: placedTrees,
+          rocks: placedRocks,
+          voxelMeshes: voxelInstancer.meshes,
+          resolveVoxelHit: (mesh, instanceId) => {
+            const layer = voxelInstancer.getLayerFromMesh(mesh)
+            if (layer === undefined) return null
+            const key = voxelInstancer.getCellKey(layer, instanceId)
+            if (!key) return null
+            const cell = cells.get(key)
+            if (!cell || !voxelInstancer.hasLayer(cell, layer)) return null
+            return { cellKey: key, layer }
+          },
+          intersectBuildBlocks: (rc, out) => {
+            if (blockBuilder.count > 0) blockBuilder.intersectMeshes(rc, out)
+          },
+          resolveBuildBlockHit: (mesh, instanceId) => {
+            if (!(mesh instanceof THREE.InstancedMesh)) return null
+            if (!blockBuilder.isBlockMesh(mesh)) return null
+            return blockBuilder.instanceCellKey(mesh, instanceId) ?? null
+          },
+          deathCtx: getEnemyDeathContext(),
+          collisionWorld,
+          capsuleCollider,
+          playerPos: player.object.position,
+          spiders,
+          spidersGroup,
+          spiderDeathCtx: getSpiderDeathContext(),
           onHeal: (amount) => {
             if (playerHealth <= 0 || playerDead) return
             const before = playerHealth
@@ -4546,10 +5535,45 @@ async function main() {
           },
         },
       )
-      if (arrowsPicked > 0 && player.isLocked()) {
-        info.textContent =
-          arrowsPicked === 1 ? 'Picked up arrow' : `Picked up ${arrowsPicked} arrows`
-      }
+    }
+    if (thrownCatapultRocks.length > 0 || hasCatapultRockBlasts()) {
+      updateThrownCatapultRocks(
+        dt,
+        thrownCatapultRocks,
+        projectilesGroup,
+        enemies,
+        enemiesGroup,
+        raycaster,
+        {
+          groundTargets: rockGround,
+          trees: placedTrees,
+          rocks: placedRocks,
+          voxelMeshes: voxelInstancer.meshes,
+          resolveVoxelHit: (mesh, instanceId) => {
+            const layer = voxelInstancer.getLayerFromMesh(mesh)
+            if (layer === undefined) return null
+            const key = voxelInstancer.getCellKey(layer, instanceId)
+            if (!key) return null
+            const cell = cells.get(key)
+            if (!cell || !voxelInstancer.hasLayer(cell, layer)) return null
+            return { cellKey: key, layer }
+          },
+          intersectBuildBlocks: (rc, out) => {
+            if (blockBuilder.count > 0) blockBuilder.intersectMeshes(rc, out)
+          },
+          resolveBuildBlockHit: (mesh, instanceId) => {
+            if (!(mesh instanceof THREE.InstancedMesh)) return null
+            if (!blockBuilder.isBlockMesh(mesh)) return null
+            return blockBuilder.instanceCellKey(mesh, instanceId) ?? null
+          },
+          deathCtx: getEnemyDeathContext(),
+          collisionWorld,
+          capsuleCollider,
+          spiders,
+          spidersGroup,
+          spiderDeathCtx: getSpiderDeathContext(),
+        },
+      )
     }
     syncEnemyCountHud()
     if (digging) {
@@ -4557,6 +5581,8 @@ async function main() {
       placedTorches.setGhost(null, null, false)
       placedChests.setGhost(null, null, false)
       placedBeds.setGhost(null, null, false)
+      placedBallistas.setGhost(null, null, false)
+      placedCatapults.setGhost(null, null, false)
       plantedSaplings.setGhost(null, null, false)
       updateDig(dt)
       _bpHasQuat = false
@@ -4574,6 +5600,8 @@ async function main() {
           placedTorches.setGhost(null, null, false)
           placedChests.setGhost(null, null, false)
           placedBeds.setGhost(null, null, false)
+          placedBallistas.setGhost(null, null, false)
+          placedCatapults.setGhost(null, null, false)
           plantedSaplings.setGhost(null, null, false)
           _bpQuat.copy(camera.quaternion)
           _bpHasQuat = true
@@ -4592,6 +5620,8 @@ async function main() {
           blockBuilder.setGhost(null)
           placedChests.setGhost(null, null, false)
           placedBeds.setGhost(null, null, false)
+          placedBallistas.setGhost(null, null, false)
+          placedCatapults.setGhost(null, null, false)
           plantedSaplings.setGhost(null, null, false)
           _bpQuat.copy(camera.quaternion)
           _bpHasQuat = true
@@ -4610,6 +5640,8 @@ async function main() {
           blockBuilder.setGhost(null)
           placedTorches.setGhost(null, null, false)
           placedBeds.setGhost(null, null, false)
+          placedBallistas.setGhost(null, null, false)
+          placedCatapults.setGhost(null, null, false)
           plantedSaplings.setGhost(null, null, false)
           _bpQuat.copy(camera.quaternion)
           _bpHasQuat = true
@@ -4628,6 +5660,46 @@ async function main() {
           blockBuilder.setGhost(null)
           placedTorches.setGhost(null, null, false)
           placedChests.setGhost(null, null, false)
+          placedBallistas.setGhost(null, null, false)
+          placedCatapults.setGhost(null, null, false)
+          plantedSaplings.setGhost(null, null, false)
+          _bpQuat.copy(camera.quaternion)
+          _bpHasQuat = true
+          buildPreviewTimer = 0
+          forceBuildPreview = false
+        }
+      } else if (player.isLocked() && inventory.getHeldItem() === 'ballista') {
+        buildPreviewTimer += dt
+        const rotDelta = _bpHasQuat ? camera.quaternion.angleTo(_bpQuat) : Infinity
+        if (
+          forceBuildPreview ||
+          rotDelta > BUILD_PREVIEW_ROT_EPS ||
+          buildPreviewTimer >= BUILD_PREVIEW_HEARTBEAT
+        ) {
+          updateBallistaPreview()
+          blockBuilder.setGhost(null)
+          placedTorches.setGhost(null, null, false)
+          placedChests.setGhost(null, null, false)
+          placedBeds.setGhost(null, null, false)
+          plantedSaplings.setGhost(null, null, false)
+          _bpQuat.copy(camera.quaternion)
+          _bpHasQuat = true
+          buildPreviewTimer = 0
+          forceBuildPreview = false
+        }
+      } else if (player.isLocked() && inventory.getHeldItem() === 'catapult') {
+        buildPreviewTimer += dt
+        const rotDelta = _bpHasQuat ? camera.quaternion.angleTo(_bpQuat) : Infinity
+        if (
+          forceBuildPreview ||
+          rotDelta > BUILD_PREVIEW_ROT_EPS ||
+          buildPreviewTimer >= BUILD_PREVIEW_HEARTBEAT
+        ) {
+          updateCatapultPreview()
+          blockBuilder.setGhost(null)
+          placedTorches.setGhost(null, null, false)
+          placedChests.setGhost(null, null, false)
+          placedBeds.setGhost(null, null, false)
           plantedSaplings.setGhost(null, null, false)
           _bpQuat.copy(camera.quaternion)
           _bpHasQuat = true
@@ -4647,6 +5719,8 @@ async function main() {
           placedTorches.setGhost(null, null, false)
           placedChests.setGhost(null, null, false)
           placedBeds.setGhost(null, null, false)
+          placedBallistas.setGhost(null, null, false)
+          placedCatapults.setGhost(null, null, false)
           _bpQuat.copy(camera.quaternion)
           _bpHasQuat = true
           buildPreviewTimer = 0
@@ -4657,16 +5731,116 @@ async function main() {
         placedTorches.setGhost(null, null, false)
         placedChests.setGhost(null, null, false)
         placedBeds.setGhost(null, null, false)
+        placedBallistas.setGhost(null, null, false)
+        placedCatapults.setGhost(null, null, false)
         plantedSaplings.setGhost(null, null, false)
         _bpHasQuat = false
       }
     }
     updateSpearReloadHud(digging)
     digBreakFx.tick(dt)
+    // Spread surface merge/BVH remeshes across frames after digs.
+    if (surfaceChunks.hasDirtyChunks()) surfaceChunks.pumpDirty(8)
     updateBlockExpiry()
     placedTorches.update(clock.elapsedTime, localLightExposureScale)
     placedChests.syncOpenId(inventory.getOpenContainerId())
     placedChests.update(dt)
+    if (placedBallistas.count > 0) {
+      placedBallistas.update(dt, enemies, spiders, ballistaFires, ballistaEjects, {
+        playerPos: player.object.position,
+      })
+      for (const eject of ballistaEjects) {
+        groundItems.spawnAt(
+          eject.item,
+          eject.count,
+          eject.position,
+          eject.velocity,
+          1.1,
+          eject.durability,
+        )
+      }
+      for (const shot of ballistaFires) {
+        if (shot.ammo.kind === 'arrow') {
+          spawnThrownArrow(
+            projectilesGroup,
+            shot.origin,
+            shot.direction,
+            thrownArrows,
+            shot.ammo.item,
+            ARROW_MAX_SPEED,
+          )
+        } else if (shot.ammo.kind === 'spear') {
+          spawnThrownSpear(
+            projectilesGroup,
+            shot.origin,
+            shot.direction,
+            thrownSpears,
+            shot.ammo.item,
+            shot.ammo.durability,
+          )
+        } else {
+          spawnThrownOrb(
+            projectilesGroup,
+            shot.origin,
+            shot.direction,
+            thrownOrbs,
+            shot.ammo.item === 'crystal_berries' ? 'heal' : 'damage',
+          )
+        }
+      }
+      // Hopper spit / spent ammo can change the open ballista UI.
+      if (
+        (ballistaEjects.length > 0 || ballistaFires.length > 0) &&
+        inventory.getOpenContainerId()
+      ) {
+        inventory.refreshExternalIfOpen()
+      }
+    }
+    if (placedCatapults.count > 0) {
+      placedCatapults.update(dt, enemies, spiders, catapultFires, catapultEjects, {
+        playerPos: player.object.position,
+        playerHeight: PLAYER_HEIGHT,
+      })
+      for (const eject of catapultEjects) {
+        groundItems.spawnAt(
+          eject.item,
+          eject.count,
+          eject.position,
+          eject.velocity,
+          1.1,
+          eject.durability,
+        )
+      }
+      for (const shot of catapultFires) {
+        spawnThrownCatapultRock(
+          projectilesGroup,
+          shot.origin,
+          shot.direction,
+          thrownCatapultRocks,
+          shot.ammo,
+          shot.speed,
+        )
+        if (shot.flingPlayer) {
+          const vx = shot.direction.x * shot.speed
+          const vy = shot.direction.y * shot.speed
+          const vz = shot.direction.z * shot.speed
+          // Snap into the scoop so the ride feels intentional.
+          player.object.position.set(
+            shot.origin.x,
+            Math.max(player.object.position.y, shot.origin.y - 0.15),
+            shot.origin.z,
+          )
+          player.applyLaunch(vx, vy, vz, 2.6)
+          info.textContent = 'Yeeted!'
+        }
+      }
+      if (
+        (catapultEjects.length > 0 || catapultFires.length > 0) &&
+        inventory.getOpenContainerId()
+      ) {
+        inventory.refreshExternalIfOpen()
+      }
+    }
     if (plantedSaplings.update(dt, placedTrees)) {
       syncPropCollision()
     }
@@ -4697,8 +5871,15 @@ async function main() {
     profReport(dt)
   }
   updatePerfHud()
+  await finishWorldPropsLoad()
   animate()
-  void startDistantTerrainLoad()
+  await waitForStableFps()
+  hideLoadingOverlay()
+  if (!player.isLocked()) {
+    info.textContent = touchControls.enabled
+      ? 'Tap to play — stick to move, drag to look'
+      : 'Click to play'
+  }
 }
 
 main().catch((err) => {

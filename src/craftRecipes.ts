@@ -347,4 +347,27 @@ export const CRAFT_RECIPES: CraftRecipe[] = [
     outputCount: 1,
     ingredients: [{ item: 'rope', count: 5 }],
   },
+  {
+    id: 'ballista',
+    output: 'ballista',
+    outputCount: 1,
+    ingredients: [
+      { item: 'stone', count: 5 },
+      { item: 'wood', count: 5 },
+      { item: 'computer_chip', count: 1 },
+      { item: 'bow', count: 1 },
+    ],
+  },
+  {
+    id: 'catapult',
+    output: 'catapult',
+    outputCount: 1,
+    ingredients: [
+      { item: 'wood', count: 10 },
+      { item: 'stone', count: 5 },
+      { item: 'iron', count: 1 },
+      { item: 'computer_chip', count: 1 },
+      { item: 'rope', count: 2 },
+    ],
+  },
 ]

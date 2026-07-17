@@ -21,6 +21,12 @@ export type TuneState = {
   enemySpawnRate: number
   enemySpeed: number
   enemyLightHeight: number
+  /** Nest center X offset from world spawn (−120…+120 via slider). */
+  spiderNestOffsetX: number
+  /** Nest center Z offset from world spawn (−120…+120 via slider). */
+  spiderNestOffsetZ: number
+  /** Spawn circle radius (meters via slider). */
+  spiderNestRadius: number
 }
 
 /** Canonical tuning defaults — keep `index.html` slider `value`s in sync. */
@@ -35,7 +41,7 @@ export const TUNE_DEFAULTS: TuneState = {
   debrisDivisions: 2,
   graphics: 45,
   fog: 82,
-  grassGreenSlope: 97,
+  grassGreenSlope: 90,
   grassTuftCluster: 82,
   treeFlatness: 3.05,
   treeRadius: 2.5,
@@ -47,6 +53,9 @@ export const TUNE_DEFAULTS: TuneState = {
   enemySpawnRate: 78,
   enemySpeed: 58,
   enemyLightHeight: 33,
+  spiderNestOffsetX: 19,
+  spiderNestOffsetZ: 41,
+  spiderNestRadius: 36,
 }
 
 export const DEFAULT_GRAVITY = TUNE_DEFAULTS.gravity
@@ -114,6 +123,9 @@ export function readTuneFromSliders(sliders: TuneSliderElements): TuneState {
     enemySpawnRate: sliderValue(sliders, 'enemySpawnRate'),
     enemySpeed: sliderValue(sliders, 'enemySpeed'),
     enemyLightHeight: sliderValue(sliders, 'enemyLightHeight'),
+    spiderNestOffsetX: sliderValue(sliders, 'spiderNestOffsetX'),
+    spiderNestOffsetZ: sliderValue(sliders, 'spiderNestOffsetZ'),
+    spiderNestRadius: sliderValue(sliders, 'spiderNestRadius'),
   }
 }
 
@@ -139,6 +151,14 @@ function migrateSavedTune(raw: Record<string, unknown>): Partial<TuneState> {
   // Bump default look speed down; keep custom values the user actually changed.
   if (out.lookSpeed === 5.25) {
     out.lookSpeed = TUNE_DEFAULTS.lookSpeed
+  }
+  // Remap prior nest defaults to the current absolute world spot (−74 / −22).
+  if (
+    (out.spiderNestOffsetX === 62 && out.spiderNestOffsetZ === 48) ||
+    (out.spiderNestOffsetX === 63 && out.spiderNestOffsetZ === 49)
+  ) {
+    out.spiderNestOffsetX = TUNE_DEFAULTS.spiderNestOffsetX
+    out.spiderNestOffsetZ = TUNE_DEFAULTS.spiderNestOffsetZ
   }
   return out
 }

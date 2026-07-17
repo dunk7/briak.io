@@ -75,10 +75,10 @@ export function createIronAlbedoMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
   const image = new ImageData(size, size)
   const data = image.data
 
-  const deep: [number, number, number] = [72, 70, 66]
-  const mid: [number, number, number] = [168, 164, 156]
-  const bright: [number, number, number] = [220, 216, 206]
-  const cool: [number, number, number] = [148, 156, 162]
+  const deep: [number, number, number] = [88, 86, 80]
+  const mid: [number, number, number] = [178, 174, 166]
+  const bright: [number, number, number] = [232, 228, 218]
+  const cool: [number, number, number] = [156, 164, 172]
 
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
@@ -89,19 +89,19 @@ export function createIronAlbedoMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
       const grain = fbm(u * 1.6 + 9.0, v * 1.6 + 1.3, 2)
       const speck = valueNoise(u * 3.4 + 5.5, v * 3.4 + 11.2)
 
-      let rgb = mix3(deep, mid, THREE.MathUtils.clamp(patch * 1.35, 0, 1))
-      rgb = mix3(rgb, bright, THREE.MathUtils.clamp((swirl - 0.58) * 2.4, 0, 1) * 0.55)
-      rgb = mix3(rgb, cool, THREE.MathUtils.clamp((patch - 0.5) * 1.2, 0, 1) * 0.22)
+      let rgb = mix3(deep, mid, THREE.MathUtils.clamp(patch * 1.4, 0, 1))
+      rgb = mix3(rgb, bright, THREE.MathUtils.clamp((swirl - 0.55) * 2.5, 0, 1) * 0.62)
+      rgb = mix3(rgb, cool, THREE.MathUtils.clamp((patch - 0.5) * 1.2, 0, 1) * 0.26)
 
-      const grainShade = (grain - 0.5) * 22
+      const grainShade = (grain - 0.5) * 28
       rgb = [rgb[0] + grainShade, rgb[1] + grainShade, rgb[2] + grainShade]
 
       // Soft metallic sparkles — scattered, not aligned
-      if (speck > 0.86) {
-        const spark = (speck - 0.86) / 0.14
-        rgb = mix3(rgb, bright, spark * 0.7)
-      } else if (speck < 0.12) {
-        rgb = mix3(rgb, deep, ((0.12 - speck) / 0.12) * 0.35)
+      if (speck > 0.84) {
+        const spark = (speck - 0.84) / 0.16
+        rgb = mix3(rgb, bright, spark * 0.78)
+      } else if (speck < 0.14) {
+        rgb = mix3(rgb, deep, ((0.14 - speck) / 0.14) * 0.42)
       }
 
       const i = (y * size + x) * 4

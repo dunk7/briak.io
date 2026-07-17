@@ -2,9 +2,38 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
     <title>Terrain Explorer</title>
     <link rel="stylesheet" href="/src/style.css" />
+    <style>
+      /* Shown only if the Vite app never boots (e.g. opened as file://). */
+      #boot-error {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: #111;
+        color: #eee;
+        font-family: system-ui, -apple-system, sans-serif;
+        text-align: center;
+        line-height: 1.5;
+      }
+      #boot-error code {
+        display: inline-block;
+        margin-top: 8px;
+        padding: 4px 8px;
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.08);
+      }
+    </style>
   </head>
   <body>
     <div id="bottom-hud">
@@ -50,6 +79,26 @@
           <aside class="inventory-craft-column" data-chest-column hidden aria-label="Chest">
             <h3 class="inventory-section-label" data-chest-label>Chest</h3>
             <div class="inventory-grid inventory-grid--backpack" data-chest-grid></div>
+            <div class="ballista-controls" data-ballista-controls hidden>
+              <div class="ballista-control-row">
+                <span class="ballista-control-label">Target</span>
+                <button type="button" class="ballista-control-btn" data-ballista-priority="closest">Closest</button>
+                <button type="button" class="ballista-control-btn" data-ballista-priority="strongest">Strongest</button>
+                <button type="button" class="ballista-control-btn" data-ballista-priority="near_player">Near me</button>
+              </div>
+              <div class="ballista-control-row">
+                <span class="ballista-control-label">Rate</span>
+                <button type="button" class="ballista-control-btn" data-ballista-rate="slow">Slow</button>
+                <button type="button" class="ballista-control-btn" data-ballista-rate="normal">Normal</button>
+                <button type="button" class="ballista-control-btn" data-ballista-rate="fast">Fast</button>
+              </div>
+              <div class="ballista-control-row">
+                <span class="ballista-control-label">You</span>
+                <button type="button" class="ballista-control-btn" data-ballista-target-player="on">Shoot me</button>
+                <button type="button" class="ballista-control-btn" data-ballista-target-player="off">Enemies only</button>
+              </div>
+              <p class="ballista-control-hint">Ammo: arrows, spears, orbs, berries. “Shoot me” is for healing ammo.</p>
+            </div>
           </aside>
         </div>
       </div>
@@ -66,9 +115,21 @@
       <div id="dig-progress-fill"></div>
     </div>
     <div id="loading-overlay" aria-live="polite" aria-busy="true" hidden>
-      <div class="loading-label">Loading…</div>
+      <div class="loading-panel">
+        <div class="loading-label">Loading…</div>
+        <div
+          class="loading-bar"
+          role="progressbar"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow="0"
+        >
+          <div class="loading-bar-fill"></div>
+        </div>
+        <div class="loading-pct">0%</div>
+      </div>
     </div>
-    <div id="controls" hidden></div>
+    <div id="controls" class="touch-controls" hidden aria-hidden="true"></div>
     <div id="jump-tune">
       <div class="jump-tune-row">
         <label for="gravity-slider">Gravity</label>
@@ -181,9 +242,9 @@
           min="0"
           max="100"
           step="1"
-          value="97"
+          value="90"
         />
-        <output id="grass-green-slope-value">0.97</output>
+        <output id="grass-green-slope-value">0.90</output>
       </div>
       <div class="jump-tune-row">
         <label
@@ -287,7 +348,49 @@
         <input type="range" id="enemy-light-height-slider" min="0" max="100" step="1" value="33" />
         <output id="enemy-light-height-value">-0.02</output>
       </div>
+      <div class="jump-tune-row">
+        <label for="spider-nest-x-slider" title="World X of the spider nest (glowing sky beacon)">
+          Spider nest X
+        </label>
+        <input type="range" id="spider-nest-x-slider" min="0" max="100" step="1" value="19" />
+        <output id="spider-nest-x-value">-74</output>
+      </div>
+      <div class="jump-tune-row">
+        <label for="spider-nest-z-slider" title="World Z of the spider nest (glowing sky beacon)">
+          Spider nest Z
+        </label>
+        <input type="range" id="spider-nest-z-slider" min="0" max="100" step="1" value="41" />
+        <output id="spider-nest-z-value">-22</output>
+      </div>
+      <div class="jump-tune-row">
+        <label
+          for="spider-nest-radius-slider"
+          title="Spawn circle radius — spiders appear randomly inside this ring every 4.5s when you are within 42m (max 5)"
+        >
+          Spider nest radius
+        </label>
+        <input type="range" id="spider-nest-radius-slider" min="0" max="100" step="1" value="36" />
+        <output id="spider-nest-radius-value">12.0m</output>
+      </div>
+    </div>
+    <div id="boot-error" role="alert">
+      <div>
+        <p><strong>Game didn’t start.</strong></p>
+        <p>
+          Don’t open <code>index.html</code> directly. From the project folder run
+          <code>npm run dev</code>, then open the local URL Vite prints (usually
+          <code>http://localhost:5173</code>).
+        </p>
+      </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
+    <script>
+      // If the module bundle never mounts a canvas, show how to boot the game.
+      setTimeout(() => {
+        if (document.querySelector('canvas')) return
+        const el = document.getElementById('boot-error')
+        if (el) el.style.display = 'flex'
+      }, 2500)
+    </script>
   </body>
 </html>

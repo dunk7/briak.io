@@ -26,6 +26,7 @@ type GroundItemEntity = {
   mesh: THREE.Object3D
   item: InventoryItem
   count: number
+  durability?: number
   vel: THREE.Vector3
   life: number
   pickupDelay: number
@@ -68,6 +69,7 @@ export class GroundItems {
     count: number,
     origin: THREE.Vector3,
     forward: THREE.Vector3,
+    durability?: number,
   ) {
     if (count <= 0) return
     _forward.copy(forward)
@@ -86,12 +88,12 @@ export class GroundItems {
     vel.x += (Math.random() - 0.5) * 0.8
     vel.z += (Math.random() - 0.5) * 0.8
 
-    this.spawnAt(item, count, pos, vel, DEFAULT_PICKUP_DELAY)
+    this.spawnAt(item, count, pos, vel, DEFAULT_PICKUP_DELAY, durability)
   }
 
   /** Scatter stacks around a death point. */
   spawnDeathScatter(
-    stacks: { item: InventoryItem; count: number }[],
+    stacks: { item: InventoryItem; count: number; durability?: number }[],
     origin: THREE.Vector3,
   ) {
     for (const stack of stacks) {
@@ -108,7 +110,7 @@ export class GroundItems {
         2.4 + Math.random() * 2.2,
         Math.sin(angle) * (1.6 + Math.random() * 2.4),
       )
-      this.spawnAt(stack.item, stack.count, pos, vel, 1.1)
+      this.spawnAt(stack.item, stack.count, pos, vel, 1.1, stack.durability)
     }
   }
 
@@ -118,6 +120,7 @@ export class GroundItems {
     position: THREE.Vector3,
     velocity: THREE.Vector3,
     pickupDelay = DEFAULT_PICKUP_DELAY,
+    durability?: number,
   ) {
     if (count <= 0) return
 
@@ -132,6 +135,7 @@ export class GroundItems {
       mesh,
       item,
       count,
+      durability,
       vel: velocity.clone(),
       life: LIFETIME,
       pickupDelay,
@@ -173,7 +177,7 @@ export class GroundItems {
 
   private tryPickup(entity: GroundItemEntity): boolean {
     if (!this.inventory || entity.pickupDelay > 0) return false
-    const added = this.inventory.add(entity.item, entity.count)
+    const added = this.inventory.add(entity.item, entity.count, entity.durability)
     if (added <= 0) return false
     entity.count -= added
     if (entity.count <= 0) {

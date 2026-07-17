@@ -8,37 +8,38 @@ export const DIAMOND_DARK = 0x0a5a5c
 const DEFAULT_SIZE = 128
 
 /**
- * 16×16 diamond face — mostly cyan gem pixels with soft light/dark speckles.
- * No heavy vein lines.
+ * 16×16 diamond ore face — stone matrix with bright cyan crystal flecks.
+ * Reads clearly underground (not glassy / clear).
  *
- * Palette: X rim, D soft shade, M mid, B bright, L light, H highlight
+ * Palette: S stone, D deep stone, R rock rim, C crystal mid, B bright, L light, H highlight
  */
 const TILE = [
-  'XXXXXXXXXXXXXXXX',
-  'XHHLLBBMMBBLHHHX',
-  'XHLLBBMMMBBLLHHX',
-  'XLLBBMMM MBBLLHX',
-  'XLBBMMMMMMBBLLLX',
-  'XBBMMMMMMMBBBLLX',
-  'XBMMMMMMMMMBBBLX',
-  'XMMMMLMMMMMMBBBX',
-  'XMMMLLLMMMMMBBBX',
-  'XMMLLLLMMMMMBBBX',
-  'XMLLLLLMMM MBBBX',
-  'XLLLLBBMMM MBBBX',
-  'XLLLBBMMMMMBBLDX',
-  'XLHHBBMMMMBBLLDX',
-  'XHHHLLBBBBLLDDDX',
-  'XXXXXXXXXXXXXXXX',
-].map((row) => row.replace(/ /g, 'M'))
+  'RRRRRRRRRRRRRRRR',
+  'RSSSDSSSCCSDSSSR',
+  'RSDSSSCCBBCCSSDR',
+  'RSSSCCBBHHBBCCSR',
+  'RDSSCBBHHHBBCSRR',
+  'RSSSCBBLLLBBCCSR',
+  'RSSSCCBLLLBBCCDR',
+  'RSDSSCCBBBBCCSSR',
+  'RSSSDSSSCCSSSDSR',
+  'RSSSCCBBHHBBCCSR',
+  'RDSSCBBHHHBBCSRR',
+  'RSSSCBBLLLBBCCSR',
+  'RSSSCCBLLLBBCCDR',
+  'RSDSSCCBBBBCCSSR',
+  'RSSSDSSSCCSSSDSR',
+  'RRRRRRRRRRRRRRRR',
+]
 
 const PALETTE: Record<string, [number, number, number]> = {
-  X: [18, 120, 118],
-  D: [48, 180, 174],
-  M: [90, 238, 228],
-  B: [120, 244, 234],
-  L: [170, 250, 242],
-  H: [230, 255, 250],
+  R: [72, 68, 62],
+  S: [98, 94, 86],
+  D: [58, 54, 48],
+  C: [56, 210, 200],
+  B: [90, 238, 228],
+  L: [150, 248, 240],
+  H: [220, 255, 250],
 }
 
 function clampByte(v: number) {
@@ -46,8 +47,7 @@ function clampByte(v: number) {
 }
 
 /**
- * Diamond block albedo — soft cyan pixel mottling, no dark vein stripes.
- * Nearest-neighbor upscaled from a 16×16 pixel pattern.
+ * Diamond ore albedo — stone with bright cyan crystals (nearest-upscaled 16×16).
  */
 export function createDiamondAlbedoMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
   const image = new ImageData(size, size)
@@ -59,7 +59,7 @@ export function createDiamondAlbedoMap(size = DEFAULT_SIZE): THREE.CanvasTexture
       const px = Math.min(15, Math.floor(x / cell))
       const py = Math.min(15, Math.floor(y / cell))
       const key = TILE[py]![px]!
-      const rgb = PALETTE[key] ?? PALETTE.M!
+      const rgb = PALETTE[key] ?? PALETTE.S!
 
       const i = (y * size + x) * 4
       data[i] = clampByte(rgb[0])

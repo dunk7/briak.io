@@ -203,11 +203,12 @@ const BERRY_GLOW_COLOR = 0xb060ff
 const BERRY_GLOW_INTENSITY = 4.8
 const BERRY_GLOW_DISTANCE = 11
 /**
- * Fixed PointLight count. Cloning a light onto each berry tree (or planting one)
- * changes NUM_POINT_LIGHTS and forces Three.js to recompile every
- * MeshStandardMaterial — a ~half-second hitch. Same pattern as torches.
+ * Cap on concurrent canopy PointLights. Only *assigned* lights stay visible —
+ * parked slots are hidden so they do not inflate NUM_POINT_LIGHTS (a 20-light
+ * always-on pool was crushing Medium to ~15fps). Assign/release can recompile
+ * once; that hitch beats permanent GPU light-list bloat.
  */
-const MAX_BERRY_GLOW_LIGHTS = 20
+const MAX_BERRY_GLOW_LIGHTS = 8
 let berryMaterial: THREE.MeshStandardMaterial | null = null
 let berryGlowEnabled = true
 const berryGlowLights: THREE.PointLight[] = []
@@ -252,14 +253,14 @@ function berryClusterCenter(root: THREE.Object3D, out: THREE.Vector3) {
 function parkBerryGlowLight(light: THREE.PointLight) {
   light.intensity = 0
   light.position.set(0, -9999, 0)
-  // When glows are quality-gated off, keep lights out of the WebGL light list so
-  // NUM_POINT_LIGHTS drops. Toggling visible recompiles once (graphics slider).
-  if (!berryGlowEnabled) light.visible = false
+  // Always hide parked lights — intensity 0 still counts toward NUM_POINT_LIGHTS
+  // while visible, and that cost is paid on every MeshStandardMaterial fragment.
+  light.visible = false
 }
 
 /**
- * Pre-add a fixed set of berry canopy lights so plant/chop/respawn never
- * changes NUM_POINT_LIGHTS (avoids material recompile hitch).
+ * Pre-create canopy light objects (hidden until assigned). Visibility tracks
+ * assignment so unused slots do not bloat the GPU light list.
  */
 export function initBerryGlowLightPool(parent: THREE.Object3D) {
   if (berryGlowPool.length > 0) return
@@ -270,16 +271,13 @@ export function initBerryGlowLightPool(parent: THREE.Object3D) {
       BERRY_GLOW_DISTANCE,
       2,
     )
-    // Stay visible while the Medium+ glow path is active — toggling .visible
-    // mid-session (plant/chop) would recompile every MeshStandardMaterial.
-    light.visible = berryGlowEnabled
+    light.visible = false
     light.userData.berryGlowLight = true
     light.userData.baseIntensity = BERRY_GLOW_INTENSITY
     light.userData.baseDistance = BERRY_GLOW_DISTANCE
     parkBerryGlowLight(light)
     parent.add(light)
     berryGlowPool.push({ light, tree: null })
-    berryGlowLights.push(light)
   }
 }
 
@@ -359,9 +357,8 @@ export function refreshBerryGlowLights(treesRoot: THREE.Object3D) {
 
 /**
  * Enable crystal berry shine + canopy lights on Medium+ graphics.
- * Materials are shared across clones; lights modulate from the fixed pool.
- * When disabled, lights are hidden (not just intensity 0) so the GPU light
- * count drops — expect a one-time material recompile on the graphics slider.
+ * Materials are shared across clones; lights modulate from the assigned pool.
+ * Expect a one-time material recompile when the graphics slider crosses Medium.
  */
 export function setBerryGlowEnabled(enabled: boolean, treesRoot?: THREE.Object3D) {
   berryGlowEnabled = enabled
@@ -372,16 +369,11 @@ export function setBerryGlowEnabled(enabled: boolean, treesRoot?: THREE.Object3D
     if (!enabled) berryMaterial.emissiveIntensity = 0.28
   }
   for (const slot of berryGlowPool) {
-    if (!slot.tree) {
+    if (!slot.tree || !enabled) {
       parkBerryGlowLight(slot.light)
       continue
     }
-    if (!enabled) {
-      slot.light.visible = false
-      slot.light.intensity = 0
-    } else {
-      slot.light.visible = true
-    }
+    slot.light.visible = true
   }
 }
 

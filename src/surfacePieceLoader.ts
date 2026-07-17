@@ -4,9 +4,16 @@ import { applySurfaceCapMaterials } from './surfaceCapMaterials'
 import { alignSurfaceToCellGrid, type TerrainGrid } from './voxelPlacement'
 import type { SurfaceChunkManager } from './surfaceChunks'
 
-export const SURFACE_LOAD_CONCURRENCY = 12
-/** Nearest surface cells to load before the game is playable. */
-export const MAX_INITIAL_SURFACE_CELLS = 80
+/** Parallel GLTF fetches during boot — scale with cores, cap to avoid thrash. */
+export const SURFACE_LOAD_CONCURRENCY = Math.min(
+  32,
+  Math.max(
+    16,
+    (typeof navigator !== 'undefined' ? navigator.hardwareConcurrency ?? 8 : 8) * 2,
+  ),
+)
+/** @deprecated Boot now loads the full map; kept for any external callers. */
+export const MAX_INITIAL_SURFACE_CELLS = 36
 
 export type SurfaceCellMeta = {
   ix: number
@@ -25,7 +32,6 @@ export type SurfaceLoadCell = {
   capBottomY: number
   bounds?: { min: number[]; max: number[] }
   surfaceRoot?: THREE.Object3D
-  surfaceSource?: THREE.Object3D
 }
 
 export type SurfaceLoadContext = {
@@ -102,16 +108,25 @@ export function thawSubtreeMatrices(root: THREE.Object3D) {
   })
 }
 
+/** Nearest cells first so spawn ground finishes early within a full-map load. */
+export function sortSurfaceCellsByDistance<T extends SurfaceCellMeta>(
+  metas: T[],
+  spawnX: number,
+  spawnZ: number,
+): T[] {
+  return [...metas].sort((a, b) => {
+    const da = (a.center_x - spawnX) ** 2 + (a.center_y - spawnZ) ** 2
+    const db = (b.center_x - spawnX) ** 2 + (b.center_y - spawnZ) ** 2
+    return da - db
+  })
+}
+
 export function sortSurfaceCellsBySpawn<T extends SurfaceCellMeta>(
   metas: T[],
   spawnX: number,
   spawnZ: number,
 ): { priority: T[]; deferred: T[] } {
-  const sorted = [...metas].sort((a, b) => {
-    const da = (a.center_x - spawnX) ** 2 + (a.center_y - spawnZ) ** 2
-    const db = (b.center_x - spawnX) ** 2 + (b.center_y - spawnZ) ** 2
-    return da - db
-  })
+  const sorted = sortSurfaceCellsByDistance(metas, spawnX, spawnZ)
   return {
     priority: sorted.slice(0, MAX_INITIAL_SURFACE_CELLS),
     deferred: sorted.slice(MAX_INITIAL_SURFACE_CELLS),
@@ -122,17 +137,25 @@ export async function runLoadPool<T>(
   items: readonly T[],
   concurrency: number,
   loadOne: (item: T) => Promise<void>,
+  onProgress?: (done: number, total: number) => void,
 ): Promise<void> {
-  if (items.length === 0) return
+  if (items.length === 0) {
+    onProgress?.(0, 0)
+    return
+  }
   let next = 0
+  let done = 0
+  const total = items.length
   const worker = async () => {
     while (true) {
       const i = next++
-      if (i >= items.length) break
+      if (i >= total) break
       await loadOne(items[i]!)
+      done++
+      onProgress?.(done, total)
     }
   }
-  const workers = Math.min(concurrency, items.length)
+  const workers = Math.min(concurrency, total)
   await Promise.all(Array.from({ length: workers }, () => worker()))
 }
 
@@ -151,8 +174,9 @@ export function loadSurfaceCell(
       (gltf) => {
         const root = gltf.scene
         tagSurfaceLayerMeshes(root)
-        const pristine = root.clone()
-        tagSurfaceLayerMeshes(pristine)
+        // Skip a full scene clone for slope-refresh sources — refreshing
+        // re-clones surfaceRoot and re-applies materials instead. That saves
+        // one deep clone per cell during the cold-load path (~1.8k GLBs).
         applySurfaceCapMaterials(
           root,
           ctx.dirtMaterial,
@@ -175,7 +199,6 @@ export function loadSurfaceCell(
         freezeSubtreeMatrices(root)
         ctx.surfaceChunks.registerCell(cell)
         ctx.surfaceChunks.markDirtyForCell(cell)
-        queueSurfaceSource(cell, pristine)
         resolve()
       },
       undefined,
@@ -187,38 +210,3 @@ export function loadSurfaceCell(
   })
 }
 
-const pendingSources: { cell: SurfaceLoadCell; source: THREE.Object3D }[] = []
-let idleFlushScheduled = false
-
-function queueSurfaceSource(cell: SurfaceLoadCell, source: THREE.Object3D) {
-  pendingSources.push({ cell, source })
-  scheduleIdleSourceFlush()
-}
-
-function scheduleIdleSourceFlush() {
-  if (idleFlushScheduled) return
-  idleFlushScheduled = true
-  const run = () => {
-    idleFlushScheduled = false
-    const batch = pendingSources.splice(0, 16)
-    for (const { cell, source } of batch) {
-      cell.surfaceSource = source
-    }
-    if (pendingSources.length > 0) scheduleIdleSourceFlush()
-  }
-  if (typeof requestIdleCallback === 'function') {
-    requestIdleCallback(run, { timeout: 2000 })
-  } else {
-    setTimeout(run, 0)
-  }
-}
-
-/** Assign any queued grass-slope source clones immediately (e.g. before slope refresh). */
-export function flushPendingSurfaceSources() {
-  while (pendingSources.length > 0) {
-    const batch = pendingSources.splice(0, pendingSources.length)
-    for (const { cell, source } of batch) {
-      cell.surfaceSource = source
-    }
-  }
-}

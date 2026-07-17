@@ -75,10 +75,10 @@ export function createGoldAlbedoMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
   const image = new ImageData(size, size)
   const data = image.data
 
-  const deep: [number, number, number] = [110, 72, 14]
-  const mid: [number, number, number] = [212, 168, 42]
-  const bright: [number, number, number] = [255, 232, 140]
-  const rose: [number, number, number] = [200, 140, 48]
+  const deep: [number, number, number] = [120, 78, 16]
+  const mid: [number, number, number] = [220, 176, 46]
+  const bright: [number, number, number] = [255, 238, 150]
+  const rose: [number, number, number] = [210, 148, 52]
 
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
@@ -89,18 +89,18 @@ export function createGoldAlbedoMap(size = DEFAULT_SIZE): THREE.CanvasTexture {
       const grain = fbm(u * 1.5 + 6.2, v * 1.5 + 13.4, 2)
       const speck = valueNoise(u * 3.2 + 1.8, v * 3.2 + 7.9)
 
-      let rgb = mix3(deep, mid, THREE.MathUtils.clamp(patch * 1.35, 0, 1))
-      rgb = mix3(rgb, bright, THREE.MathUtils.clamp((swirl - 0.56) * 2.5, 0, 1) * 0.6)
-      rgb = mix3(rgb, rose, THREE.MathUtils.clamp((patch - 0.45) * 1.4, 0, 1) * 0.28)
+      let rgb = mix3(deep, mid, THREE.MathUtils.clamp(patch * 1.4, 0, 1))
+      rgb = mix3(rgb, bright, THREE.MathUtils.clamp((swirl - 0.52) * 2.6, 0, 1) * 0.68)
+      rgb = mix3(rgb, rose, THREE.MathUtils.clamp((patch - 0.42) * 1.45, 0, 1) * 0.32)
 
-      const grainShade = (grain - 0.5) * 20
+      const grainShade = (grain - 0.5) * 26
       rgb = [rgb[0] + grainShade, rgb[1] + grainShade * 0.9, rgb[2] + grainShade * 0.55]
 
-      if (speck > 0.88) {
-        const spark = (speck - 0.88) / 0.12
-        rgb = mix3(rgb, bright, spark * 0.75)
-      } else if (speck < 0.1) {
-        rgb = mix3(rgb, deep, ((0.1 - speck) / 0.1) * 0.4)
+      if (speck > 0.86) {
+        const spark = (speck - 0.86) / 0.14
+        rgb = mix3(rgb, bright, spark * 0.82)
+      } else if (speck < 0.12) {
+        rgb = mix3(rgb, deep, ((0.12 - speck) / 0.12) * 0.48)
       }
 
       const i = (y * size + x) * 4

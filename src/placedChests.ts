@@ -27,7 +27,7 @@ const _center = new THREE.Vector3()
 const _forward = new THREE.Vector3()
 const _look = new THREE.Vector3()
 
-export type ChestStack = { item: InventoryItem; count: number }
+export type ChestStack = { item: InventoryItem; count: number; durability?: number }
 
 export type PlacedChest = {
   id: string
@@ -459,7 +459,11 @@ export class PlacedChestManager {
     for (let i = 0; i < chest.slots.length; i++) {
       const slot = chest.slots[i]
       if (!slot) continue
-      out.push({ item: slot.item, count: slot.count })
+      out.push(
+        slot.durability !== undefined
+          ? { item: slot.item, count: slot.count, durability: slot.durability }
+          : { item: slot.item, count: slot.count },
+      )
       chest.slots[i] = null
     }
     return out

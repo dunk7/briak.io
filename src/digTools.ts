@@ -2,7 +2,17 @@ import type { InventoryItem } from './inventory'
 import type { OreType } from './voxelPlacement'
 
 export type DigToolTarget = {
-  kind: 'surface' | 'voxel' | 'rock' | 'tree' | 'block' | 'torch' | 'chest' | 'bed'
+  kind:
+    | 'surface'
+    | 'voxel'
+    | 'rock'
+    | 'tree'
+    | 'block'
+    | 'torch'
+    | 'chest'
+    | 'bed'
+    | 'ballista'
+    | 'catapult'
   blockType?: 'dirt' | 'wood' | 'stone' | 'iron' | 'gold' | 'diamond'
   /** Underground iron ore voxel (mined from dirt columns). */
   isIronOre?: boolean
@@ -28,7 +38,9 @@ function isWoodTarget(target: DigToolTarget): boolean {
     target.blockType === 'wood' ||
     target.kind === 'torch' ||
     target.kind === 'chest' ||
-    target.kind === 'bed'
+    target.kind === 'bed' ||
+    target.kind === 'ballista' ||
+    target.kind === 'catapult'
   )
 }
 

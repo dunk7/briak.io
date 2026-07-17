@@ -21,6 +21,50 @@ export const ENEMY_BIG_CRAWL_SPEED_SCALE = 0.55
 export const ENEMY_BIG_SWORD_KNOCKBACK_MULT = 1.55
 export const ENEMY_DAMAGE = 1
 export const ENEMY_BIG_DAMAGE = 2
+/** Rare boss-tier: double the big one's size. */
+export const ENEMY_HUGE_SCALE = ENEMY_BIG_SCALE * 2
+export const ENEMY_HUGE_MAX_HEALTH = ENEMY_BIG_MAX_HEALTH * 4
+/** Chance that a newly spawned enemy is the huge variant (rarer than big). */
+export const ENEMY_HUGE_SPAWN_CHANCE = 0.05
+export const ENEMY_HUGE_SPLIT_COUNT = 2
+/** Huge enemies crawl and lunge even slower than bigs. */
+export const ENEMY_HUGE_CRAWL_SPEED_SCALE = 0.38
+export const ENEMY_HUGE_DAMAGE = 10
+export const ENEMY_HUGE_SWORD_KNOCKBACK_MULT = 1.85
+
+export type EnemySizeTier = 'normal' | 'big' | 'huge'
+
+/** Night / debug spawn roll: huge first (rare), then big, else normal. */
+export function rollEnemySpawnTier(): EnemySizeTier {
+  const r = Math.random()
+  if (r < ENEMY_HUGE_SPAWN_CHANCE) return 'huge'
+  if (r < ENEMY_HUGE_SPAWN_CHANCE + ENEMY_BIG_SPAWN_CHANCE) return 'big'
+  return 'normal'
+}
+
+function enemyScaleMul(tier: EnemySizeTier): number {
+  if (tier === 'huge') return ENEMY_HUGE_SCALE
+  if (tier === 'big') return ENEMY_BIG_SCALE
+  return 1
+}
+
+function enemyMaxHealthForTier(tier: EnemySizeTier): number {
+  if (tier === 'huge') return ENEMY_HUGE_MAX_HEALTH
+  if (tier === 'big') return ENEMY_BIG_MAX_HEALTH
+  return ENEMY_MAX_HEALTH
+}
+
+function enemyDamageForTier(tier: EnemySizeTier): number {
+  if (tier === 'huge') return ENEMY_HUGE_DAMAGE
+  if (tier === 'big') return ENEMY_BIG_DAMAGE
+  return ENEMY_DAMAGE
+}
+
+function enemyCrawlSpeedScale(tier: EnemySizeTier): number {
+  if (tier === 'huge') return ENEMY_HUGE_CRAWL_SPEED_SCALE
+  if (tier === 'big') return ENEMY_BIG_CRAWL_SPEED_SCALE
+  return 1
+}
 export const ENEMY_MELEE_DAMAGE = 1
 export const ITEM_MELEE_DAMAGE = 2
 export const SWORD_MELEE_DAMAGE = 4
@@ -128,6 +172,8 @@ export const ENEMY_BAR_WORLD_WIDTH = 0.36
 export const ENEMY_BAR_WORLD_HEIGHT = 0.042
 export const ENEMY_BAR_BIG_WORLD_WIDTH = 0.48
 export const ENEMY_BAR_BIG_WORLD_HEIGHT = 0.052
+export const ENEMY_BAR_HUGE_WORLD_WIDTH = 0.72
+export const ENEMY_BAR_HUGE_WORLD_HEIGHT = 0.07
 export const DEFAULT_ENEMY_SPAWN_RATE = 78
 export const DEFAULT_ENEMY_SPEED = 58
 export const DEFAULT_ENEMY_LIGHT_HEIGHT = 33
@@ -226,6 +272,11 @@ const ENEMY_MESH_RECOVER_ABOVE = 2.5
 const ENEMY_ORPHAN_FALL_CULL = 80
 /** Seconds of unrecoverable free-fall before silent delete. */
 const ENEMY_ORPHAN_DESPAWN_SEC = 2.5
+/** Despawn if XZ travel stays under this distance for ENEMY_STUCK_TIME_SEC. */
+const ENEMY_STUCK_MOVE_MIN = 1
+const ENEMY_STUCK_MOVE_MIN_SQ = ENEMY_STUCK_MOVE_MIN * ENEMY_STUCK_MOVE_MIN
+/** Seconds without ≥1 m of XZ progress before a stuck enemy is removed. */
+const ENEMY_STUCK_TIME_SEC = 10
 
 /** Reused light-budget scratch — avoid allocating {enemy, distSq} every frame. */
 const _lightOrder: { enemy: EnemyInstance; distSq: number }[] = []
@@ -276,21 +327,10 @@ const healthBarTrackMat = new THREE.MeshBasicMaterial({
   depthWrite: false,
 })
 const healthBarFillMat = new THREE.MeshBasicMaterial({
-  color: 0x22c55e,
+  color: new THREE.Color().setStyle('hsl(0, 68%, 36%)'),
   toneMapped: false,
   depthWrite: false,
 })
-
-const _healthBarRed = new THREE.Color()
-const _healthBarGreen = new THREE.Color()
-_healthBarRed.setStyle('hsl(0, 68%, 36%)')
-_healthBarGreen.setStyle('hsl(128, 82%, 46%)')
-
-/** Match player HUD fill endpoints; RGB lerp avoids the orange HSL hue band. */
-function healthBarColorFromFraction(t: number, out: THREE.Color): THREE.Color {
-  const u = THREE.MathUtils.clamp(t, 0, 1)
-  return out.copy(_healthBarRed).lerp(_healthBarGreen, u)
-}
 const healthBarBorderMat = new THREE.MeshBasicMaterial({
   color: 0xffffff,
   transparent: true,
@@ -320,7 +360,7 @@ export type EnemyCellMeta = {
 type EnemyAttackPhase = 'idle' | 'lunge' | 'recover'
 
 export type EnemyCreateOptions = {
-  big?: boolean
+  tier?: EnemySizeTier
 }
 
 export type EnemyDeathContext = {
@@ -350,7 +390,7 @@ export type EnemyInstance = {
   /** XZ radius used for soft separation from other enemies. */
   separationRadius: number
   maxHealth: number
-  isBig: boolean
+  tier: EnemySizeTier
   health: number
   attackCooldown: number
   attackPhase: EnemyAttackPhase
@@ -371,10 +411,20 @@ export type EnemyInstance = {
   collideTerrainMesh: boolean
   /** Accumulated seconds of unrecoverable free-fall (orphan despawn). */
   orphanFallT: number
+  /** XZ anchor for stuck detection — reset when the enemy travels ≥1 m. */
+  stuckAnchorX: number
+  stuckAnchorZ: number
+  /** Seconds since last ≥1 m XZ move. */
+  stuckT: number
   healthBarGroup: THREE.Group
   healthFill: THREE.Mesh
   healthBarWidth: number
   spawnTime: number
+  /**
+   * Brief post-split immunity so a glowing-arrow blast that killed the parent
+   * cannot also wipe the three children that pop out in the same radius.
+   */
+  spawnProtectT: number
 }
 
 function hashUnit(i: number): number {
@@ -419,11 +469,17 @@ function facingYawForPlusX(dx: number, dz: number): number {
   return Math.atan2(-dz, dx)
 }
 
-/** Shared pick capsules — one geometry per scale tier (normal / big). */
+/** Shared pick capsules — one geometry per scale tier (normal / big / huge). */
 const pickGeoByScale = new Map<number, THREE.CapsuleGeometry>()
 
+function pickScaleKey(scaleMul: number): number {
+  if (scaleMul === ENEMY_HUGE_SCALE) return ENEMY_HUGE_SCALE
+  if (scaleMul === ENEMY_BIG_SCALE) return ENEMY_BIG_SCALE
+  return 1
+}
+
 function pickColliderGeometry(scaleMul: number): THREE.CapsuleGeometry {
-  const key = scaleMul === ENEMY_BIG_SCALE ? ENEMY_BIG_SCALE : 1
+  const key = pickScaleKey(scaleMul)
   let geo = pickGeoByScale.get(key)
   if (geo) return geo
   const t = templateCol
@@ -439,7 +495,7 @@ function pickColliderGeometry(scaleMul: number): THREE.CapsuleGeometry {
 
 function createPickColliderFromCache(scaleMul: number): THREE.Mesh {
   const t = templateCol
-  const key = scaleMul === ENEMY_BIG_SCALE ? ENEMY_BIG_SCALE : 1
+  const key = pickScaleKey(scaleMul)
   const height = t ? t.height * key : 0.42
   const foot = t ? t.footOffset * key : 0
   const mesh = new THREE.Mesh(pickColliderGeometry(key), pickMaterial)
@@ -448,13 +504,23 @@ function createPickColliderFromCache(scaleMul: number): THREE.Mesh {
   return mesh
 }
 
-function createEnemyHealthBar(isBig: boolean): {
+function createEnemyHealthBar(tier: EnemySizeTier): {
   group: THREE.Group
   fill: THREE.Mesh
   width: number
 } {
-  const width = isBig ? ENEMY_BAR_BIG_WORLD_WIDTH : ENEMY_BAR_WORLD_WIDTH
-  const height = isBig ? ENEMY_BAR_BIG_WORLD_HEIGHT : ENEMY_BAR_WORLD_HEIGHT
+  const width =
+    tier === 'huge'
+      ? ENEMY_BAR_HUGE_WORLD_WIDTH
+      : tier === 'big'
+        ? ENEMY_BAR_BIG_WORLD_WIDTH
+        : ENEMY_BAR_WORLD_WIDTH
+  const height =
+    tier === 'huge'
+      ? ENEMY_BAR_HUGE_WORLD_HEIGHT
+      : tier === 'big'
+        ? ENEMY_BAR_BIG_WORLD_HEIGHT
+        : ENEMY_BAR_WORLD_HEIGHT
 
   const group = new THREE.Group()
   group.renderOrder = 12
@@ -468,7 +534,6 @@ function createEnemyHealthBar(isBig: boolean): {
   group.add(track)
 
   const fillMat = healthBarFillMat.clone()
-  healthBarColorFromFraction(1, fillMat.color)
   const fill = new THREE.Mesh(healthBarPlane, fillMat)
   fill.scale.set(width, height, 1)
   fill.position.z = 0.002
@@ -532,25 +597,33 @@ function ensureEnemyGlowCore(innerLight: THREE.PointLight): THREE.MeshBasicMater
 /** Pooled visual clones — GLTF deep-clone on every spawn/kill was the main hitch. */
 const _visualPoolNormal: THREE.Group[] = []
 const _visualPoolBig: THREE.Group[] = []
+const _visualPoolHuge: THREE.Group[] = []
 const VISUAL_POOL_MAX = 10
 
-function acquireEnemyVisual(template: THREE.Group, isBig: boolean): THREE.Group {
-  const pool = isBig ? _visualPoolBig : _visualPoolNormal
+function visualPoolForTier(tier: EnemySizeTier): THREE.Group[] {
+  if (tier === 'huge') return _visualPoolHuge
+  if (tier === 'big') return _visualPoolBig
+  return _visualPoolNormal
+}
+
+function acquireEnemyVisual(template: THREE.Group, tier: EnemySizeTier): THREE.Group {
+  const pool = visualPoolForTier(tier)
   const reused = pool.pop()
   if (reused) {
     resetEnemyVisualPose(reused)
     return reused
   }
   const model = template.clone(true)
-  if (isBig) model.scale.multiplyScalar(ENEMY_BIG_SCALE)
+  const scaleMul = enemyScaleMul(tier)
+  if (scaleMul !== 1) model.scale.multiplyScalar(scaleMul)
   enableAutoMatrices(model)
   return model
 }
 
-function releaseEnemyVisual(model: THREE.Group, isBig: boolean) {
+function releaseEnemyVisual(model: THREE.Group, tier: EnemySizeTier) {
   model.removeFromParent()
   resetEnemyVisualPose(model)
-  const pool = isBig ? _visualPoolBig : _visualPoolNormal
+  const pool = visualPoolForTier(tier)
   if (pool.length < VISUAL_POOL_MAX) pool.push(model)
 }
 
@@ -559,11 +632,15 @@ export function prewarmEnemyVisualPool(template: THREE.Group, count = 4) {
   if (!templateCol) bakeTemplateCollision(template)
   for (let i = 0; i < count; i++) {
     if (_visualPoolNormal.length >= VISUAL_POOL_MAX) break
-    _visualPoolNormal.push(acquireEnemyVisual(template, false))
+    _visualPoolNormal.push(acquireEnemyVisual(template, 'normal'))
   }
   // One big ready for the first large kill-split.
   if (_visualPoolBig.length === 0) {
-    _visualPoolBig.push(acquireEnemyVisual(template, true))
+    _visualPoolBig.push(acquireEnemyVisual(template, 'big'))
+  }
+  // One huge ready for the rare boss spawn.
+  if (_visualPoolHuge.length === 0) {
+    _visualPoolHuge.push(acquireEnemyVisual(template, 'huge'))
   }
 }
 
@@ -1954,7 +2031,7 @@ function applyPlayerHitFromEnemy(
   knockbackZ: { value: number },
   knockbackDist: { value: number },
 ): void {
-  damage.value += enemy.isBig ? ENEMY_BIG_DAMAGE : ENEMY_DAMAGE
+  damage.value += enemyDamageForTier(enemy.tier)
   enemy.attackCooldown = ENEMY_ATTACK_COOLDOWN
   let nx = distXZ > 1e-4 ? dirX / distXZ : enemy.lungeDirX
   let nz = distXZ > 1e-4 ? dirZ / distXZ : enemy.lungeDirZ
@@ -2067,7 +2144,7 @@ function updateEnemyBitePhase(
     // Model crawls along local +X; pitch around Z bites forward toward the player.
     visual.rotation.z = -arch * 0.72
 
-    const moveScale = enemy.isBig ? ENEMY_BIG_CRAWL_SPEED_SCALE : 1
+    const moveScale = enemyCrawlSpeedScale(enemy.tier)
     const forwardStep = (ENEMY_LUNGE_FORWARD / ENEMY_LUNGE_DURATION) * moveScale * dt
     const stopDist = PLAYER_RADIUS + enemy.separationRadius * 0.75 + 0.06
     const closeGap = Math.max(0, _towardDist.v - stopDist)
@@ -2221,13 +2298,14 @@ function syncEnemyHealthBar(enemy: EnemyInstance, camera: THREE.Camera) {
 
   const t = Math.max(0, enemy.health / enemy.maxHealth)
   const w = enemy.healthBarWidth
-  const h = enemy.isBig ? ENEMY_BAR_BIG_WORLD_HEIGHT : ENEMY_BAR_WORLD_HEIGHT
+  const h =
+    enemy.tier === 'huge'
+      ? ENEMY_BAR_HUGE_WORLD_HEIGHT
+      : enemy.tier === 'big'
+        ? ENEMY_BAR_BIG_WORLD_HEIGHT
+        : ENEMY_BAR_WORLD_HEIGHT
   enemy.healthFill.scale.set(w * t, h, 1)
   enemy.healthFill.position.x = (-w * (1 - t)) / 2
-  healthBarColorFromFraction(
-    t,
-    (enemy.healthFill.material as THREE.MeshBasicMaterial).color,
-  )
 }
 
 /** Visual template (model group with mesh + inner light); clone per spawn. */
@@ -2266,20 +2344,24 @@ export function createEnemy(
   barParent: THREE.Object3D,
   options: EnemyCreateOptions = {},
 ): EnemyInstance {
-  const isBig = options.big === true
-  const scaleMul = isBig ? ENEMY_BIG_SCALE : 1
-  const maxHealth = isBig ? ENEMY_BIG_MAX_HEALTH : ENEMY_MAX_HEALTH
+  const tier = options.tier ?? 'normal'
+  const scaleMul = enemyScaleMul(tier)
+  const maxHealth = enemyMaxHealthForTier(tier)
 
   const root = new THREE.Group()
   root.position.set(x, 0, z)
   root.rotation.y = Math.random() * Math.PI * 2
   root.matrixAutoUpdate = true
 
-  const model = acquireEnemyVisual(template, isBig)
+  const model = acquireEnemyVisual(template, tier)
   const lightParts = findVisualParts(model)
   if (lightParts) {
     configureInnerLight(lightParts.innerLight)
-    if (isBig) {
+    if (tier === 'huge') {
+      lightParts.innerLight.intensity = INNER_LIGHT_INTENSITY * 1.7
+      lightParts.innerLight.distance = INNER_LIGHT_DISTANCE * scaleMul
+      storeEnemyLightBase(lightParts.innerLight)
+    } else if (tier === 'big') {
       lightParts.innerLight.intensity = INNER_LIGHT_INTENSITY * 1.35
       lightParts.innerLight.distance = INNER_LIGHT_DISTANCE * scaleMul
       storeEnemyLightBase(lightParts.innerLight)
@@ -2294,7 +2376,7 @@ export function createEnemy(
   parent.add(root)
 
   const { group: healthBarGroup, fill: healthFill, width: healthBarWidth } =
-    createEnemyHealthBar(isBig)
+    createEnemyHealthBar(tier)
   barParent.add(healthBarGroup)
 
   const enemy: EnemyInstance = {
@@ -2308,7 +2390,7 @@ export function createEnemy(
     innerLight: lightParts?.innerLight ?? null,
     separationRadius: 0.3,
     maxHealth,
-    isBig,
+    tier,
     health: maxHealth,
     attackCooldown: 0.4 + Math.random() * 0.5,
     attackPhase: 'idle',
@@ -2323,10 +2405,14 @@ export function createEnemy(
     grounded: true,
     collideTerrainMesh: false,
     orphanFallT: 0,
+    stuckAnchorX: x,
+    stuckAnchorZ: z,
+    stuckT: 0,
     healthBarGroup,
     healthFill,
     healthBarWidth,
     spawnTime: performance.now(),
+    spawnProtectT: 0,
   }
   applyBakedCollision(enemy, scaleMul)
   snapEnemyToGround(enemy, y)
@@ -2374,6 +2460,55 @@ export function cullExcessEnemies(
     // If everyone is in fight range, stop spawning pressure instead of deleting.
     if (worst < 0) break
     removeEnemy(enemies[worst]!, parent, enemies)
+  }
+}
+
+/**
+ * Remove enemies that barely move while they should be chasing.
+ * If XZ travel stays under 1 m for 10 s while in aggro range, despawn.
+ */
+export function despawnStuckEnemies(
+  enemies: EnemyInstance[],
+  parent: THREE.Object3D,
+  playerPos: THREE.Vector3,
+  dt: number,
+) {
+  const aggroSq = ENEMY_AGGRO_RANGE * ENEMY_AGGRO_RANGE
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const enemy = enemies[i]!
+    const pos = enemy.root.position
+
+    // Far idle packs aren't supposed to crawl — don't punish standing still.
+    const pdx = pos.x - playerPos.x
+    const pdz = pos.z - playerPos.z
+    if (pdx * pdx + pdz * pdz > aggroSq && enemy.attackPhase === 'idle') {
+      enemy.stuckAnchorX = pos.x
+      enemy.stuckAnchorZ = pos.z
+      enemy.stuckT = 0
+      continue
+    }
+
+    // Let fresh spawns / split children get moving before the timer starts.
+    if (enemy.spawnProtectT > 0) {
+      enemy.stuckAnchorX = pos.x
+      enemy.stuckAnchorZ = pos.z
+      enemy.stuckT = 0
+      continue
+    }
+
+    const dx = pos.x - enemy.stuckAnchorX
+    const dz = pos.z - enemy.stuckAnchorZ
+    if (dx * dx + dz * dz >= ENEMY_STUCK_MOVE_MIN_SQ) {
+      enemy.stuckAnchorX = pos.x
+      enemy.stuckAnchorZ = pos.z
+      enemy.stuckT = 0
+      continue
+    }
+
+    enemy.stuckT += dt
+    if (enemy.stuckT >= ENEMY_STUCK_TIME_SEC) {
+      removeEnemy(enemy, parent, enemies)
+    }
   }
 }
 
@@ -2468,7 +2603,7 @@ export function removeEnemy(
 ) {
   parent.remove(enemy.root)
   parent.remove(enemy.healthBarGroup)
-  releaseEnemyVisual(enemy.visual, enemy.isBig)
+  releaseEnemyVisual(enemy.visual, enemy.tier)
   // Pick geometry is shared across scale tiers — do not dispose.
   const idx = enemies.indexOf(enemy)
   if (idx >= 0) enemies.splice(idx, 1)
@@ -2638,6 +2773,9 @@ export function updateEnemies(
 
   for (const enemy of enemies) {
     enemy.attackCooldown = Math.max(0, enemy.attackCooldown - dt)
+    if (enemy.spawnProtectT > 0) {
+      enemy.spawnProtectT = Math.max(0, enemy.spawnProtectT - dt)
+    }
     updateEnemyHitSpin(enemy, dt)
 
     const pos = enemy.root.position
@@ -2708,7 +2846,7 @@ export function updateEnemies(
       }
 
       if (distXZ > 0.02) {
-        const moveScale = enemy.isBig ? ENEMY_BIG_CRAWL_SPEED_SCALE : 1
+        const moveScale = enemyCrawlSpeedScale(enemy.tier)
         const step = Math.min(crawlSpeed * moveScale * dt, distXZ)
         const mx = (dx / distXZ) * step
         const mz = (dz / distXZ) * step
@@ -2742,7 +2880,7 @@ export function updateEnemies(
 
     if (
       enemy.attackPhase === 'idle' &&
-      hitDist <= ENEMY_BITE_START_RANGE &&
+      hitDist <= Math.max(ENEMY_BITE_START_RANGE, enemyTouchRange(enemy) + 0.08) &&
       enemy.attackCooldown <= 0 &&
       playerVerticallyInBiteRange(playerPos, enemy)
     ) {
@@ -2838,32 +2976,44 @@ export function enemyFromIntersection(
   return undefined
 }
 
-const _splitOffsets = [
-  { x: 0.85, z: 0 },
-  { x: -0.42, z: 0.73 },
-  { x: -0.42, z: -0.73 },
+/** Outside glowing-arrow blast radius (1 m) so children aren't born inside the boom. */
+const _splitOffsetsBig = [
+  { x: 1.35, z: 0 },
+  { x: -0.68, z: 1.17 },
+  { x: -0.68, z: -1.17 },
 ]
+/** Wider spacing so two big children clear the huge corpse / each other. */
+const _splitOffsetsHuge = [
+  { x: 2.4, z: 0.4 },
+  { x: -2.4, z: -0.4 },
+]
+/** Match glow-blast visual lifetime so the same explosion can't erase the adds. */
+const ENEMY_SPLIT_SPAWN_PROTECT = 0.4
 
 function spawnEnemySplits(
   originX: number,
   originZ: number,
   originFeetY: number,
   ctx: EnemyDeathContext,
+  childTier: EnemySizeTier,
+  count: number,
+  offsets: readonly { x: number; z: number }[],
 ) {
-  // Stagger clones across frames — three GLTF clones in one tick still hitch
+  // Stagger clones across frames — multiple GLTF clones in one tick still hitch
   // when the visual pool is empty. Resolve ground in the deferred frame so we
-  // don't raycast three times on the kill tick (that used to freeze).
+  // don't raycast several times on the kill tick (that used to freeze).
+  // Always spawn all children — night spawn uses ENEMY_MAX_ALIVE, but death splits
+  // are a combat payoff and must not vanish when the pack is already full.
   let i = 0
   const spawnNext = () => {
-    if (i >= ENEMY_BIG_SPLIT_COUNT) return
-    const off = _splitOffsets[i]!
+    if (i >= count) return
+    const off = offsets[i]!
     i++
     const x = originX + off.x
     const z = originZ + off.z
     const gy =
       resolveEnemyGroundY(x, z, ctx.groundTargets, ctx.collisionWorld, originFeetY) ??
       originFeetY
-    if (ctx.enemies.length >= ENEMY_MAX_ALIVE) return
     const child = createEnemy(
       ctx.template,
       x,
@@ -2871,11 +3021,12 @@ function spawnEnemySplits(
       z,
       ctx.parent,
       ctx.barParent,
-      { big: false },
+      { tier: childTier },
     )
+    child.spawnProtectT = ENEMY_SPLIT_SPAWN_PROTECT
     applyEnemyLightHeight(child.visual, ctx.lightHeightOffset)
     ctx.enemies.push(child)
-    if (i < ENEMY_BIG_SPLIT_COUNT) requestAnimationFrame(spawnNext)
+    if (i < count) requestAnimationFrame(spawnNext)
   }
   requestAnimationFrame(spawnNext)
 }
@@ -2885,14 +3036,32 @@ export function killEnemy(enemy: EnemyInstance, ctx: EnemyDeathContext) {
   const burstY = pos.y + enemy.colFootOffset + enemy.colHeight * 0.5
   ctx.onOrbBurst(pos.x, burstY, pos.z)
 
-  const wasBig = enemy.isBig
+  const tier = enemy.tier
   const originX = pos.x
   const originZ = pos.z
   const originFeetY = getEnemyFeetY(enemy)
   removeEnemy(enemy, ctx.parent, ctx.enemies)
 
-  if (wasBig) {
-    spawnEnemySplits(originX, originZ, originFeetY, ctx)
+  if (tier === 'huge') {
+    spawnEnemySplits(
+      originX,
+      originZ,
+      originFeetY,
+      ctx,
+      'big',
+      ENEMY_HUGE_SPLIT_COUNT,
+      _splitOffsetsHuge,
+    )
+  } else if (tier === 'big') {
+    spawnEnemySplits(
+      originX,
+      originZ,
+      originFeetY,
+      ctx,
+      'normal',
+      ENEMY_BIG_SPLIT_COUNT,
+      _splitOffsetsBig,
+    )
   }
 }
 
@@ -2906,6 +3075,8 @@ export function damageEnemy(
   knockSpeed = ENEMY_HIT_KNOCKBACK_SPEED,
   deathCtx?: EnemyDeathContext,
 ): boolean {
+  if (enemy.spawnProtectT > 0) return false
+
   startEnemyHitSpin(enemy)
 
   const dx = enemy.root.position.x - hitterX
@@ -3066,14 +3237,13 @@ export function meleeKnockbackForEnemy(
   enemy: EnemyInstance,
 ): number {
   const { knockback } = meleeStatsForItem(item)
-  if (
-    enemy.isBig &&
-    (item === 'sword' ||
-      item === 'iron_sword' ||
-      item === 'gold_sword' ||
-      item === 'diamond_sword')
-  ) {
-    return knockback * ENEMY_BIG_SWORD_KNOCKBACK_MULT
-  }
+  const isSword =
+    item === 'sword' ||
+    item === 'iron_sword' ||
+    item === 'gold_sword' ||
+    item === 'diamond_sword'
+  if (!isSword) return knockback
+  if (enemy.tier === 'huge') return knockback * ENEMY_HUGE_SWORD_KNOCKBACK_MULT
+  if (enemy.tier === 'big') return knockback * ENEMY_BIG_SWORD_KNOCKBACK_MULT
   return knockback
 }

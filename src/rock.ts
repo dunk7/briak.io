@@ -124,20 +124,18 @@ export async function loadRockModels(
   urls: readonly string[] = ROCK_MODEL_URLS,
 ): Promise<THREE.Group[]> {
   const loader = new GLTFLoader()
-  const templates: THREE.Group[] = []
+  return Promise.all(
+    urls.map(async (url) => {
+      const gltf = await loader.loadAsync(url)
+      const model = gltf.scene
+      prepareRockMesh(model)
+      alignModelToGround(model)
 
-  for (const url of urls) {
-    const gltf = await loader.loadAsync(url)
-    const model = gltf.scene
-    prepareRockMesh(model)
-    alignModelToGround(model)
-
-    const wrapper = new THREE.Group()
-    wrapper.add(model)
-    templates.push(wrapper)
-  }
-
-  return templates
+      const wrapper = new THREE.Group()
+      wrapper.add(model)
+      return wrapper
+    }),
+  )
 }
 
 /** World XZ at the center of a terrain grid cell (metadata center_y is world Z). */
@@ -292,6 +290,27 @@ export function updateRocksPhysics(
  */
 export function wakeRocks(rocks: readonly THREE.Group[]): void {
   for (const rock of rocks) {
+    rock.userData[ROCK_SETTLED_KEY] = false
+    thawSubtreeMatrices(rock)
+  }
+}
+
+/**
+ * Like wakeRocks, but only for rocks within `radius` of (x, z).
+ * Digging used to wake every rock on the map; each then raycast the whole
+ * terrain mesh set and hitch for ~100ms.
+ */
+export function wakeRocksNear(
+  rocks: readonly THREE.Group[],
+  x: number,
+  z: number,
+  radius: number,
+): void {
+  const rSq = radius * radius
+  for (const rock of rocks) {
+    const dx = rock.position.x - x
+    const dz = rock.position.z - z
+    if (dx * dx + dz * dz > rSq) continue
     rock.userData[ROCK_SETTLED_KEY] = false
     thawSubtreeMatrices(rock)
   }

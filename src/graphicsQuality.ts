@@ -14,16 +14,16 @@ import { setRockTexturesEnabled } from './rockTexture'
 export const POTATO_MAX_T = 0.18
 /** Slider tier boundary for the "Low" label (matches `qualityLabel`). */
 export const LOW_MAX_T = 0.42
-/** Below this, terrain uses flat brown / green (no texture sampling). */
-const TEXTURED_MIN_T = 0.4
+/** Below this, terrain uses flat brown / green (no texture sampling). Low+. */
+const TEXTURED_MIN_T = 0.22
 /** Below this, shadows are fully disabled (cheapest tier). */
 const SHADOWS_MIN_T = 0.3
 /** Below this, the atmospheric Sky shader is swapped for a flat horizon color. */
 const SKY_MIN_T = 0.3
 /**
  * Below this (Potato/Low), fill directionals + berry/torch/enemy PointLights are
- * off — sun/hemi/ambient only. Medium+ pays for the point-light PBR cost and
- * darkens sheltered digs so torches matter underground.
+ * off — sun/hemi/ambient only. Medium+ enables point glows; unused pool slots
+ * must stay hidden (intensity 0 still costs while visible).
  */
 const FILL_LIGHTS_MIN_T = LOW_MAX_T
 /** Medium+ — berry canopy, torch, and enemy PointLights. */
@@ -334,8 +334,9 @@ export function applyGraphicsQuality(
     }
   }
 
-  const textureSize = pow2Size(t, 64, 512)
-  const useMipmaps = t > 0.5
+  // Floor at 128 so Low/Medium dirt sides read as soil, not muddy blobs.
+  const textureSize = pow2Size(t, 128, 512)
+  const useMipmaps = t > 0.38
 
   if (textureSize !== lastTextureSize) {
     lastTextureSize = textureSize

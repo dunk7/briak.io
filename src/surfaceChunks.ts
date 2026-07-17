@@ -439,7 +439,9 @@ export class SurfaceChunkManager {
   }
 
   rebuildForCell(cell: SurfaceChunkCell) {
-    this.rebuildChunk(this.chunkId(cell))
+    const id = this.chunkId(cell)
+    this.dirtyChunkIds.delete(id)
+    this.rebuildChunk(id)
   }
 
   private readonly dirtyChunkIds = new Set<string>()
@@ -451,13 +453,40 @@ export class SurfaceChunkManager {
     this.dirtyChunkIds.add(this.chunkId(cell))
   }
 
-  /** Peel one cell out of the chunk batch so it can wobble in place while digging. */
+  /** True when at least one chunk still needs a merge/BVH rebuild. */
+  hasDirtyChunks() {
+    return this.dirtyChunkIds.size > 0
+  }
+
+  /**
+   * Rebuild dirty chunks within a time budget. Safe to call every frame —
+   * unlike flushDirtyChunked, this never drops pending IDs mid-pass.
+   * Always finishes at least one chunk so dig remeshes land on the next frame
+   * instead of stretching a visible ghost across many frames.
+   */
+  pumpDirty(budgetMs = 5) {
+    if (this.dirtyChunkIds.size === 0) return
+    const t0 = performance.now()
+    let didOne = false
+    for (const id of this.dirtyChunkIds) {
+      if (didOne && performance.now() - t0 >= budgetMs) break
+      this.dirtyChunkIds.delete(id)
+      this.rebuildChunk(id)
+      didOne = true
+    }
+  }
+
+  /**
+   * Peel one cell out of the chunk batch so it can wobble in place while digging.
+   * Remesh is deferred via markDirty — sync rebuilds here caused multi-frame hitches
+   * every time dig aim moved onto a new surface cap.
+   */
   setDigPreviewCell(cell: SurfaceChunkCell | null) {
     if (this.digPreviewCell?.key === cell?.key) return
     const prev = this.digPreviewCell
     this.digPreviewCell = cell
-    if (prev) this.rebuildChunk(this.chunkId(prev))
-    if (cell) this.rebuildChunk(this.chunkId(cell))
+    if (prev) this.markDirtyForCell(prev)
+    if (cell) this.markDirtyForCell(cell)
   }
 
   flushDirty() {
@@ -501,6 +530,16 @@ export class SurfaceChunkManager {
       }
     }
     requestAnimationFrame(step)
+  }
+
+  /** Promise wrapper around flushDirtyChunked for startup / background loads. */
+  flushDirtyChunkedAsync(
+    budgetMs = 6,
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<void> {
+    return new Promise((resolve) => {
+      this.flushDirtyChunked(budgetMs, resolve, onProgress)
+    })
   }
 
   private rebuildChunk(id: string) {

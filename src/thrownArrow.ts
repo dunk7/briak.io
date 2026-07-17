@@ -13,6 +13,12 @@ import {
 } from './enemy'
 import type { Inventory, InventoryItem } from './inventory'
 import type { CapsuleCollider } from './meshCollider'
+import {
+  damageSpider,
+  SPIDER_HIT_KNOCKBACK_SPEED,
+  type SpiderDeathContext,
+  type SpiderInstance,
+} from './roboticSpider'
 import { type MeshGroundTargets } from './terrainGroundRay'
 
 /** Full-draw flight speed — snappy and flat compared to spears. */
@@ -22,6 +28,8 @@ const ARROW_GRAVITY = 9.5
 /** Long enough for a full-draw vertical shot (~9s round-trip) plus elevated terrain. */
 const ARROW_MAX_FLIGHT = 14
 const ARROW_DROP_LIFE = 3.2
+/** How long stuck / pickable arrows linger before despawning (matches ground items). */
+const ARROW_STUCK_LIFE = 60
 const ARROW_HIT_HORIZ_KEEP = 0.12
 const ARROW_HIT_UP_BOUNCE = 1.0
 const PICKUP_RADIUS = 1.4
@@ -154,6 +162,8 @@ export type ThrownArrow = {
   life: number
   stuck: boolean
   ignoreEnemies: boolean
+  /** World position at spawn — used for close-range player-hit grace. */
+  spawnPos: THREE.Vector3
   stuckTo: THREE.Object3D | null
   stuckBlockKey: string | null
   stuckVoxelKey: string | null
@@ -175,6 +185,11 @@ export type ThrownArrowUpdateOpts = {
   capsuleCollider?: CapsuleCollider
   /** Called when a healing arrow should restore player health. */
   onHeal?: (amount: number) => void
+  /** Called when a damage arrow hits the player (e.g. ballista “shoot me”). */
+  onPlayerDamage?: (amount: number) => void
+  spiders?: SpiderInstance[]
+  spidersGroup?: THREE.Object3D
+  spiderDeathCtx?: SpiderDeathContext
 }
 
 function tipColors(item: ArrowItem): {
@@ -454,6 +469,9 @@ function triggerGlowArrowBlast(
   playerPos?: THREE.Vector3,
   onHeal?: (amount: number) => void,
   primaryEnemy?: EnemyInstance | null,
+  spiders?: SpiderInstance[],
+  spidersGroup?: THREE.Object3D,
+  spiderDeathCtx?: SpiderDeathContext,
 ) {
   if (isHealingArrow(arrow.item)) {
     _blastCenter.copy(hitPoint)
@@ -491,6 +509,27 @@ function triggerGlowArrowBlast(
       deathCtx,
     )
   }
+  if (spiders && spidersGroup) {
+    const spiderTargets = spiders.slice()
+    for (const spider of spiderTargets) {
+      if (!spiders.includes(spider)) continue
+      const dx = spider.root.position.x - _blastCenter.x
+      const dy =
+        spider.root.position.y + spider.colHeight * 0.5 - _blastCenter.y
+      const dz = spider.root.position.z - _blastCenter.z
+      if (dx * dx + dy * dy + dz * dz > GLOW_BLAST_RADIUS_SQ) continue
+      damageSpider(
+        spider,
+        damage,
+        spidersGroup,
+        spiders,
+        _blastCenter.x,
+        _blastCenter.z,
+        GLOW_BLAST_KNOCKBACK,
+        spiderDeathCtx,
+      )
+    }
+  }
 }
 
 /** Closest-point distance check against a rough player capsule. */
@@ -502,6 +541,45 @@ function playerInHealBlast(playerPos: THREE.Vector3, hitPoint: THREE.Vector3): b
   const dy = cy - hitPoint.y
   const dz = playerPos.z - hitPoint.z
   return dx * dx + dy * dy + dz * dz <= PLAYER_HEAL_RADIUS_SQ
+}
+
+/** Generous body radius so ballista shots can land on the player. */
+const PLAYER_HIT_RADIUS = 0.42
+const PLAYER_HIT_RADIUS_SQ = PLAYER_HIT_RADIUS * PLAYER_HIT_RADIUS
+/**
+ * Skip player hits until the projectile has cleared the muzzle / bow hand.
+ * Distance-based so close-range ballista “shoot me” heals still connect
+ * (a time grace at arrow speed skipped the whole player capsule).
+ */
+const PLAYER_HIT_GRACE_DIST = 0.55
+const PLAYER_HIT_GRACE_DIST_SQ = PLAYER_HIT_GRACE_DIST * PLAYER_HIT_GRACE_DIST
+
+/**
+ * True when the flight segment comes within the player capsule.
+ * Writes the closest point on the segment into `outHit`.
+ */
+function segmentHitsPlayer(
+  prev: THREE.Vector3,
+  next: THREE.Vector3,
+  playerPos: THREE.Vector3,
+  outHit: THREE.Vector3,
+): boolean {
+  const minY = playerPos.y
+  const maxY = playerPos.y + PLAYER_HEAL_HEIGHT
+  // Sample a few points along the segment (short steps; cheap).
+  for (let i = 0; i <= 4; i++) {
+    const t = i / 4
+    outHit.lerpVectors(prev, next, t)
+    const cy = Math.min(Math.max(outHit.y, minY), maxY)
+    const dx = playerPos.x - outHit.x
+    const dy = cy - outHit.y
+    const dz = playerPos.z - outHit.z
+    if (dx * dx + dy * dy + dz * dz <= PLAYER_HIT_RADIUS_SQ) {
+      outHit.y = cy
+      return true
+    }
+  }
+  return false
 }
 
 function createArrowMesh(item: ArrowItem): THREE.Group {
@@ -622,7 +700,7 @@ function stickArrow(
     arrow.stuckVoxelKey = target.voxel.cellKey
     arrow.stuckVoxelLayer = target.voxel.layer
   }
-  arrow.life = Infinity
+  arrow.life = ARROW_STUCK_LIFE
 }
 
 function dropArrowFromHit(arrow: ThrownArrow, hitPoint: THREE.Vector3) {
@@ -787,6 +865,7 @@ export function spawnThrownArrow(
     life: ARROW_MAX_FLIGHT,
     stuck: false,
     ignoreEnemies: false,
+    spawnPos: origin.clone(),
     stuckTo: null,
     stuckBlockKey: null,
     stuckVoxelKey: null,
@@ -850,6 +929,10 @@ export function updateThrownArrows(
     collisionWorld,
     capsuleCollider,
     onHeal,
+    onPlayerDamage,
+    spiders,
+    spidersGroup,
+    spiderDeathCtx,
   } = opts
   const fireImpact = (
     hitPoint: THREE.Vector3,
@@ -866,10 +949,16 @@ export function updateThrownArrows(
       playerPos,
       onHeal,
       primaryEnemy,
+      spiders,
+      spidersGroup,
+      spiderDeathCtx,
     )
   }
   _pickMeshes.length = 0
   for (let i = 0; i < enemies.length; i++) _pickMeshes.push(enemies[i]!.pickMesh)
+  if (spiders) {
+    for (let i = 0; i < spiders.length; i++) _pickMeshes.push(spiders[i]!.pickMesh)
+  }
   _groundCacheKeys.length = 0
   _groundCacheVals.length = 0
   let pickedUp = 0
@@ -878,6 +967,11 @@ export function updateThrownArrows(
     const arrow = arrows[i]!
 
     if (arrow.stuck) {
+      arrow.life -= dt
+      if (arrow.life <= 0) {
+        removeArrow(arrow, parent, arrows)
+        continue
+      }
       if (tryPickupArrow(arrow, parent, arrows, playerPos, inventory)) pickedUp++
       continue
     }
@@ -903,7 +997,7 @@ export function updateThrownArrows(
       } else {
         arrow.velocity.set(0, 0, 0)
         arrow.stuck = true
-        arrow.life = Infinity
+        arrow.life = ARROW_STUCK_LIFE
       }
       continue
     }
@@ -973,6 +1067,23 @@ export function updateThrownArrows(
         groundEst !== null &&
         Math.min(_prev.y, _next.y) > groundEst + AIR_CLEARANCE
 
+      // Player body hits (ballista healing / “shoot me”, stray arrows).
+      if (
+        !arrow.ignoreEnemies &&
+        arrow.root.position.distanceToSquared(arrow.spawnPos) >= PLAYER_HIT_GRACE_DIST_SQ &&
+        segmentHitsPlayer(_prev, _next, playerPos, _tip)
+      ) {
+        if (isHealingArrow(arrow.item) || isGlowingArrow(arrow.item)) {
+          // Heal / blast FX; glowing damage also hurts the player below.
+          fireImpact(_tip, arrow, null)
+        }
+        if (!isHealingArrow(arrow.item) && onPlayerDamage) {
+          onPlayerDamage(arrowDamage(arrow.item))
+        }
+        dropArrowFromHit(arrow, _tip)
+        continue
+      }
+
       if (_pickMeshes.length > 0) {
         _hits.length = 0
         raycaster.intersectObjects(_pickMeshes, false, _hits)
@@ -984,6 +1095,10 @@ export function updateThrownArrows(
             fireImpact(hit.point, arrow, enemy)
           } else {
             const enemy = enemies.find((e) => e.pickMesh === hit.object)
+            const spider =
+              !enemy && spiders
+                ? spiders.find((s) => s.pickMesh === hit.object)
+                : undefined
             if (enemy) {
               damageEnemy(
                 enemy,
@@ -994,6 +1109,17 @@ export function updateThrownArrows(
                 _prev.z,
                 ARROW_HIT_KNOCKBACK_SPEED,
                 deathCtx,
+              )
+            } else if (spider && spiders && spidersGroup) {
+              damageSpider(
+                spider,
+                arrowDamage(arrow.item),
+                spidersGroup,
+                spiders,
+                _prev.x,
+                _prev.z,
+                SPIDER_HIT_KNOCKBACK_SPEED,
+                spiderDeathCtx,
               )
             }
           }
@@ -1131,9 +1257,12 @@ export function updateThrownArrows(
   return pickedUp
 }
 
+/** Remove in-flight arrows (and glow blasts). Stuck ground arrows are kept for pickup. */
 export function clearThrownArrows(arrows: ThrownArrow[], parent: THREE.Object3D) {
-  while (arrows.length > 0) {
-    removeArrow(arrows[0]!, parent, arrows)
+  for (let i = arrows.length - 1; i >= 0; i--) {
+    const arrow = arrows[i]!
+    if (arrow.stuck) continue
+    removeArrow(arrow, parent, arrows)
   }
   while (_glowBlasts.length > 0) {
     removeGlowBlast(_glowBlasts[0]!, parent)

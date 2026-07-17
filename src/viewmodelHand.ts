@@ -4,10 +4,63 @@ import { createHeldBowPullingItem, createHeldExtrudedItem } from './itemMeshes'
 import type { ArrowItem } from './thrownArrow'
 
 const DEG = Math.PI / 180
+/** Default melee / dig tools (pickaxe, shovel, fist, etc.). */
 const SWING_DURATION = 0.36
 const SWING_INTERVAL = 0.44
+/** Axe: full 1s swing animation, 1 swing/s. */
+const AXE_SWING_DURATION = 1
+const AXE_SWING_INTERVAL = 1
+/** Sword: faster recovery between swings. */
+const SWORD_SWING_DURATION = SWING_DURATION
+const SWORD_SWING_INTERVAL = 0.7
+/** Spear melee: slow swing cadence (throw cooldown is separate). */
+const SPEAR_SWING_DURATION = SWING_DURATION
+const SPEAR_SWING_INTERVAL = 1.5
 const THROW_DURATION = 0.28
 export const SPEAR_THROW_COOLDOWN = 0.55
+
+function isAxeItem(item: InventoryItem | null): boolean {
+  return (
+    item === 'axe' ||
+    item === 'iron_axe' ||
+    item === 'gold_axe' ||
+    item === 'diamond_axe'
+  )
+}
+
+function isSwordItem(item: InventoryItem | null): boolean {
+  return (
+    item === 'sword' ||
+    item === 'iron_sword' ||
+    item === 'gold_sword' ||
+    item === 'diamond_sword'
+  )
+}
+
+function isSpearItem(item: InventoryItem | null): boolean {
+  return (
+    item === 'spear' ||
+    item === 'iron_spear' ||
+    item === 'gold_spear' ||
+    item === 'diamond_spear'
+  )
+}
+
+function swingTimingFor(item: InventoryItem | null): {
+  duration: number
+  interval: number
+} {
+  if (isAxeItem(item)) {
+    return { duration: AXE_SWING_DURATION, interval: AXE_SWING_INTERVAL }
+  }
+  if (isSwordItem(item)) {
+    return { duration: SWORD_SWING_DURATION, interval: SWORD_SWING_INTERVAL }
+  }
+  if (isSpearItem(item)) {
+    return { duration: SPEAR_SWING_DURATION, interval: SPEAR_SWING_INTERVAL }
+  }
+  return { duration: SWING_DURATION, interval: SWING_INTERVAL }
+}
 /** Time to reach full bow draw. */
 export const BOW_DRAW_DURATION = 0.62
 export const BOW_FIRE_COOLDOWN = 0.28
@@ -156,6 +209,8 @@ export class ViewmodelHand {
 
   private swingT = 0
   private swingCooldown = 0
+  /** Duration of the in-progress swing (set in beginSwing). */
+  private swingDuration = SWING_DURATION
   /** Clicked during cooldown — fire one swing when reload finishes. */
   private swingPending = false
   private throwT = 0
@@ -316,9 +371,11 @@ export class ViewmodelHand {
   }
 
   private beginSwing() {
+    const timing = swingTimingFor(this.heldItem)
     this.swingPending = false
     this.swingT = 1
-    this.swingCooldown = SWING_INTERVAL
+    this.swingDuration = timing.duration
+    this.swingCooldown = timing.interval
   }
 
   startThrow(): boolean {
@@ -379,7 +436,9 @@ export class ViewmodelHand {
         this.heldItem === 'spear' ||
         this.heldItem === 'iron_spear' ||
         this.heldItem === 'gold_spear' ||
-        this.heldItem === 'diamond_spear'
+        this.heldItem === 'diamond_spear' ||
+        this.heldItem === 'glowing_orb' ||
+        this.heldItem === 'crystal_berries'
       ) {
         const mesh = this.heldMeshes.get(this.heldItem)
         if (mesh) mesh.visible = throwProgress < 0.34
@@ -397,7 +456,9 @@ export class ViewmodelHand {
       this.heldItem === 'spear' ||
       this.heldItem === 'iron_spear' ||
       this.heldItem === 'gold_spear' ||
-      this.heldItem === 'diamond_spear'
+      this.heldItem === 'diamond_spear' ||
+      this.heldItem === 'glowing_orb' ||
+      this.heldItem === 'crystal_berries'
     ) {
       const mesh = this.heldMeshes.get(this.heldItem)
       if (mesh) mesh.visible = true
@@ -420,7 +481,7 @@ export class ViewmodelHand {
       return
     }
 
-    this.swingT = Math.max(0, this.swingT - dt / SWING_DURATION)
+    this.swingT = Math.max(0, this.swingT - dt / this.swingDuration)
     const swingProgress = 1 - this.swingT
 
     this.group.rotation.y = BASE_YAW

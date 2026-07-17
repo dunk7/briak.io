@@ -274,11 +274,25 @@ export class CapsuleCollider {
     _capsuleBox.max.addScalar(radius)
 
     const includeHiddenChunks = this.collideInvisibleChunks
+    const capX = (segment.start.x + segment.end.x) * 0.5
+    const capZ = (segment.start.z + segment.end.z) * 0.5
+    // Capsule XZ reach — skip far merged chunks before AABB/BVH work.
+    const chunkCullPad = radius + 2
     if (this.chunkRoot) {
       const children = this.chunkRoot.children
       for (let i = 0; i < children.length; i++) {
         const mesh = children[i] as THREE.Mesh
         if (!includeHiddenChunks && !mesh.visible) continue
+        const geo = mesh.geometry
+        if (!geo.boundingSphere) geo.computeBoundingSphere()
+        const bs = geo.boundingSphere
+        if (bs) {
+          _xzSphereCenter.copy(bs.center).applyMatrix4(mesh.matrixWorld)
+          const dx = _xzSphereCenter.x - capX
+          const dz = _xzSphereCenter.z - capZ
+          const r = bs.radius + chunkCullPad
+          if (dx * dx + dz * dz > r * r) continue
+        }
         this.collideMesh(mesh, segment, radius, includeHiddenChunks)
       }
     }

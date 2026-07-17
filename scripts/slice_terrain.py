@@ -35,11 +35,18 @@ MAX_LAYERS_REPORT = 31
 COLUMN_Y_MIN = -500.0
 COLUMN_Y_MAX = 500.0
 
-# Inset sample grid used to classify full vs partial without a boolean.
-SAMPLE_AXIS = 4
-SAMPLE_INSET = 0.2
-# Boolean volume ≥ this fraction of CELL³ counts as a full cube.
-FULL_VOLUME_RATIO = 0.98
+# Dense inset grid used to classify full vs partial without a boolean.
+# Keep inset small — a deep inset misses shallow exterior cuts and falsely
+# marks surface-touching cubes as full (voxels poking through the terrain).
+SAMPLE_AXIS = 6
+SAMPLE_INSET = 0.05
+# Extra samples pressed against each of the 6 cube faces catch shallow cuts
+# that the interior grid can still miss.
+FACE_SAMPLE_AXIS = 4
+FACE_SAMPLE_INSET = 0.02
+# Boolean volume ≥ this fraction of CELL³ counts as a full cube. Keep this
+# strict so near-surface cubes stay smooth partials instead of blocky voxels.
+FULL_VOLUME_RATIO = 0.995
 MIN_PARTIAL_VOLUME = 1e-3
 
 # Footprint coverage gate for sparse map-edge columns.
@@ -47,7 +54,6 @@ SURFACE_SAMPLES = 7
 MIN_CELL_COVERAGE = 0.5
 
 BOUNDARY_SNAP = 1e-3
-CLIP_PAD = 1e-6
 VERTEX_MERGE_DIGITS = 8
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -139,6 +145,7 @@ def snap_and_clip_to_box(
     z0: int,
     z1: int,
 ) -> trimesh.Trimesh:
+    """Force verts inside the cell box and weld near-boundary verts to exact planes."""
     lo = (float(x0), float(y0), float(z0))
     hi = (float(x1), float(y1), float(z1))
     verts = piece.vertices.copy()
@@ -149,7 +156,9 @@ def snap_and_clip_to_box(
         near_hi = np.abs(col - plane_hi) <= BOUNDARY_SNAP
         col[near_lo] = plane_lo
         col[near_hi] = plane_hi
-        verts[:, axis] = np.clip(col, plane_lo - CLIP_PAD, plane_hi + CLIP_PAD)
+        # Strict clip — never leave verts outside the owning cell (prevents
+        # adjacent-cell overlap / z-fight from boolean tolerance).
+        verts[:, axis] = np.clip(col, plane_lo, plane_hi)
 
     out = piece.copy()
     out.vertices = verts
@@ -240,6 +249,56 @@ def sample_points_in_cell(
     return np.column_stack([gx.ravel(), gy.ravel(), gz.ravel()])
 
 
+def face_exposure_points(
+    x0: float,
+    x1: float,
+    y0: float,
+    y1: float,
+    z0: float,
+    z1: float,
+) -> np.ndarray:
+    """
+    Sample just inside each of the six cube faces.
+
+    Catches shallow atmosphere cuts that a deeper interior grid can miss —
+    those false-fulls are what make diggable cubes poke through the surface.
+    """
+    inset = FACE_SAMPLE_INSET
+    n = FACE_SAMPLE_AXIS
+    u = np.linspace(0.0, 1.0, n)
+    pts: list[np.ndarray] = []
+
+    # Faces normal ±X
+    ys = y0 + inset + u * (y1 - y0 - 2 * inset)
+    zs = z0 + inset + u * (z1 - z0 - 2 * inset)
+    gy, gz = np.meshgrid(ys, zs, indexing="ij")
+    pts.append(np.column_stack([np.full(gy.size, x0 + inset), gy.ravel(), gz.ravel()]))
+    pts.append(np.column_stack([np.full(gy.size, x1 - inset), gy.ravel(), gz.ravel()]))
+
+    # Faces normal ±Y
+    xs = x0 + inset + u * (x1 - x0 - 2 * inset)
+    zs = z0 + inset + u * (z1 - z0 - 2 * inset)
+    gx, gz = np.meshgrid(xs, zs, indexing="ij")
+    pts.append(np.column_stack([gx.ravel(), np.full(gx.size, y0 + inset), gz.ravel()]))
+    pts.append(np.column_stack([gx.ravel(), np.full(gx.size, y1 - inset), gz.ravel()]))
+
+    # Faces normal ±Z
+    xs = x0 + inset + u * (x1 - x0 - 2 * inset)
+    ys = y0 + inset + u * (y1 - y0 - 2 * inset)
+    gx, gy = np.meshgrid(xs, ys, indexing="ij")
+    pts.append(np.column_stack([gx.ravel(), gy.ravel(), np.full(gx.size, z0 + inset)]))
+    pts.append(np.column_stack([gx.ravel(), gy.ravel(), np.full(gx.size, z1 - inset)]))
+
+    return np.vstack(pts)
+
+
+def _contains_safe(mesh: trimesh.Trimesh, pts: np.ndarray) -> np.ndarray:
+    try:
+        return mesh.contains(pts)
+    except Exception:
+        return np.zeros(len(pts), dtype=bool)
+
+
 def classify_layer(
     column: trimesh.Trimesh,
     x0: int,
@@ -251,26 +310,30 @@ def classify_layer(
 ) -> tuple[str, trimesh.Trimesh | None]:
     """
     Returns (kind, piece) where kind is 'full' | 'partial' | 'empty'.
-    Full cubes skip boolean when inset samples are all inside.
+
+    Full cubes skip boolean only when both the interior grid and the
+    face-exposure samples are entirely inside the solid.
     """
     clo, chi = column.bounds
     if chi[1] < y0 or clo[1] > y1:
         return "empty", None
 
-    pts = sample_points_in_cell(float(x0), float(x1), float(y0), float(y1), float(z0), float(z1))
-    try:
-        inside = column.contains(pts)
-    except Exception:
-        inside = np.zeros(len(pts), dtype=bool)
+    fx0, fx1 = float(x0), float(x1)
+    fy0, fy1 = float(y0), float(y1)
+    fz0, fz1 = float(z0), float(z1)
 
+    interior = sample_points_in_cell(fx0, fx1, fy0, fy1, fz0, fz1)
+    inside = _contains_safe(column, interior)
     n_in = int(inside.sum())
-    if n_in == len(pts):
-        return "full", None
-    if n_in == 0:
-        # Thin shells can miss inset samples — still try a boolean.
-        pass
 
-    slab = exact_box(float(x0), float(x1), float(y0), float(y1), float(z0), float(z1))
+    if n_in == len(interior):
+        face_pts = face_exposure_points(fx0, fx1, fy0, fy1, fz0, fz1)
+        face_inside = _contains_safe(column, face_pts)
+        if bool(face_inside.all()):
+            return "full", None
+        # Shallow exterior cut near a face — fall through to boolean.
+
+    slab = exact_box(fx0, fx1, fy0, fy1, fz0, fz1)
     piece = boolean_intersection(column, slab)
     if piece is None:
         return "empty", None
@@ -284,7 +347,12 @@ def classify_layer(
 
     full_vol = float(CELL_SIZE ** 3)
     if vol >= full_vol * FULL_VOLUME_RATIO:
-        return "full", None
+        # Near-complete fill, but only promote to full when face samples agree.
+        # Otherwise keep the thin atmosphere cut as a smooth partial.
+        face_pts = face_exposure_points(fx0, fx1, fy0, fy1, fz0, fz1)
+        face_inside = _contains_safe(column, face_pts)
+        if bool(face_inside.all()):
+            return "full", None
 
     clipped = snap_and_clip_to_box(piece, x0, x1, y0, y1, z0, z1)
     if clipped is None or len(clipped.faces) == 0:
@@ -396,6 +464,9 @@ def slice_column_job(
     if voxel_bits == 0 and surface_bits == 0:
         return None
 
+    # A layer cannot be both full and partial.
+    assert (voxel_bits & surface_bits) == 0
+
     filename = f"surf_{ix}_{iy}.glb"
     filepath = os.path.join(output_dir, filename)
     tri_count = export_column_glb(partial_layers, filepath)
@@ -428,6 +499,7 @@ def slice_column_job(
         "n_full": bin(voxel_bits).count("1"),
         "n_partial": bin(surface_bits).count("1"),
     }
+
 
 def _available_ram_gb() -> float | None:
     try:
@@ -465,6 +537,12 @@ def main() -> int:
     print(
         f"  grid origin ({min_x}, {min_z}), "
         f"extent {num_x}×{num_z} cells, metadata span {num_cells}×{num_cells}",
+        flush=True,
+    )
+    print(
+        f"  classify: sample {SAMPLE_AXIS}³ inset={SAMPLE_INSET}, "
+        f"face {FACE_SAMPLE_AXIS}² inset={FACE_SAMPLE_INSET}, "
+        f"full_vol≥{FULL_VOLUME_RATIO}",
         flush=True,
     )
 

@@ -10,8 +10,14 @@ import {
   type EnemyDeathContext,
   type EnemyInstance,
 } from './enemy'
-import type { Inventory, InventoryItem } from './inventory'
+import { TOOL_MAX_DURABILITY, type Inventory, type InventoryItem } from './inventory'
 import type { CapsuleCollider } from './meshCollider'
+import {
+  damageSpider,
+  SPIDER_HIT_KNOCKBACK_SPEED,
+  type SpiderDeathContext,
+  type SpiderInstance,
+} from './roboticSpider'
 import { type MeshGroundTargets } from './terrainGroundRay'
 
 const SPEAR_SPEED = 22
@@ -63,6 +69,8 @@ export type SpearItem = Extract<
 export type ThrownSpear = {
   root: THREE.Group
   item: SpearItem
+  /** Remaining tool health when thrown; restored on pickup. */
+  durability: number
   velocity: THREE.Vector3
   life: number
   stuck: boolean
@@ -94,6 +102,9 @@ export type ThrownSpearUpdateOpts = {
   /** Cave-aware floor / solid queries (avoids sky-down outdoor-lid sticks). */
   collisionWorld?: CollisionWorld
   capsuleCollider?: CapsuleCollider
+  spiders?: SpiderInstance[]
+  spidersGroup?: THREE.Object3D
+  spiderDeathCtx?: SpiderDeathContext
 }
 
 /**
@@ -308,7 +319,7 @@ function tryPickupSpear(
   _playerDelta.subVectors(playerPos, spear.root.position)
   _playerDelta.y = 0
   if (_playerDelta.lengthSq() > PICKUP_RADIUS_SQ) return false
-  inventory.add(spear.item, 1)
+  inventory.add(spear.item, 1, spear.durability)
   removeSpear(spear, parent, spears)
   return true
 }
@@ -319,6 +330,7 @@ export function spawnThrownSpear(
   direction: THREE.Vector3,
   spears: ThrownSpear[],
   item: SpearItem = 'spear',
+  durability?: number,
 ) {
   const root = createSpearMesh(item)
   root.position.copy(origin)
@@ -331,6 +343,7 @@ export function spawnThrownSpear(
   spears.push({
     root,
     item,
+    durability: durability ?? TOOL_MAX_DURABILITY,
     velocity: vel,
     life: SPEAR_MAX_FLIGHT,
     stuck: false,
@@ -399,9 +412,15 @@ export function updateThrownSpears(
     deathCtx,
     collisionWorld,
     capsuleCollider,
+    spiders,
+    spidersGroup,
+    spiderDeathCtx,
   } = opts
   _pickMeshes.length = 0
   for (let i = 0; i < enemies.length; i++) _pickMeshes.push(enemies[i]!.pickMesh)
+  if (spiders) {
+    for (let i = 0; i < spiders.length; i++) _pickMeshes.push(spiders[i]!.pickMesh)
+  }
   _groundCacheKeys.length = 0
   _groundCacheVals.length = 0
   let pickedUp = 0
@@ -514,7 +533,11 @@ export function updateThrownSpears(
         if (_hits.length > 0) {
           const hit = _hits[0]!
           const enemy = enemies.find((e) => e.pickMesh === hit.object)
-          if (enemy) {
+          const spider =
+            !enemy && spiders
+              ? spiders.find((s) => s.pickMesh === hit.object)
+              : undefined
+          if (enemy || spider) {
             const dmg =
               spear.item === 'diamond_spear'
                 ? DIAMOND_SPEAR_THROW_DAMAGE
@@ -523,16 +546,34 @@ export function updateThrownSpears(
                   : spear.item === 'iron_spear'
                     ? IRON_SPEAR_THROW_DAMAGE
                     : SPEAR_THROW_DAMAGE
-            damageEnemy(
-              enemy,
-              dmg,
-              enemiesGroup,
-              enemies,
-              _prev.x,
-              _prev.z,
-              SPEAR_HIT_KNOCKBACK_SPEED,
-              deathCtx,
-            )
+            if (enemy) {
+              damageEnemy(
+                enemy,
+                dmg,
+                enemiesGroup,
+                enemies,
+                _prev.x,
+                _prev.z,
+                SPEAR_HIT_KNOCKBACK_SPEED,
+                deathCtx,
+              )
+            } else if (spider && spiders && spidersGroup) {
+              damageSpider(
+                spider,
+                dmg,
+                spidersGroup,
+                spiders,
+                _prev.x,
+                _prev.z,
+                SPIDER_HIT_KNOCKBACK_SPEED,
+                spiderDeathCtx,
+              )
+            }
+            spear.durability -= 1
+            if (spear.durability <= 0) {
+              removeSpear(spear, parent, spears)
+              continue
+            }
           }
           dropSpearFromHit(spear, hit.point)
           continue
@@ -663,11 +704,14 @@ export function updateThrownSpears(
   return pickedUp
 }
 
+/** Remove in-flight spears. Stuck ground spears are kept for pickup. */
 export function clearThrownSpears(
   spears: ThrownSpear[],
   parent: THREE.Object3D,
 ) {
-  while (spears.length > 0) {
-    removeSpear(spears[0]!, parent, spears)
+  for (let i = spears.length - 1; i >= 0; i--) {
+    const spear = spears[i]!
+    if (spear.stuck) continue
+    removeSpear(spear, parent, spears)
   }
 }

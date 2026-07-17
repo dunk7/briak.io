@@ -5,11 +5,10 @@ export const TORCH_LIGHT_COLOR = 0xff6a2a
 export const TORCH_LIGHT_INTENSITY = 16
 export const TORCH_LIGHT_DISTANCE = 20
 /**
- * Fixed PointLight count. Adding/removing lights at runtime forces Three.js to
- * recompile every MeshStandardMaterial (half-second hitch). Keep this pool in
- * the scene from day one and only move / modulate intensity.
+ * Cap on concurrent torch PointLights. Only bound slots stay visible — parked
+ * intensity-0 lights must stay hidden or they still inflate NUM_POINT_LIGHTS.
  */
-const MAX_TORCH_LIGHTS = 12
+const MAX_TORCH_LIGHTS = 8
 const TORCH_HEIGHT = 0.56
 const TORCH_STICK_RADIUS = 0.048
 const TORCH_FLAME_RADIUS = 0.07
@@ -188,8 +187,8 @@ export class PlacedTorchManager {
     })
     this.group.add(this.ghost)
 
-    // Pre-add a fixed set of lights so place/remove never changes NUM_POINT_LIGHTS
-    // while Medium+ is active. Potato/Low hide the whole pool via setPointLightsEnabled.
+    // Pre-create light objects (hidden until a torch claims them). Hiding parked
+    // slots keeps NUM_POINT_LIGHTS equal to active torches, not the pool size.
     for (let i = 0; i < MAX_TORCH_LIGHTS; i++) {
       const light = new THREE.PointLight(
         TORCH_LIGHT_COLOR,
@@ -197,7 +196,7 @@ export class PlacedTorchManager {
         TORCH_LIGHT_DISTANCE,
         2,
       )
-      light.visible = true
+      light.visible = false
       light.position.set(0, -9999, 0)
       this.group.add(light)
       this.pool.push({ light, torchId: null })
@@ -275,7 +274,7 @@ export class PlacedTorchManager {
     slot.torchId = null
     slot.light.intensity = 0
     slot.light.position.set(0, -9999, 0)
-    if (!this.pointLightsEnabled) slot.light.visible = false
+    slot.light.visible = false
   }
 
   private bindLight(slotIndex: number, torch: PlacedTorch) {
@@ -331,9 +330,8 @@ export class PlacedTorchManager {
   }
 
   /**
-   * Potato/Low: hide the fixed pool (drops NUM_POINT_LIGHTS). Medium+: restore
-   * and re-bind lights to placed torches. Expect a one-time material recompile
-   * when the graphics slider crosses the Medium boundary.
+   * Potato/Low: hide all torch lights. Medium+: re-bind to placed torches.
+   * Expect a one-time material recompile when crossing the Medium boundary.
    */
   setPointLightsEnabled(enabled: boolean) {
     if (this.pointLightsEnabled === enabled) return
@@ -344,14 +342,10 @@ export class PlacedTorchManager {
       }
       for (const slot of this.pool) {
         this.parkLight(slot)
-        slot.light.visible = false
       }
       return
     }
-    for (const slot of this.pool) {
-      slot.light.visible = true
-      this.parkLight(slot)
-    }
+    for (const slot of this.pool) this.parkLight(slot)
     for (const torch of this.torches.values()) {
       this.acquireLight(torch)
     }

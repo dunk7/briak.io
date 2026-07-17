@@ -1946,6 +1946,29 @@ const ICONS: Partial<Record<InventoryItem, string>> = {
     <rect x="9" y="7" width="1" height="1" fill="#ffccaa" opacity="0.5"/>
   </svg>`,
 
+  computer_chip: `<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" aria-hidden="true">
+    <rect x="0" y="0" width="16" height="16" fill="#0e1418"/>
+    <rect x="3" y="3" width="10" height="10" fill="#1a3038"/>
+    <rect x="4" y="4" width="8" height="8" fill="#243e48"/>
+    <rect x="5" y="5" width="6" height="6" fill="#2f5560"/>
+    <rect x="6" y="6" width="4" height="4" fill="#3a6a78"/>
+    <rect x="7" y="7" width="2" height="2" fill="#7ec8d4"/>
+    <rect x="1" y="5" width="2" height="1" fill="#5a8a70"/>
+    <rect x="1" y="7" width="2" height="1" fill="#5a8a70"/>
+    <rect x="1" y="9" width="2" height="1" fill="#5a8a70"/>
+    <rect x="13" y="5" width="2" height="1" fill="#5a8a70"/>
+    <rect x="13" y="7" width="2" height="1" fill="#5a8a70"/>
+    <rect x="13" y="9" width="2" height="1" fill="#5a8a70"/>
+    <rect x="5" y="1" width="1" height="2" fill="#c4a44a"/>
+    <rect x="7" y="1" width="1" height="2" fill="#c4a44a"/>
+    <rect x="9" y="1" width="1" height="2" fill="#c4a44a"/>
+    <rect x="5" y="13" width="1" height="2" fill="#c4a44a"/>
+    <rect x="7" y="13" width="1" height="2" fill="#c4a44a"/>
+    <rect x="9" y="13" width="1" height="2" fill="#c4a44a"/>
+    <rect x="6" y="6" width="1" height="1" fill="#a8e8f0" opacity="0.7"/>
+    <rect x="4" y="4" width="2" height="1" fill="#4a8898" opacity="0.5"/>
+  </svg>`,
+
   torch: `<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" aria-hidden="true">
     <rect x="0" y="0" width="16" height="16" fill="#141820"/>
     <rect x="7" y="2" width="2" height="1" fill="#ff3300"/>
@@ -2019,6 +2042,40 @@ const ICONS: Partial<Record<InventoryItem, string>> = {
     <rect x="7" y="8" width="6" height="1" fill="#3d7234"/>
     <rect x="2" y="4" width="1" height="9" fill="#4a8838"/>
     <rect x="13" y="4" width="1" height="9" fill="#8fd868"/>
+  </svg>`,
+
+  ballista: `<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" aria-hidden="true">
+    <rect x="0" y="0" width="16" height="16" fill="#141820"/>
+    <rect x="5" y="12" width="6" height="2" fill="#5c3a22"/>
+    <rect x="6" y="10" width="4" height="2" fill="#4a2e18"/>
+    <rect x="7" y="6" width="2" height="5" fill="#6b4428"/>
+    <rect x="2" y="5" width="4" height="2" fill="#6b4428"/>
+    <rect x="10" y="5" width="4" height="2" fill="#6b4428"/>
+    <rect x="1" y="4" width="3" height="2" fill="#5c3a22"/>
+    <rect x="12" y="4" width="3" height="2" fill="#5c3a22"/>
+    <rect x="0" y="3" width="2" height="2" fill="#4a2e18"/>
+    <rect x="14" y="3" width="2" height="2" fill="#4a2e18"/>
+    <rect x="2" y="7" width="5" height="1" fill="#c4a46a"/>
+    <rect x="9" y="7" width="5" height="1" fill="#c4a46a"/>
+    <rect x="7" y="8" width="2" height="1" fill="#c4a46a"/>
+    <rect x="7" y="3" width="2" height="3" fill="#b8b4ac"/>
+    <rect x="7" y="2" width="2" height="1" fill="#d8d4cc"/>
+  </svg>`,
+
+  catapult: `<svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" aria-hidden="true">
+    <rect x="0" y="0" width="16" height="16" fill="#141820"/>
+    <rect x="2" y="13" width="12" height="2" fill="#5c3a22"/>
+    <rect x="3" y="12" width="10" height="1" fill="#4a2e18"/>
+    <rect x="3" y="7" width="2" height="6" fill="#6b4428"/>
+    <rect x="11" y="7" width="2" height="6" fill="#6b4428"/>
+    <rect x="4" y="6" width="8" height="2" fill="#4a2e18"/>
+    <rect x="7" y="2" width="2" height="8" fill="#6b4428"/>
+    <rect x="6" y="1" width="2" height="2" fill="#8a8680"/>
+    <rect x="5" y="0" width="2" height="2" fill="#9a968e"/>
+    <rect x="8" y="9" width="5" height="1" fill="#c4a46a"/>
+    <rect x="11" y="8" width="3" height="1" fill="#c4a46a"/>
+    <rect x="12" y="6" width="2" height="2" fill="#8a8680"/>
+    <rect x="7" y="5" width="2" height="1" fill="#b8b4ac"/>
   </svg>`,
 }
 

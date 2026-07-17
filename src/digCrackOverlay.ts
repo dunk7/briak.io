@@ -271,12 +271,14 @@ export class DigCrackOverlay {
   private mesh: THREE.Mesh | null = null
   private material: THREE.MeshBasicMaterial | null = null
   private style: DigCrackStyle = 'dirt'
+  private lastBoxStage = -1
 
   // --- Conforming overlay (curved props) ---
   private confMaterial: THREE.MeshBasicMaterial | null = null
   private confUniforms: TriplanarUniforms | null = null
   private confMeshes: THREE.Mesh[] = []
   private confRoot: THREE.Object3D | null = null
+  private lastConfStage = -1
   private readonly groupInverse = new THREE.Matrix4()
 
   constructor(parent: THREE.Object3D, stages: THREE.Texture[]) {
@@ -285,6 +287,7 @@ export class DigCrackOverlay {
   }
 
   setStyle(style: DigCrackStyle) {
+    if (this.style === style) return
     this.style = style
     if (this.material) this.material.color.setHex(CRACK_TINT[style])
     if (this.confMaterial) this.confMaterial.color.setHex(CRACK_TINT[style])
@@ -333,7 +336,10 @@ export class DigCrackOverlay {
         toneMapped: false,
       })
     }
-    this.applyStageToMaterials(stage)
+    if (stage !== this.lastBoxStage) {
+      this.applyStageToMaterials(stage)
+      this.lastBoxStage = stage
+    }
     this.material.color.setHex(CRACK_TINT[this.style])
 
     box.getCenter(_center)
@@ -376,7 +382,10 @@ export class DigCrackOverlay {
     }
 
     const stage = progressToStage(progress)
-    this.applyStageToMaterials(stage)
+    if (stage !== this.lastConfStage) {
+      this.applyStageToMaterials(stage)
+      this.lastConfStage = stage
+    }
     this.confMaterial.color.setHex(CRACK_TINT[this.style])
 
     box.getCenter(_center)
@@ -430,11 +439,13 @@ export class DigCrackOverlay {
     for (const overlay of this.confMeshes) this.group.remove(overlay)
     this.confMeshes.length = 0
     this.confRoot = null
+    this.lastConfStage = -1
   }
 
   clear() {
     if (this.mesh) this.mesh.visible = false
     if (this.material) this.material.map = null
+    this.lastBoxStage = -1
     this.clearConforming()
   }
 
